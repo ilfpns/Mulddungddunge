@@ -130,7 +130,8 @@ wuc::CompositionDrawingSurface Snapshot::Render(Job const& job, Direct3D11Captur
         // The capture covers the window rect including invisible resize borders; crop to the visible frame.
         RECT const& frame = job.frame;
         RECT wr;
-        GetWindowRect(job.hwnd, &wr);
+        if (!GetWindowRect(job.hwnd, &wr))
+            return nullptr;                         // gone meanwhile: no offsets to crop with
         float fw = static_cast<float>(frame.right - frame.left);
         float fh = static_cast<float>(frame.bottom - frame.top);
         float ox = 0, oy = 0;
@@ -176,19 +177,29 @@ void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
     // composition surface comes back to the UI thread.
     std::thread([this, hwnd, frame, queue, done = std::move(done)]() mutable {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        auto job = Start(hwnd, frame);
+        std::shared_ptr<Job> job;
         Direct3D11CaptureFrame captured{ nullptr };
-        if (job)
+        // An exception escaping this thread would end the whole process: a window closing mid-capture
+        // just means no picture.
+        try
         {
-            winrt::handle arrived{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
-            HANDLE ev = arrived.get();
-            job->arrivedToken = job->pool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
-            job->session.StartCapture();
-            if (WaitForSingleObject(ev, 400) == WAIT_OBJECT_0)
-                captured = job->pool.TryGetNextFrame();
-            // `ev` is closed when this block ends; a late frame must not signal it afterwards.
-            job->pool.FrameArrived(job->arrivedToken);
-            job->arrivedToken = {};
+            job = Start(hwnd, frame);
+            if (job)
+            {
+                // Shared with the handler, so a frame arriving after it was removed (the pool's thread
+                // may already be inside it) still signals a live event.
+                auto arrived = std::make_shared<winrt::handle>(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+                job->arrivedToken = job->pool.FrameArrived([arrived](auto&&, auto&&) { SetEvent(arrived->get()); });
+                job->session.StartCapture();
+                if (WaitForSingleObject(arrived->get(), 400) == WAIT_OBJECT_0)
+                    captured = job->pool.TryGetNextFrame();
+                job->pool.FrameArrived(job->arrivedToken);
+                job->arrivedToken = {};
+            }
+        }
+        catch (...)
+        {
+            captured = nullptr;
         }
         queue.TryEnqueue([this, job, captured, done = std::move(done)] {
             wuc::CompositionDrawingSurface surface{ nullptr };
@@ -234,7 +245,10 @@ namespace
                 return converter;
         }
         auto path = wt::ProcessPath(hwnd);
-        if (!path.empty() && !IsFrameHost(path) && wt::AppId(hwnd) == path)
+        // Store apps live under the locked-down WindowsApps folder, and the shell draws a padlock over
+        // their file icons; the icon taken from the executable itself (LoadAppIcon) has none.
+        bool packaged = path.find(L"\\WindowsApps\\") != std::wstring::npos;
+        if (!path.empty() && !packaged && !IsFrameHost(path) && wt::AppId(hwnd) == path)
         {
             winrt::com_ptr<IShellItemImageFactory> images;
             HBITMAP hbmp = nullptr;
@@ -276,8 +290,9 @@ namespace
 winrt::com_ptr<IWICFormatConverter> Snapshot::CachedIcon(HWND hwnd)
 {
     auto path = wt::AppId(hwnd);
-    // UWP windows all belong to ApplicationFrameHost; their icons differ per window, so no caching.
-    if (path.empty() || IsFrameHost(path))
+    // A UWP frame's icon comes from the window and may not be set yet right after it opens: asked
+    // again each time rather than caching a generic one.
+    if (path.empty() || IsFrameHost(wt::ProcessPath(hwnd)))
         return IconSource(m_wic.get(), hwnd, 128);
     for (auto& [app, source] : m_icons)
         if (_wcsicmp(app.c_str(), path.c_str()) == 0)

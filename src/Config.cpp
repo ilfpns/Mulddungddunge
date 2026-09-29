@@ -19,6 +19,33 @@ namespace
     }
 }
 
+namespace
+{
+    std::vector<std::wstring> ReadList(wchar_t const* name)
+    {
+        std::vector<std::wstring> out;
+        DWORD bytes = 0;
+        if (RegGetValueW(HKEY_CURRENT_USER, kKey, name, RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &bytes) == ERROR_SUCCESS && bytes)
+        {
+            std::wstring buffer(bytes / sizeof(wchar_t), L'\0');
+            if (RegGetValueW(HKEY_CURRENT_USER, kKey, name, RRF_RT_REG_MULTI_SZ, nullptr, buffer.data(), &bytes) == ERROR_SUCCESS)
+                for (wchar_t const* p = buffer.c_str(); *p; p += wcslen(p) + 1)
+                    out.emplace_back(p);
+        }
+        return out;
+    }
+
+    void WriteList(wchar_t const* name, std::vector<std::wstring> const& list)
+    {
+        std::wstring buffer;
+        for (auto& app : list)
+            buffer.append(app).push_back(L'\0');
+        buffer.push_back(L'\0');
+        RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_MULTI_SZ, buffer.data(),
+            static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
+    }
+}
+
 void Config::Load()
 {
     cards = ReadInt(L"Cards", cards, 1, 6);
@@ -40,15 +67,9 @@ void Config::Load()
     if (RegGetValueW(HKEY_CURRENT_USER, kKey, L"Monitor", RRF_RT_REG_SZ, nullptr, name, &bytes) == ERROR_SUCCESS)
         monitor = name;
 
-    excluded.clear();
-    bytes = 0;
-    if (RegGetValueW(HKEY_CURRENT_USER, kKey, L"Excluded", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &bytes) == ERROR_SUCCESS && bytes)
-    {
-        std::wstring buffer(bytes / sizeof(wchar_t), L'\0');
-        if (RegGetValueW(HKEY_CURRENT_USER, kKey, L"Excluded", RRF_RT_REG_MULTI_SZ, nullptr, buffer.data(), &bytes) == ERROR_SUCCESS)
-            for (wchar_t const* p = buffer.c_str(); *p; p += wcslen(p) + 1)
-                excluded.emplace_back(p);
-    }
+    excluded = ReadList(L"Excluded");
+    quitApps = ReadList(L"QuitApps");
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kKey, L"QuitOnClose");     // the old all-apps switch
 }
 
 void Config::Save() const
@@ -68,12 +89,8 @@ void Config::Save() const
     WriteInt(L"Right", right);
     RegSetKeyValueW(HKEY_CURRENT_USER, kKey, L"Monitor", REG_SZ, monitor.c_str(),
         static_cast<DWORD>((monitor.size() + 1) * sizeof(wchar_t)));
-    std::wstring buffer;
-    for (auto& app : excluded)
-        buffer.append(app).push_back(L'\0');
-    buffer.push_back(L'\0');
-    RegSetKeyValueW(HKEY_CURRENT_USER, kKey, L"Excluded", REG_MULTI_SZ, buffer.data(),
-        static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
+    WriteList(L"Excluded", excluded);
+    WriteList(L"QuitApps", quitApps);
 }
 
 UINT Config::HotkeyModifiers() const

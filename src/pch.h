@@ -12,6 +12,8 @@
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <psapi.h>
+#include <tlhelp32.h>
+#include <appmodel.h>
 #include <d3d11_4.h>
 #include <dxgi1_4.h>
 #include <d2d1_3.h>

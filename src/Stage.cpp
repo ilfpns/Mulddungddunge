@@ -10,6 +10,7 @@ namespace
     constexpr UINT ID_CLOSE = 4;
     constexpr UINT ID_SETTINGS = 6;
     constexpr UINT ID_AUTOSTART = 5;
+    constexpr UINT ID_QUIT = 7;
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValue[] = L"StageManager";
     constexpr wchar_t kStateKey[] = L"Software\\StageManager";
@@ -29,10 +30,18 @@ namespace
     constexpr UINT_PTR kTimerTrim = 6;
     constexpr UINT_PTR kTimerTuck = 7;
     constexpr UINT_PTR kTimerRecheck = 8;
+    constexpr UINT kRecheckMs = 80;           // a new window not ready yet: looked at again this often
+    constexpr int kMaxRechecks = 25;          // ...for about two seconds
     constexpr UINT_PTR kTimerDock = 9;
     constexpr UINT_PTR kTimerWatchdog = 10;
     constexpr UINT_PTR kTimerHidden = 12;     // a hidden stage window: closed, or only put away?
     constexpr UINT kHiddenMs = 300;
+    constexpr UINT_PTR kTimerQuit = 14;       // an app asked to quit: gone, or still running in the background?
+    constexpr UINT kQuitPollMs = 500;
+    // Apps save and clean up after their windows close (Chrome, VS Code, Office); only one still
+    // running this long after, with nothing on screen, is ended.
+    constexpr ULONGLONG kQuitGraceMs = 5000;
+    constexpr UINT_PTR kTimerNewWindow = 15;  // a new window not ready yet when it took focus
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
@@ -148,9 +157,6 @@ bool Stage::Init(HINSTANCE inst)
         saved = static_cast<DWORD>(m_savedMinAnimate);
         RegSetKeyValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate", REG_DWORD, &saved, sizeof(saved));
     }
-    // While we run, a minimized stage window flies into the sidebar instead of shrinking to the
-    // taskbar. Not persisted (no SPIF_UPDATEINIFILE); restored on exit.
-    SetMinAnimate(false);
     m_scale = dpiX / 96.f;
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -195,8 +201,13 @@ bool Stage::Init(HINSTANCE inst)
 
     Dock();
     ShrinkView();
+    m_taskbarMsg = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
     SetTimer(m_sidebar, kTimerPopulate, 400, nullptr);
+    // While we run, a minimized stage window flies into the sidebar instead of shrinking to the
+    // taskbar. Not persisted (no SPIF_UPDATEINIFILE); restored on exit. Only now: an Init that
+    // failed earlier never reaches Shutdown, which restores it.
+    SetMinAnimate(false);
     return true;
 }
 
@@ -214,6 +225,11 @@ void Stage::Shutdown()
     nid.hWnd = m_sidebar;
     nid.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (m_trayIcon)
+        DestroyIcon(m_trayIcon);
+    for (auto& q : m_quitting)
+        CloseHandle(q.proc);
+    m_quitting.clear();
     SetMinAnimate(true);
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate");
     DestroyWindow(m_view);
@@ -238,7 +254,12 @@ void Stage::Dock()
 
     float2 barSize{ static_cast<float>(m_bar.right - m_bar.left), static_cast<float>(m_bar.bottom - m_bar.top) };
     float2 barOrigin = SideToAnim({ 0.f, 0.f });
-    m_sideContent.Offset({ barOrigin.x, barOrigin.y, 0.f });
+    // Where the cards are for the current dock state (a slide in progress is cut short).
+    float x = barOrigin.x;
+    if (m_dock != DockState::Shown)
+        x = Right() ? x + static_cast<float>(m_monitor.right - m_bar.left) : x - static_cast<float>(m_bar.right - m_monitor.left);
+    m_sideContent.StopAnimation(L"Offset.X");
+    m_sideContent.Offset({ x, barOrigin.y, 0.f });
     if (!m_busy && !m_dragging && !m_menu.open && !m_settings.open)
         ShrinkView();
 
@@ -254,8 +275,10 @@ void Stage::AddTrayIcon()
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
-        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    if (!m_trayIcon)
+        m_trayIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    nid.hIcon = m_trayIcon;
     wcscpy_s(nid.szTip, L"Stage Manager");
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -349,10 +372,14 @@ void Stage::OpenCardMenu(int index, int anchorY)
     m_menu.open = true;
     m_menu.card = card;
     if (card)
+    {
         m_menu.items = {
             card->pinned ? MenuItem{ ID_UNPIN, L"\xE77A", L"고정 해제" } : MenuItem{ ID_PIN, L"\xE718", L"탭 고정" },
             MenuItem{ ID_CLOSE, L"\xE8BB", L"창 닫기" },
         };
+        if (wt::QuitTarget(card->hwnd))
+            m_menu.items.push_back(MenuItem{ ID_QUIT, L"\xE7E8", L"앱 종료" });
+    }
     m_menu.items.push_back(MenuItem{ ID_SETTINGS, L"\xE713", L"설정" });
     float w = S(kMenuW), h = S(kMenuPad) * 2 + S(kMenuItemH) * m_menu.items.size();
 
@@ -509,12 +536,117 @@ void Stage::RunMenuItem(int item)
     UINT command = m_menu.items[item].command;
     auto card = m_menu.card;
     CloseCardMenu();
+    if (command != ID_SETTINGS && (!card || !IsWindow(card->hwnd)))
+        return;                                     // its window closed while the menu was open
     if (command == ID_SETTINGS)
         OpenSettings();
     else if (command == ID_PIN || command == ID_UNPIN)
         SetPinned(*card, command == ID_PIN);
     else if (command == ID_CLOSE)
         PostMessageW(card->hwnd, WM_CLOSE, 0, 0);   // the card goes away when the window is destroyed
+    else if (command == ID_QUIT)
+        QuitApp(card->hwnd);
+}
+
+// Closes every window of the app the way its close buttons would, then, if it keeps running with
+// nothing on screen (gone to the tray or the background), ends the process. An app that leaves a
+// window open (a "save changes?" question, a window on another desktop) is left alone.
+bool Stage::QuitApp(HWND hwnd, bool fromHide)
+{
+    DWORD pid = wt::QuitTarget(hwnd);
+    if (!pid)
+        return false;
+    // Held open so the id can't be reused by another process meanwhile; checked to still be the
+    // window's process after opening it.
+    HANDLE proc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!proc)
+    {
+        Trace(L"quit: no access (elevated app?)", hwnd);
+        return false;
+    }
+    if (wt::QuitTarget(hwnd) != pid)
+    {
+        CloseHandle(proc);
+        return false;
+    }
+    if (fromHide && wt::HasVisibleWindow(pid))
+    {
+        CloseHandle(proc);                          // other windows of it are still open: keep it running
+        return false;
+    }
+    Trace(fromHide ? L"quit (closed to the tray)" : L"quit", hwnd);
+    if (!fromHide)
+        wt::CloseWindowsOf(pid);
+    DWORD windowPid = 0;
+    GetWindowThreadProcessId(hwnd, &windowPid);
+    m_quitting.push_back({ proc, hwnd, windowPid, GetTickCount64() + kQuitGraceMs, fromHide });
+    SetTimer(m_sidebar, kTimerQuit, kQuitPollMs, nullptr);
+    return true;
+}
+
+void Stage::FinishQuits()
+{
+    ULONGLONG now = GetTickCount64();
+    bool finished = false;
+    auto quitting = std::move(m_quitting);          // nothing below may add to the list being walked
+    m_quitting.clear();
+    for (auto& q : quitting)
+    {
+        bool done = WaitForSingleObject(q.proc, 0) != WAIT_TIMEOUT;     // exited by itself
+        if (!done && now >= q.deadline)
+        {
+            if (wt::HasVisibleWindow(GetProcessId(q.proc)))
+            {
+                Trace(L"quit: spared, a window is still open", q.hwnd);
+                DWORD pid = 0;
+                if (q.fromHide && IsWindow(q.hwnd) && (GetWindowThreadProcessId(q.hwnd, &pid), pid == q.windowPid))
+                    m_putAway.push_back(q.hwnd);
+            }
+            else
+            {
+                Trace(L"quit: ended", q.hwnd);
+                wt::KillProcess(q.proc);
+            }
+            done = true;
+        }
+        if (done)
+        {
+            CloseHandle(q.proc);
+            finished = true;
+        }
+        else
+            m_quitting.push_back(q);
+    }
+    // Spared windows get their card once nothing is animating.
+    if (!m_putAway.empty() && !m_busy && !m_dragging)
+    {
+        auto putAway = std::move(m_putAway);
+        m_putAway.clear();
+        for (HWND h : putAway)
+            PutAwayHidden(h);
+    }
+    if (!m_quitting.empty() || !m_putAway.empty())
+        SetTimer(m_sidebar, kTimerQuit, kQuitPollMs, nullptr);
+    if (finished)
+        SetTimer(m_sidebar, kTimerSweep, 300, nullptr);     // cards of windows gone while hidden
+}
+
+bool Stage::QuitsOnClose(HWND hwnd) const
+{
+    if (m_cfg.quitApps.empty())
+        return false;
+    auto app = wt::AppId(hwnd);
+    return !app.empty() && std::any_of(m_cfg.quitApps.begin(), m_cfg.quitApps.end(), [&](auto& e) { return wt::SameApp(e, app); });
+}
+
+// A stage window the app hid (closed to the tray): kept as a card it can be brought back from.
+void Stage::PutAwayHidden(HWND h)
+{
+    if (!m_cfg.keepTray || !IsWindow(h) || IsWindowVisible(h) || OnStage(h) ||
+        std::any_of(m_cards.begin(), m_cards.end(), [h](auto& c) { return c->hwnd == h; }))
+        return;
+    m_stage.push_back(h);                           // back where it was, then:
+    OnMinimizeStart(h);                             // put away like a minimize: into the sidebar
 }
 
 wuc::CompositionSurfaceBrush Stage::PinBrush()
@@ -555,14 +687,19 @@ void Stage::SetPinned(Card& c, bool pinned)
         if (pinned)
         {
             c.desktop = DesktopOf(c.hwnd);
-            m_pinnedApps.push_back(PinKey(c));
+            c.pinKey = PinKey(c);
+            m_pinnedApps.push_back(c.pinKey);
         }
         else
         {
-            // Look the entry up with the desktop it was pinned on, before refreshing it.
-            auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, c); });
+            // The entry it was pinned with; the card's desktop may have changed since (moved in Task View).
+            auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) {
+                return c.pinKey.empty() ? PinMatches(e, c) : _wcsicmp(e.c_str(), c.pinKey.c_str()) == 0; });
+            if (it == m_pinnedApps.end())
+                it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, c); });
             if (it != m_pinnedApps.end())
                 m_pinnedApps.erase(it);
+            c.pinKey.clear();
             c.desktop = DesktopOf(c.hwnd);
         }
         SavePins();
@@ -812,6 +949,20 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
         if (g_stage->OnStage(hwnd))
             g_stage->OnHidden(hwnd);
         break;
+    case EVENT_OBJECT_CLOAKED:
+    case EVENT_OBJECT_UNCLOAKED:
+        if (wt::IsInputPanel(hwnd))
+        {
+            std::erase(m_inputPanels, hwnd);
+            if (event == EVENT_OBJECT_UNCLOAKED)
+                m_inputPanels.push_back(hwnd);
+            Trace(event == EVENT_OBJECT_UNCLOAKED ? L"input panel shown" : L"input panel hidden", hwnd);
+            // Re-applies the z-order; a grown view (hover, menu, animation) is topmost anyway and gets
+            // it right when it shrinks.
+            if (!m_busy && !m_dragging && m_hover < 0)
+                ShrinkView();
+        }
+        break;
     }
 }
 
@@ -826,7 +977,7 @@ void Stage::OnForeground(HWND hwnd)
     // (Focus handed back to the stage window, as after the tray menu, doesn't count.)
     if (m_settings.open && hwnd != m_active)
         CloseSettings();
-    if (!m_ready || m_busy)
+    if (!m_ready || m_busy || m_syncing)
         return;
     GUID desktop = CurrentDesktopId();
     if (desktop != m_desktopId)
@@ -852,8 +1003,24 @@ void Stage::OnForeground(HWND hwnd)
     if (!wt::IsManageable(hwnd, m_mon))
     {
         UpdateDock();                               // e.g. a fullscreen game came to the front
+        // An app window still being set up (not shown or untitled yet) becomes manageable in a moment;
+        // look again soon instead of waiting for the next focus change. Not the taskbar, the desktop,
+        // tool windows or our own.
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (IsWindow(hwnd) && !GetWindow(hwnd, GW_OWNER) && (!IsWindowVisible(hwnd) || GetWindowTextLengthW(hwnd) == 0) &&
+            !wt::IsShellWindow(hwnd) && pid != GetCurrentProcessId() && !(GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW))
+        {
+            if (hwnd != m_newWindow)
+            {
+                m_newWindow = hwnd;
+                m_rechecks = kMaxRechecks;
+            }
+            SetTimer(m_sidebar, kTimerNewWindow, kRecheckMs, nullptr);
+        }
         return;
     }
+    m_newWindow = nullptr;
     if (SideBySide(hwnd))
     {
         // Next to what is on stage (two windows snapped side by side): both stay.
@@ -951,6 +1118,8 @@ void Stage::OnGone(HWND hwnd)
         SetTimer(m_sidebar, kTimerSweep, 300, nullptr);
         return;
     }
+    if (m_menu.open && m_menu.card && m_menu.card->hwnd == hwnd)
+        CloseCardMenu();
     LeaveStage(hwnd);
     if (!m_busy)
         RemoveCard(hwnd, true);
@@ -1010,8 +1179,9 @@ bool Stage::PinMatches(std::wstring const& entry, Card const& c)
 {
     auto bar = entry.find(L'|');
     if (bar == std::wstring::npos)
-        return _wcsicmp(entry.c_str(), c.app.c_str()) == 0;
-    return _wcsicmp(entry.c_str(), PinKey(c).c_str()) == 0;
+        return wt::SameApp(entry, c.app);
+    auto key = PinKey(c);
+    return _wcsnicmp(entry.c_str(), key.c_str(), bar + 1) == 0 && wt::SameApp(entry.substr(bar + 1), c.app);
 }
 
 // Pinned apps whose windows live on other desktops still get their (pinned) cards.
@@ -1025,7 +1195,7 @@ void Stage::AdoptPinnedElsewhere()
             continue;
         auto app = wt::AppId(h);
         if (app.empty() || std::none_of(m_pinnedApps.begin(), m_pinnedApps.end(),
-                [&](auto& e) { return e.size() >= app.size() && _wcsicmp(e.c_str() + e.size() - app.size(), app.c_str()) == 0; }))
+                [&](auto& e) { return wt::SameApp(e.substr(e.find(L'|') + 1), app); }))
             continue;
         auto card = MakeCard(h);
         if (!card->pinned)
@@ -1064,8 +1234,11 @@ GUID Stage::CurrentDesktopId()
 void Stage::SyncDesktop()
 {
     Trace(L"desktop switched");
-    for (auto& c : m_cards)
+    auto cards = m_cards;                           // DesktopOf calls into Explorer, which may pump messages
+    m_syncing = true;
+    for (auto& c : cards)
         c->desktop = DesktopOf(c->hwnd);
+    m_syncing = false;
     HWND fg = GetForegroundWindow();
     m_active = wt::IsManageable(fg, m_mon) ? fg : nullptr;
     m_stage.clear();
@@ -1111,7 +1284,7 @@ void Stage::Adopt(HWND hwnd)
     m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
         SetSnapshot(*card, frame, surface);
         TrimMemory();
-        if (!OnStage(card->hwnd) && IsWindow(card->hwnd))
+        if (!OnStage(card->hwnd) && IsWindow(card->hwnd) && IsWindowVisible(card->hwnd))
             Minimize(card->hwnd);
     });
 }
@@ -1158,11 +1331,11 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     // Pinned if this app on this desktop has more pin entries than pinned cards. The desktop is only
     // asked for (a call into Explorer) when the app has a pin at all.
     if (!c->app.empty() && std::any_of(m_pinnedApps.begin(), m_pinnedApps.end(),
-            [&](auto const& e) { return e.size() >= c->app.size() && _wcsicmp(e.c_str() + e.size() - c->app.size(), c->app.c_str()) == 0; }))
+            [&](auto const& e) { return wt::SameApp(e.substr(e.find(L'|') + 1), c->app); }))
     {
         c->desktop = DesktopOf(hwnd);
         auto wanted = std::count_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, *c); });
-        auto have = std::count_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->pinned && o->desktop == c->desktop && o->app == c->app; });
+        auto have = std::count_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->pinned && o->desktop == c->desktop && wt::SameApp(o->app, c->app); });
         c->pinned = have < wanted;
         // Upgrade an old app-only entry to this window's desktop, so it stops matching elsewhere.
         auto old = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(),
@@ -1171,6 +1344,12 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
         {
             *old = PinKey(*c);
             SavePins();
+        }
+        if (c->pinned)
+        {
+            auto e = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, *c); });
+            if (e != m_pinnedApps.end())
+                c->pinKey = *e;
         }
     }
     c->frame = IsIconic(hwnd) ? wt::RestoreRect(hwnd) : wt::FrameRect(hwnd);
@@ -1565,7 +1744,7 @@ void Stage::SwitchTo(size_t index)
     {
         // On another desktop: activating it makes Windows switch there (with its own animation);
         // SyncDesktop takes over once the switch is seen.
-        m_hover = -1;
+        SetHover(-1);
         BringBack(next->hwnd);
         ForceForeground(next->hwnd);
         return;
@@ -1574,10 +1753,12 @@ void Stage::SwitchTo(size_t index)
     from.center = SideToAnim(from.center);
     if (m_hover == static_cast<int>(index))
         from = HoverPose(*next, index, true), from.center = SideToAnim(from.center);
-    m_hover = -1;
-
     if (next->hwnd == m_active)
+    {
+        SetHover(-1);                               // already on stage: the card just settles back
         return;
+    }
+    m_hover = -1;
     if (!next->pinned)
     {
         m_cards.erase(std::find(m_cards.begin(), m_cards.end(), next));
@@ -1680,7 +1861,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
         AnimatePose(m_flyIn, *m_inCard, nextFrom, to, m_cfg.Ms(kFlyMs));
         m_inBatch.End();
-        m_inBatch.Completed([this](auto&&, auto&&) { OnFlyInDone(); });
+        m_inBatch.Completed([this, gen = m_gen](auto&&, auto&&) { if (gen == m_gen) OnFlyInDone(); });
     }
     if (!m_pending)
     {
@@ -1702,14 +1883,21 @@ void Stage::GrowView()
 
 // The view in monitor coordinates. Its content is laid out from the monitor's top-left, so when the
 // view does not start there (sidebar on the right) the root visual is shifted to match.
+// Any emoji panel / touch keyboard still up. One that went away without a cloak event (its process
+// restarted) no longer counts.
+bool Stage::InputPanelUp()
+{
+    std::erase_if(m_inputPanels, [](HWND h) { return !IsWindow(h) || !IsWindowVisible(h) || wt::IsCloaked(h); });
+    return !m_inputPanels.empty();
+}
+
 void Stage::PlaceView(LONG left, LONG right, LONG height, bool grown)
 {
-    // Always-on-top only when it has to be: while animating or showing a menu/panel over other
-    // windows, and while tucked (the edge strip must stay reachable over a maximized window). A shown
-    // sidebar at rest has nothing over it anyway (a window covering it makes it tuck away), and as an
-    // ordinary window it lets later popups that never take focus, like the emoji panel (Win+.) or the
-    // touch keyboard, appear over it instead of underneath.
-    bool topmost = grown || m_busy || m_dragging || m_menu.open || m_settings.open ||
+    // Always on top, or "show desktop" (four fingers down, Win+D) sweeps the sidebar away with the
+    // windows. The one exception is while the emoji panel (Win+.) or touch keyboard is up: those never
+    // take focus and would open underneath it. A shown sidebar at rest has nothing else over it (a
+    // window covering it makes it tuck away).
+    bool topmost = !InputPanelUp() || grown || m_busy || m_dragging || m_menu.open || m_settings.open ||
                    m_dock != DockState::Shown || m_revealed || !m_cfg.autoTuck;
     SetWindowPos(m_view, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, m_monitor.left + left, m_monitor.top, right - left, height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -1895,14 +2083,15 @@ void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, 
     flight->batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     AnimatePose(flight->vis, *card, from, to, m_cfg.Ms(kFlyMs));
     flight->batch.End();
-    flight->batch.Completed([this, flight](auto&&, auto&&) {
+    flight->batch.Completed([this, flight, gen = m_gen](auto&&, auto&&) {
         flight->batch = nullptr;
         if (flight->vis.holder)
             m_animStage.Children().Remove(flight->vis.holder);
         flight->vis = {};
         if (flight->card->side.holder)
             flight->card->side.holder.Opacity(1.f);
-        StepDone();
+        if (gen == m_gen)                           // not a transition the watchdog already ended
+            StepDone();
     });
     // Hide the real window only once the flying copy is on screen above it.
     m_toMinimize.push_back(card->hwnd);
@@ -1911,6 +2100,8 @@ void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, 
 
 void Stage::OnFlyInDone()
 {
+    if (!m_inCard)
+        return;
     m_inBatch = nullptr;
     BringBack(m_inCard->hwnd);
     ForceForeground(m_inCard->hwnd);
@@ -1920,6 +2111,8 @@ void Stage::OnFlyInDone()
 
 void Stage::FadeOutFlyIn()
 {
+    if (!m_busy || !m_flyIn.holder)
+        return;
     auto fade = m_compositor.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(0.f, 1.f);
     fade.InsertKeyFrame(1.f, 0.f);
@@ -1927,7 +2120,9 @@ void Stage::FadeOutFlyIn()
     m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     m_flyIn.holder.StartAnimation(L"Opacity", fade);
     m_inBatch.End();
-    m_inBatch.Completed([this](auto&&, auto&&) {
+    m_inBatch.Completed([this, gen = m_gen](auto&&, auto&&) {
+        if (gen != m_gen)
+            return;
         m_inBatch = nullptr;
         StepDone();
     });
@@ -1941,7 +2136,9 @@ void Stage::StepDone()
 
 void Stage::FinishTransition()
 {
+    ++m_gen;                                        // callbacks still pending belong to the old one
     KillTimer(m_sidebar, kTimerWatchdog);
+    KillTimer(m_sidebar, kTimerFade);
     m_inBatch = nullptr;
     for (auto& flight : m_outs)
     {
@@ -1978,6 +2175,8 @@ void Stage::FinishTransition()
             RemoveCard(h, true);
     }
     std::erase_if(m_stage, [](HWND h) { return !IsWindow(h); });
+    if (m_active && !IsWindow(m_active))
+        m_active = m_stage.empty() ? nullptr : m_stage.back();
     StageChanged();                                 // after m_busy is cleared, or the dock won't update
     // Focus changes that arrived while animating were ignored; catch up once things have settled.
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
@@ -2017,7 +2216,20 @@ void Stage::ForceForeground(HWND hwnd)
         hwnd = dialog;
     if (SetForegroundWindow(hwnd))
         return;
-    // Foreground lock: a synthetic Alt tap counts as input and lets us hand focus over.
+    // Foreground lock: a synthetic Alt tap counts as input and lets us hand focus over. Not while the
+    // user holds Alt (Alt+number): our key-up would leave Alt stuck up, and the real release would
+    // then open the new window's menu bar.
+    if (GetAsyncKeyState(VK_MENU) & 0x8000)
+    {
+        // Sharing input state with the foreground thread lifts the lock without touching the keyboard.
+        DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr), self = GetCurrentThreadId();
+        if (fgThread && fgThread != self && AttachThreadInput(self, fgThread, TRUE))
+        {
+            SetForegroundWindow(hwnd);
+            AttachThreadInput(self, fgThread, FALSE);
+        }
+        return;
+    }
     INPUT in[2]{};
     in[0].type = INPUT_KEYBOARD;
     in[0].ki.wVk = VK_MENU;
@@ -2144,7 +2356,7 @@ void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
     m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     AnimatePose(m_flyIn, *card, m_dragPose, PoseForRect(frame, m_monitor, card->w), m_cfg.Ms(kFlyMs));
     m_inBatch.End();
-    m_inBatch.Completed([this](auto&&, auto&&) { OnFlyInDone(); });
+    m_inBatch.Completed([this, gen = m_gen](auto&&, auto&&) { if (gen == m_gen) OnFlyInDone(); });
 }
 
 // ---- window procs ---------------------------------------------------------
@@ -2322,10 +2534,24 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
 
 LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == m_taskbarMsg && m_taskbarMsg)
+    {
+        AddTrayIcon();                              // Explorer restarted: the old icon is gone
+        return 0;
+    }
     if (msg == m_shellMsg && m_shellMsg)
     {
         if ((wp & 0x7FFF) == HSHELL_WINDOWDESTROYED)
             OnGone(reinterpret_cast<HWND>(lp));
+        else if ((wp & 0x7FFF) == HSHELL_WINDOWCREATED)
+        {
+            // A new window on the taskbar: often shown (or titled) only after it took focus, when the
+            // foreground event already turned it down.
+            Trace(L"created", reinterpret_cast<HWND>(lp));
+            m_newWindow = reinterpret_cast<HWND>(lp);
+            m_rechecks = kMaxRechecks;
+            SetTimer(m_sidebar, kTimerNewWindow, kRecheckMs, nullptr);
+        }
         return 0;
     }
     switch (msg)
@@ -2368,6 +2594,9 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
             m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, flags));
             m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, nullptr, WinEventProc, 0, 0, flags));
+            // The emoji panel and touch keyboard are shown and put away by cloaking. Cloak events are
+            // rare (desktop switches, UWP windows), unlike object show/hide.
+            m_hooks.push_back(SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr, WinEventProc, 0, 0, flags));
             // Object-level destroy/hide WinEvents would wake us for every caret, tooltip and menu in the
             // system; the shell hook only reports top-level app windows.
             m_shellMsg = RegisterWindowMessageW(L"SHELLHOOK");
@@ -2427,18 +2656,30 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 {
                     if (!IsWindow(h))
                         OnGone(h);                  // closed: no card
-                    else if (!m_cfg.keepTray && !IsWindowVisible(h))
-                        continue;                   // closed to the tray, and the user wants no card for it
-                    else if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [h](auto& c) { return c->hwnd == h; }))
+                    else if (IsWindowVisible(h))
                     {
-                        m_stage.push_back(h);       // back where it was, then:
-                        if (!IsWindowVisible(h))
-                            OnMinimizeStart(h);     // put away like a minimize: into the sidebar
+                        // Shown again: back on stage as it was.
+                        if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [h](auto& c) { return c->hwnd == h; }))
+                        {
+                            m_stage.push_back(h);
+                            if (GetForegroundWindow() == h)
+                            {
+                                m_active = h;
+                                SnapActiveSoon();
+                            }
+                            StageChanged();
+                        }
                     }
+                    else if (QuitsOnClose(h) && QuitApp(h, true))
+                        continue;                   // an app chosen to quit on X: quitting (a card if spared)
+                    else
+                        PutAwayHidden(h);           // closed to the tray: a card, if wanted
                 }
                 UpdateDock();
             }
         }
+        else if (wp == kTimerQuit)
+            FinishQuits();                          // also hands out cards held back during an animation
         else if (wp == kTimerSweep)
         {
             if (m_busy)
@@ -2453,6 +2694,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                     RemoveCard(h, true);
                 std::erase_if(m_offstage, [](auto& c) { return !IsWindow(c->hwnd); });
                 std::erase_if(m_stage, [](HWND h) { return !IsWindow(h); });
+                if (m_active && !IsWindow(m_active))
+                    m_active = m_stage.empty() ? nullptr : m_stage.back();
             }
         }
         else if (wp == kTimerWatchdog && m_busy)
@@ -2460,8 +2703,19 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             // Something went wrong mid-transition (an exception, a lost device, a batch that never
             // completed). Never leave input blocked or the view covering the screen.
             LogError(WM_TIMER, E_FAIL, L"transition watchdog fired");
-            if (m_inCard && !IsWindowVisible(m_inCard->hwnd))
+            // The clicked window comes up (hidden or still minimized), the leaving ones go down, as the
+            // transition would have left them.
+            if (m_inCard && IsWindow(m_inCard->hwnd) && (!IsWindowVisible(m_inCard->hwnd) || IsIconic(m_inCard->hwnd)))
+            {
                 BringBack(m_inCard->hwnd);
+                ForceForeground(m_inCard->hwnd);
+            }
+            for (auto& flight : m_outs)
+            {
+                HWND h = flight->card->hwnd;
+                if (IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !OnStage(h))
+                    Minimize(h);
+            }
             FinishTransition();
             ShrinkView();
         }
@@ -2470,6 +2724,19 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             HWND fg = GetForegroundWindow();
             if (fg && fg != m_active)
                 OnForeground(fg);
+        }
+        else if (wp == kTimerNewWindow)
+        {
+            // Acted on only once the focused window is an app window (so an open menu or settings
+            // panel isn't closed by these checks); mid-animation or just after one, later.
+            HWND fg = GetForegroundWindow();
+            if (fg && fg != m_active && m_rechecks-- > 0)
+            {
+                if (!m_busy && GetTickCount64() >= m_quietUntil && wt::IsManageable(fg, m_mon))
+                    OnForeground(fg);
+                else
+                    SetTimer(m_sidebar, kTimerNewWindow, kRecheckMs, nullptr);
+            }
         }
         else if (wp == kTimerTuck)
         {

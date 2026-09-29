@@ -13,7 +13,7 @@ namespace
     constexpr float kListRowH = 52.f;
 
     // Hit targets.
-    enum : int { HitClose = 1, HitTab, HitToggle, HitChoice, HitStep, HitApp, HitUnpin, HitUnpinAll, HitGitHub, HitRefresh };
+    enum : int { HitClose = 1, HitTab, HitToggle, HitChoice, HitStep, HitApp, HitUnpin, HitUnpinAll, HitGitHub, HitRefresh, HitQuitApp };
     // What a control changes (Hit::arg for toggles; arg / 16 for choices and steps).
     enum : int
     {
@@ -221,12 +221,12 @@ void Stage::LoadSettingsLists()
         if (!wt::IsAppWindow(h, nullptr, true))
             return TRUE;
         auto id = wt::AppId(h);
-        if (!id.empty() && std::none_of(apps->begin(), apps->end(), [&](auto& a) { return _wcsicmp(a.id.c_str(), id.c_str()) == 0; }))
+        if (!id.empty() && std::none_of(apps->begin(), apps->end(), [&](auto& a) { return wt::SameApp(a.id, id); }))
             apps->push_back({ id, wt::AppLabel(id, h), h });
         return TRUE;
     }, reinterpret_cast<LPARAM>(&ctx));
     for (auto& id : m_cfg.excluded)
-        if (std::none_of(m.apps.begin(), m.apps.end(), [&](auto& a) { return _wcsicmp(a.id.c_str(), id.c_str()) == 0; }))
+        if (std::none_of(m.apps.begin(), m.apps.end(), [&](auto& a) { return wt::SameApp(a.id, id); }))
             m.apps.push_back({ id, wt::AppLabel(id, nullptr), nullptr });
     std::sort(m.apps.begin(), m.apps.end(), [](auto& a, auto& b) { return _wcsicmp(a.label.c_str(), b.label.c_str()) < 0; });
 
@@ -404,7 +404,7 @@ void Stage::PaintSettings()
         case 4:     // Pins
         {
             bool apps = m.tab == 3;
-            note(apps ? L"끈 앱의 창은 사이드바가 관리하지 않습니다 (최소화·카드 없음)"
+            note(apps ? L"X로 종료: X를 눌러 트레이로 숨으면 백그라운드까지 끕니다 · 관리: 끄면 사이드바가 관리하지 않습니다"
                       : L"고정은 데스크톱마다 따로 저장됩니다. 카드를 오른쪽 클릭해 고정할 수 있어요");
             float top = y, bottom = h - (apps ? S(20) : S(76));
             size_t count = apps ? m.apps.size() : m_pinnedApps.size();
@@ -431,13 +431,21 @@ void Stage::PaintSettings()
                         m_snap.DrawAppIcon(dc, a.hwnd, iconRect);
                     else
                         text(L"\xE71D", iconRect, m.icon.get(), dim.get());
-                    text(a.label, { x0 + S(42), cy - S(12), x1 - S(70), cy + S(12) }, m.body.get(), ink.get());
-                    bool shown = std::none_of(m_cfg.excluded.begin(), m_cfg.excluded.end(), [&](auto& e) { return _wcsicmp(e.c_str(), a.id.c_str()) == 0; });
-                    // Only fully visible rows take clicks.
+                    text(a.label, { x0 + S(42), cy - S(12), x1 - S(140), cy + S(12) }, m.body.get(), ink.get());
+                    bool shown = std::none_of(m_cfg.excluded.begin(), m_cfg.excluded.end(), [&](auto& e) { return wt::SameApp(e, a.id); });
+                    bool quits = std::any_of(m_cfg.quitApps.begin(), m_cfg.quitApps.end(), [&](auto& e) { return wt::SameApp(e, a.id); });
+                    // Only fully visible rows take clicks. Left switch: quit on X; right one: managed.
+                    D2D1_RECT_F quitRect = toggleRect(cy);
+                    quitRect.left -= S(70), quitRect.right -= S(70);
                     bool over = visible && m.hover == HitApp && m.hoverArg == static_cast<int>(i);
+                    bool overQuit = visible && m.hover == HitQuitApp && m.hoverArg == static_cast<int>(i);
                     if (visible)
+                    {
                         m.hits.push_back({ { x1 - S(56), cy - S(18), x1 + S(4), cy + S(18) }, HitApp, static_cast<int>(i) });
+                        m.hits.push_back({ { quitRect.left - S(10), cy - S(18), quitRect.right + S(10), cy + S(18) }, HitQuitApp, static_cast<int>(i) });
+                    }
                     m.toggleDescs.push_back({ 1000 + static_cast<int>(i), toggleRect(cy), shown, over, true });
+                    m.toggleDescs.push_back({ 2000 + static_cast<int>(i), quitRect, quits, overQuit, true });
                 }
                 else
                 {
@@ -446,7 +454,7 @@ void Stage::PaintSettings()
                     std::wstring app = bar == std::wstring::npos ? entry : entry.substr(bar + 1);
                     HWND sample = nullptr;
                     for (auto& c : m_cards)
-                        if (_wcsicmp(c->app.c_str(), app.c_str()) == 0)
+                        if (wt::SameApp(c->app, app))
                             sample = c->hwnd;
                     D2D1_RECT_F iconRect{ x0, cy - S(14), x0 + S(28), cy + S(14) };
                     if (sample && IsWindow(sample))
@@ -823,31 +831,43 @@ void Stage::SettingsClick(POINT pt)
         ApplySetting(what);
         break;
     }
+    case HitQuitApp:
+    {
+        if (target.arg >= static_cast<int>(m.apps.size()))
+            return;
+        auto id = m.apps[target.arg].id;
+        if (std::none_of(m_cfg.quitApps.begin(), m_cfg.quitApps.end(), [&](auto& e) { return wt::SameApp(e, id); }))
+            m_cfg.quitApps.push_back(id);
+        else
+            std::erase_if(m_cfg.quitApps, [&](auto& e) { return wt::SameApp(e, id); });
+        SaveSettings();
+        break;
+    }
     case HitApp:
     {
         if (target.arg >= static_cast<int>(m.apps.size()))
             return;
         auto id = m.apps[target.arg].id;
-        auto it = std::find_if(m_cfg.excluded.begin(), m_cfg.excluded.end(), [&](auto& e) { return _wcsicmp(e.c_str(), id.c_str()) == 0; });
-        bool excludeNow = it == m_cfg.excluded.end();
+        // Every entry for it goes (older versions may have saved one per app version).
+        bool excludeNow = std::none_of(m_cfg.excluded.begin(), m_cfg.excluded.end(), [&](auto& e) { return wt::SameApp(e, id); });
         if (excludeNow)
             m_cfg.excluded.push_back(id);
         else
-            m_cfg.excluded.erase(it);
+            std::erase_if(m_cfg.excluded, [&](auto& e) { return wt::SameApp(e, id); });
         wt::SetExcluded(m_cfg.excluded);
         if (excludeNow)
         {
             // Its windows are left alone from now on: no cards, not on the stage.
             std::vector<HWND> drop;
             for (auto& c : m_cards)
-                if (_wcsicmp(c->app.c_str(), id.c_str()) == 0)
+                if (wt::SameApp(c->app, id))
                     drop.push_back(c->hwnd);
             for (HWND h : drop)
                 RemoveCard(h, true);
-            std::erase_if(m_offstage, [&](auto& c) { return _wcsicmp(c->app.c_str(), id.c_str()) == 0; });
+            std::erase_if(m_offstage, [&](auto& c) { return wt::SameApp(c->app, id); });
             std::vector<HWND> onStage;
             for (HWND h : m_stage)
-                if (_wcsicmp(wt::AppId(h).c_str(), id.c_str()) == 0)
+                if (wt::SameApp(wt::AppId(h), id))
                     onStage.push_back(h);
             for (HWND h : onStage)
                 LeaveStage(h);
@@ -857,7 +877,7 @@ void Stage::SettingsClick(POINT pt)
             // Managed again: minimized windows get cards, visible ones stay where they are.
             for (HWND h : wt::EnumManageable(m_mon))
             {
-                if (_wcsicmp(wt::AppId(h).c_str(), id.c_str()) != 0 || OnStage(h) ||
+                if (!wt::SameApp(wt::AppId(h), id) || OnStage(h) ||
                     std::any_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
                     continue;
                 if (IsIconic(h))
@@ -994,8 +1014,9 @@ void Stage::UnpinEntry(std::wstring entry)
 {
     for (auto& c : m_cards)
     {
-        if (c->pinned && PinMatches(entry, *c))
+        if (c->pinned && (PinMatches(entry, *c) || _wcsicmp(c->pinKey.c_str(), entry.c_str()) == 0))
         {
+            c->pinKey = entry;                      // the row clicked is the entry that goes
             SetPinned(*c, false);
             return;
         }

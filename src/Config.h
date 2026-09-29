@@ -19,6 +19,7 @@ struct Config
     bool right = false;             // sidebar on the right edge of the screen
     std::wstring monitor;           // device name (\\.\DISPLAY2); empty: the primary monitor
     std::vector<std::wstring> excluded;     // app ids (see wt::AppId) the sidebar leaves alone
+    std::vector<std::wstring> quitApps;     // app ids quit outright when closed to the tray (X)
 
     void Load();
     void Save() const;

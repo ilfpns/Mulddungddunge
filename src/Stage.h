@@ -34,6 +34,7 @@ struct Card
     bool hasSnapshot = false;   // a real picture of the window (otherwise a placeholder, or nothing if released)
     bool hasPicture = false;    // snapshot or placeholder currently loaded
     bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
+    std::wstring pinKey;    // the saved pin entry it was pinned with (its desktop may change later)
     float w = 0, h = 0;     // sprite size = frame size
     wuc::CompositionSurfaceBrush snapshot{ nullptr };
     wuc::CompositionSurfaceBrush icon{ nullptr };
@@ -106,6 +107,13 @@ private:
     int MenuItemAt(POINT viewPt) const;
     void SetMenuHover(int item);
     void RunMenuItem(int item);
+    // The whole app, background included. fromHide: the window was closed to the tray (nothing else
+    // is closed, and it gets its card back if the app is spared). False if nothing was started.
+    bool QuitApp(HWND hwnd, bool fromHide = false);
+    void FinishQuits();
+    bool QuitsOnClose(HWND hwnd) const;             // its app is one the user chose to quit on X
+    void PutAwayHidden(HWND hwnd);                  // a window hidden to the tray: into the sidebar
+    bool InputPanelUp();
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
     bool Here(Card const& c) const;                 // uses the cached desktop: no call
@@ -246,6 +254,23 @@ private:
     std::shared_ptr<Card> m_inCard;
     std::vector<std::shared_ptr<OutFlight>> m_outs;
     std::vector<HWND> m_hidden;                     // stage windows just hidden, see OnHidden
+    std::vector<HWND> m_putAway;                    // spared close-to-tray windows waiting for their card
+    HWND m_newWindow{};                             // a foreground window not ready yet, see kTimerNewWindow
+    bool m_syncing = false;                         // SyncDesktop running (it may pump messages)
+    struct Quitting
+    {
+        HANDLE proc;
+        HWND hwnd;                                  // the window it started from
+        DWORD windowPid;                            // that window's process, to tell a reused handle
+        ULONGLONG deadline;                         // ended then if it still runs with nothing on screen
+        bool fromHide;
+    };
+    std::vector<Quitting> m_quitting;               // apps asked to quit, checked on kTimerQuit
+    std::vector<HWND> m_inputPanels;                // emoji panel / touch keyboard windows shown
+    int m_rechecks = 0;                             // looks left at a foreground window not ready yet
+    unsigned m_gen = 0;                             // transition number: late callbacks of an older one do nothing
+    UINT m_taskbarMsg = 0;                          // "TaskbarCreated": Explorer restarted, re-add the tray icon
+    HICON m_trayIcon = nullptr;
     std::vector<HWND> m_toMinimize;                 // stage windows whose flying copy is now on screen
     int m_pending = 0;                              // fly-out and fly-in steps still running
     wuc::CompositionScopedBatch m_inBatch{ nullptr };

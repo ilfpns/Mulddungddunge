@@ -24,11 +24,16 @@ function Stop-StageManager {
     if ($hwnd -ne [IntPtr]::Zero) {
         [StageManagerSetup.Native]::PostMessage($hwnd, 0x0111, [IntPtr]1, [IntPtr]::Zero) | Out-Null   # WM_COMMAND, ID_EXIT
     }
-    for ($i = 0; $i -lt 30 -and (Get-Process -Name 'stage-manager' -ErrorAction SilentlyContinue); $i++) {
+    for ($i = 0; $i -lt 30 -and (Get-Process -Name 'stage-manager' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId }); $i++) {
         Start-Sleep -Milliseconds 100
     }
-    $stuck = Get-Process -Name 'stage-manager' -ErrorAction SilentlyContinue
-    if ($stuck) { $stuck | Stop-Process -Force }
+    # Only this session's instance: another signed-in user's can't (and shouldn't) be stopped from here.
+    $session = (Get-Process -Id $PID).SessionId
+    $stuck = Get-Process -Name 'stage-manager' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }
+    if ($stuck) {
+        $stuck | Stop-Process -Force
+        $stuck | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue   # the exe stays locked until it has exited
+    }
     Restore-MinimizeAnimation
 }
 

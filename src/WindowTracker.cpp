@@ -36,7 +36,7 @@ namespace wt
         if (g_excluded.empty())
             return true;
         auto app = AppId(hwnd);
-        return std::none_of(g_excluded.begin(), g_excluded.end(), [&](auto& e) { return _wcsicmp(e.c_str(), app.c_str()) == 0; });
+        return std::none_of(g_excluded.begin(), g_excluded.end(), [&](auto& e) { return SameApp(e, app); });
     }
 
     bool IsAppWindow(HWND hwnd, HMONITOR monitor, bool otherDesktops)
@@ -122,20 +122,38 @@ namespace wt
         return r;
     }
 
+    static std::wstring ImagePath(HANDLE proc)
+    {
+        std::wstring buf(32768, L'\0');             // long paths, not just MAX_PATH
+        DWORD len = static_cast<DWORD>(buf.size());
+        if (!QueryFullProcessImageNameW(proc, 0, buf.data(), &len))
+            return {};
+        buf.resize(len);
+        return buf;
+    }
+
+    static std::wstring PathOf(DWORD pid)
+    {
+        HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+        if (!proc)
+            return {};
+        auto out = ImagePath(proc);
+        CloseHandle(proc);
+        return out;
+    }
+
+    static DWORD HostedApp(HWND frame, DWORD host);
+
+    static bool IsFrameHost(std::wstring const& path)
+    {
+        return path.size() >= 24 && _wcsicmp(path.c_str() + path.size() - 24, L"ApplicationFrameHost.exe") == 0;
+    }
+
     std::wstring ProcessPath(HWND hwnd)
     {
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
-        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (!proc)
-            return {};
-        wchar_t path[MAX_PATH];
-        DWORD len = MAX_PATH;
-        std::wstring out;
-        if (QueryFullProcessImageNameW(proc, 0, path, &len))
-            out.assign(path, len);
-        CloseHandle(proc);
-        return out;
+        return PathOf(pid);
     }
 
     RECT RestoreRect(HWND hwnd, bool* maximized)
@@ -218,8 +236,9 @@ namespace wt
         return ctx.found;
     }
 
-    // A browser web app window carries its own AppUserModelID, e.g. "Chrome._crx_<id>".
-    static std::wstring WebAppModelId(HWND hwnd)
+    // The AppUserModelID a window carries, if any: browser web apps ("Chrome._crx_<id>") and UWP
+    // frames (the app's own id, e.g. "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App").
+    static std::wstring WindowModelId(HWND hwnd)
     {
         winrt::com_ptr<IPropertyStore> store;
         if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(store.put()))))
@@ -230,12 +249,25 @@ namespace wt
         if (SUCCEEDED(store->GetValue(PKEY_AppUserModel_ID, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
             id = v.pwszVal;
         PropVariantClear(&v);
+        return id;
+    }
+
+    static std::wstring WebAppModelId(HWND hwnd)
+    {
+        auto id = WindowModelId(hwnd);
         return id.find(L"_crx_") != std::wstring::npos ? id : std::wstring{};
     }
 
     std::wstring AppId(HWND hwnd)
     {
         auto path = ProcessPath(hwnd);
+        // Every UWP window belongs to ApplicationFrameHost. The frame carries the app's model id, also
+        // while minimized, when the app's own window has left the frame.
+        if (IsFrameHost(path))
+        {
+            auto id = WindowModelId(hwnd);
+            return id.empty() ? path : L"uwp:" + id;
+        }
         auto web = WebAppModelId(hwnd);
         return web.empty() || path.empty() ? path : path + L"#" + web;
     }
@@ -297,6 +329,18 @@ namespace wt
 
     std::wstring AppLabel(std::wstring const& app, HWND sample)
     {
+        if (app.rfind(L"uwp:", 0) == 0)
+        {
+            // Its window title is its name ("Calculator"); without one, the package name.
+            wchar_t title[128]{};
+            if (sample)
+                GetWindowTextW(sample, title, ARRAYSIZE(title));
+            if (*title)
+                return title;
+            auto name = app.substr(4, app.find(L'_') == std::wstring::npos ? std::wstring::npos : app.find(L'_') - 4);
+            auto dot = name.find_last_of(L'.');
+            return dot == std::wstring::npos ? name : name.substr(dot + 1);
+        }
         auto hash = app.find(L'#');
         std::wstring exe = app.substr(0, hash);
         if (hash != std::wstring::npos && sample)
@@ -332,5 +376,301 @@ namespace wt
         if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
             name.resize(name.size() - 4);
         return name;
+    }
+
+    // A UWP frame (ApplicationFrameHost) hosts the app's own window as a child; its process is the app.
+    static DWORD HostedApp(HWND frame, DWORD host)
+    {
+        struct Ctx { DWORD host, app; } ctx{ host, 0 };
+        EnumChildWindows(frame, [](HWND h, LPARAM lp) -> BOOL {
+            auto c = reinterpret_cast<Ctx*>(lp);
+            DWORD p = 0;
+            GetWindowThreadProcessId(h, &p);
+            if (p != c->host)
+                c->app = p;
+            return c->app == 0;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.app;
+    }
+
+    // The running process of a packaged app, found by its model id.
+    static DWORD ProcessOfModel(std::wstring const& model)
+    {
+        DWORD found = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            return 0;
+        PROCESSENTRY32W e{ sizeof(e) };
+        for (BOOL ok = Process32FirstW(snap, &e); ok && !found; ok = Process32NextW(snap, &e))
+        {
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, e.th32ProcessID);
+            if (!proc)
+                continue;
+            wchar_t id[APPLICATION_USER_MODEL_ID_MAX_LENGTH]{};
+            UINT32 len = ARRAYSIZE(id);
+            if (GetApplicationUserModelId(proc, &len, id) == ERROR_SUCCESS && _wcsicmp(id, model.c_str()) == 0 &&
+                !IsFrameHost(ImagePath(proc)))
+                found = e.th32ProcessID;
+            CloseHandle(proc);
+        }
+        CloseHandle(snap);
+        return found;
+    }
+
+    DWORD AppProcess(HWND hwnd)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (IsFrameHost(PathOf(pid)))
+        {
+            // The app's window is inside the frame, except while minimized: then look it up by id.
+            DWORD app = HostedApp(hwnd, pid);
+            if (!app)
+                if (auto model = WindowModelId(hwnd); !model.empty())
+                    app = ProcessOfModel(model);
+            pid = app;
+        }
+        return pid;
+    }
+
+    bool IsShellWindow(HWND hwnd)
+    {
+        return IsShellClass(hwnd);
+    }
+
+    static std::wstring DirOf(std::wstring const& path)
+    {
+        auto slash = path.find_last_of(L'\\');
+        return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
+    }
+
+    static bool UnderDir(std::wstring const& path, std::wstring const& dir)
+    {
+        return !dir.empty() && path.size() > dir.size() && _wcsnicmp(path.c_str(), dir.c_str(), dir.size()) == 0;
+    }
+
+    static bool InWindowsDir(std::wstring const& path)
+    {
+        wchar_t win[MAX_PATH]{};
+        UINT n = GetWindowsDirectoryW(win, MAX_PATH);
+        return n && UnderDir(path, std::wstring(win, n) + L"\\");
+    }
+
+    // Whether a top-level window belongs to the process: its own, or a UWP frame hosting it.
+    static bool WindowOf(HWND h, DWORD pid)
+    {
+        DWORD p = 0;
+        GetWindowThreadProcessId(h, &p);
+        if (p == pid)
+            return true;
+        wchar_t cls[32]{};
+        GetClassNameW(h, cls, ARRAYSIZE(cls));
+        return wcscmp(cls, L"ApplicationFrameWindow") == 0 && HostedApp(h, p) == pid;
+    }
+
+    static bool IsSystemImage(std::wstring const& path)
+    {
+        static constexpr wchar_t const* kShell[] = {
+            L"explorer.exe", L"ApplicationFrameHost.exe", L"dwm.exe", L"sihost.exe", L"csrss.exe",
+            L"winlogon.exe", L"ShellExperienceHost.exe", L"StartMenuExperienceHost.exe", L"SearchHost.exe",
+            L"TextInputHost.exe", L"LockApp.exe", L"svchost.exe", L"services.exe", L"RuntimeBroker.exe",
+        };
+        auto name = path.substr(path.find_last_of(L'\\') + 1);
+        for (auto n : kShell)
+            if (_wcsicmp(name.c_str(), n) == 0)
+                return true;
+        return false;
+    }
+
+    static ULONGLONG CreatedAt(HANDLE proc);
+
+    // Some apps draw their window in a helper process (Steam: steamwebhelper.exe under Steam's folder).
+    // Quitting the helper alone leaves the app running (and restarting it): walk up to the process that
+    // started it while that one runs from the same install (its folder contains the helper's).
+    static DWORD MainProcess(DWORD pid)
+    {
+        if (!pid)
+            return 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            return pid;
+        std::vector<PROCESSENTRY32W> all;
+        PROCESSENTRY32W e{ sizeof(e) };
+        for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e))
+            all.push_back(e);
+        CloseHandle(snap);
+        for (int depth = 0; depth < 4; ++depth)
+        {
+            auto self = std::find_if(all.begin(), all.end(), [&](auto& p) { return p.th32ProcessID == pid; });
+            if (self == all.end())
+                break;
+            HANDLE child = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            HANDLE parent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, self->th32ParentProcessID);
+            bool up = false;
+            if (child && parent)
+            {
+                auto childPath = ImagePath(child), parentPath = ImagePath(parent);
+                // Older than the child (else the id was reused), same install, not Windows itself.
+                up = CreatedAt(parent) <= CreatedAt(child) && UnderDir(childPath, DirOf(parentPath)) &&
+                     !InWindowsDir(parentPath) && !IsSystemImage(parentPath);
+            }
+            if (child)
+                CloseHandle(child);
+            if (parent)
+                CloseHandle(parent);
+            if (!up)
+                break;
+            pid = self->th32ParentProcessID;
+        }
+        return pid;
+    }
+
+    DWORD QuitTarget(HWND hwnd)
+    {
+        // A browser web app shares its process with every window of that browser: only closing the
+        // window is right for it.
+        if (AppId(hwnd).find(L'#') != std::wstring::npos)
+            return 0;
+        DWORD pid = MainProcess(AppProcess(hwnd));
+        std::wstring path = PathOf(pid);
+        if (!pid || pid == GetCurrentProcessId() || path.empty() || IsSystemImage(path))
+            return 0;
+        // Elevated apps can't be ended from here; then there is nothing to offer.
+        HANDLE proc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!proc)
+            return 0;
+        BOOL critical = FALSE;
+        IsProcessCritical(proc, &critical);
+        CloseHandle(proc);
+        return critical ? 0 : pid;
+    }
+
+    bool IsInputPanel(HWND hwnd)
+    {
+        wchar_t cls[32]{};
+        if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"Windows.UI.Core.CoreWindow") != 0)
+            return false;
+        auto path = ProcessPath(hwnd);
+        return path.size() >= 17 && _wcsicmp(path.c_str() + path.size() - 17, L"TextInputHost.exe") == 0;
+    }
+
+    void CloseWindowsOf(DWORD pid)
+    {
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            if (IsWindowVisible(h) && !GetWindow(h, GW_OWNER) && WindowOf(h, static_cast<DWORD>(lp)))
+                PostMessageW(h, WM_CLOSE, 0, 0);
+            return TRUE;
+        }, pid);
+    }
+
+    // A window still open after the close request is the app asking something ("save changes?") or
+    // refusing to close: the user answers it, we don't kill underneath it. Windows on other virtual
+    // desktops count too (cloaked by the shell), other cloaked windows don't.
+    bool HasVisibleWindow(DWORD pid)
+    {
+        struct Ctx { DWORD pid; bool found; } ctx{ pid, false };
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto c = reinterpret_cast<Ctx*>(lp);
+            if (!IsWindowVisible(h) || (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) || !WindowOf(h, c->pid))
+                return TRUE;
+            DWORD cloaked = 0;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            RECT r{};
+            GetWindowRect(h, &r);
+            c->found = (!cloaked || cloaked == DWM_CLOAKED_SHELL) && r.right - r.left > 1 && r.bottom - r.top > 1;
+            return !c->found;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.found;
+    }
+
+    static ULONGLONG CreatedAt(HANDLE proc)
+    {
+        FILETIME created{}, x1, x2, x3;
+        GetProcessTimes(proc, &created, &x1, &x2, &x3);
+        return (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    }
+
+    void KillProcess(HANDLE proc)
+    {
+        std::wstring image = ImagePath(proc);
+        DWORD root = GetProcessId(proc);
+        // Helpers first, so none of them restarts the main process meanwhile. A child must be younger
+        // than its parent, or the parent id belongs to an older, unrelated process (ids are reused).
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE && !image.empty())
+        {
+            std::vector<PROCESSENTRY32W> all;
+            PROCESSENTRY32W e{ sizeof(e) };
+            for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e))
+                all.push_back(e);
+            std::vector<std::pair<DWORD, ULONGLONG>> parents{ { root, CreatedAt(proc) } };
+            for (size_t i = 0; i < parents.size(); ++i)
+                for (auto& c : all)
+                {
+                    if (c.th32ParentProcessID != parents[i].first || c.th32ProcessID == root)
+                        continue;
+                    HANDLE child = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, c.th32ProcessID);
+                    if (!child)
+                        continue;
+                    ULONGLONG born = CreatedAt(child);
+                    auto childImage = ImagePath(child);
+                    // Its helpers: the same executable, or (outside the Windows folder) anything from its
+                    // install folder, unless it has a window of its own (a game Steam started, say).
+                    bool helper = _wcsicmp(childImage.c_str(), image.c_str()) == 0 ||
+                                  (!InWindowsDir(image) && UnderDir(childImage, DirOf(image)) && !HasVisibleWindow(c.th32ProcessID));
+                    if (born >= parents[i].second && helper)
+                    {
+                        parents.push_back({ c.th32ProcessID, born });
+                        TerminateProcess(child, 1);
+                    }
+                    CloseHandle(child);
+                }
+        }
+        if (snap != INVALID_HANDLE_VALUE)
+            CloseHandle(snap);
+        TerminateProcess(proc, 1);
+    }
+
+    // Updates move some apps to a new folder: Squirrel installs (Discord, Slack: "...\app-1.0.9\...")
+    // and Store apps ("...\WindowsApps\Name_1.2.3.0_x64__publisher\..."). Their pins and exclusions
+    // are compared without the version, so they survive the update.
+    std::wstring AppKey(std::wstring const& id)
+    {
+        std::wstring k = id;
+        CharLowerBuffW(k.data(), static_cast<DWORD>(k.size()));
+        if (k.rfind(L"uwp:", 0) == 0)
+            return k;
+        if (IsFrameHost(k))
+            return L"uwp:*";                        // saved by older versions for every UWP app
+        // "\app-1.0.9205\" or "\app-1.2.3-beta\": digits and dots with at least one dot, then an
+        // optional "-suffix". A folder merely named "app-dev" or "app-2" is left alone.
+        for (size_t at = k.find(L"\\app-"); at != std::wstring::npos; at = k.find(L"\\app-", at + 1))
+        {
+            size_t begin = at + 5, end = k.find(L'\\', begin);
+            if (end == std::wstring::npos)
+                break;
+            size_t digits = k.find_first_not_of(L"0123456789.", begin);
+            bool version = digits > begin && (k[begin] >= L'0' && k[begin] <= L'9') && k.find(L'.', begin) < digits &&
+                           (digits == end || k[digits] == L'-');
+            if (version)
+                k.replace(begin, end - begin, L"*");
+        }
+        size_t at = k.find(L"\\windowsapps\\");
+        if (at != std::wstring::npos)
+        {
+            size_t begin = at + 13, end = k.find(L'\\', begin);
+            size_t first = k.find(L'_', begin), pub = k.find(L"__", begin);
+            if (end != std::wstring::npos && first < pub && pub < end)
+                k.erase(first, pub - first);        // "name_1.2.3.0_x64__pub" -> "name__pub"
+        }
+        return k;
+    }
+
+    bool SameApp(std::wstring const& a, std::wstring const& b)
+    {
+        auto ka = AppKey(a), kb = AppKey(b);
+        if (ka == L"uwp:*" || kb == L"uwp:*")
+            return (ka == L"uwp:*" || ka.rfind(L"uwp:", 0) == 0) && (kb == L"uwp:*" || kb.rfind(L"uwp:", 0) == 0);
+        return ka == kb;
     }
 }
