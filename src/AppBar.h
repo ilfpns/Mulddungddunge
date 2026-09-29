@@ -8,6 +8,4 @@ namespace appbar
     // Returns the rect the system granted for a bar of `width` px on the left of `monitor`.
     RECT Dock(HWND hwnd, RECT const& monitor, int width);
     void Remove(HWND hwnd);
-    void NotifyActivate(HWND hwnd);
-    void NotifyPosChanged(HWND hwnd);
 }

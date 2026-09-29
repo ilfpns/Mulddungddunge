@@ -28,7 +28,8 @@ struct Card
     HWND hwnd{};
     RECT frame{};           // last known on-screen frame (physical px)
     RECT border{};          // invisible resize borders: window rect minus visible frame, per side
-    bool hasSnapshot = false;
+    bool hasSnapshot = false;   // a real picture of the window (otherwise a placeholder, or nothing if released)
+    bool hasPicture = false;    // snapshot or placeholder currently loaded
     bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
     float w = 0, h = 0;     // sprite size = frame size
     wuc::CompositionSurfaceBrush snapshot{ nullptr };
@@ -70,9 +71,15 @@ private:
     void OnMinimizeStart(HWND hwnd);
     void OnGone(HWND hwnd);
     void RemoveCard(HWND hwnd, bool evenIfPinned = false);
-    void ShowCardMenu(size_t index);
     void SetPinned(Card& c, bool pinned);
-    void ShowMenu(HMENU menu, UINT* command);
+    void ShowMenu(HMENU menu, UINT* command);           // plain Win32 menu (tray icon)
+
+    // Card context menu, drawn with composition so it matches the sidebar.
+    void OpenCardMenu(size_t index);
+    void CloseCardMenu();
+    int MenuItemAt(POINT viewPt) const;
+    void SetMenuHover(int item);
+    void RunMenuItem(int item);
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     bool OnCurrentDesktop(HWND hwnd) const;
     static GUID CurrentDesktopId();
@@ -89,7 +96,9 @@ private:
     float ThumbScale(Card const& c) const;
     float4x4 Perspective(float2 eye) const;
     Crop CropFor(Card const& c, bool thumb) const;
+    float2 Project(Pose const& p, float2 local, float z) const;   // card-local point -> where the camera shows it
     float2 BadgeOffset(Card const& c, Pose const& p) const;
+    float2 PinOffset(Card const& c, Pose const& p) const;
     Pose SlotPose(Card const& c, size_t i) const;
 
     CardVis MakeVis(Card const& c, bool withBadge);
@@ -101,11 +110,9 @@ private:
 
     void Populate();
     std::shared_ptr<Card> MakeCard(HWND hwnd);
-    void Refresh(Card& c);                       // blocking re-capture while the window is visible
     void SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
     void ApplySize(CardVis const& v, Card const& c);
     void SetMinAnimate(bool on);
-    void MinimizeQuiet(HWND hwnd);
 
     // Transitions: `next` comes on stage, the current window flies into the sidebar.
     void SwitchTo(size_t index);
@@ -135,7 +142,6 @@ private:
     void SlideSidebar(bool out);                    // fullscreen apps: tuck the sidebar away to the left
     void SetHotkeys(bool on);                       // Alt+1..4 jump to sidebar cards                                // snapshot the stage window before a click needs it
 
-    HINSTANCE m_inst{};
     HMONITOR m_mon{};
     HWND m_active{};                // the focused window on stage
     std::vector<HWND> m_stage;      // every window on stage, most recently focused last
@@ -191,6 +197,23 @@ private:
     wuc::CompositionDrawingSurface m_activeSnap{ nullptr };
     int m_hover = -1;
     bool m_tracking = false;
+
+    struct MenuItem
+    {
+        UINT command;
+        wchar_t const* glyph;
+        wchar_t const* label;
+    };
+    struct CardMenu
+    {
+        bool open = false;
+        std::shared_ptr<Card> card;
+        std::vector<MenuItem> items;
+        wuc::ContainerVisual root{ nullptr };
+        wuc::SpriteVisual highlight{ nullptr };
+        float2 origin{};                            // view coordinates of the panel's top-left
+        int hover = -1;
+    } m_menu;
 
     // Pointer state on the sidebar: a press becomes a drag once it moves far enough.
     int m_pressIndex = -1;

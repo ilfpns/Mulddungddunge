@@ -33,16 +33,4 @@ namespace appbar
         auto abd = Data(hwnd);
         SHAppBarMessage(ABM_REMOVE, &abd);
     }
-
-    void NotifyActivate(HWND hwnd)
-    {
-        auto abd = Data(hwnd);
-        SHAppBarMessage(ABM_ACTIVATE, &abd);
-    }
-
-    void NotifyPosChanged(HWND hwnd)
-    {
-        auto abd = Data(hwnd);
-        SHAppBarMessage(ABM_WINDOWPOSCHANGED, &abd);
-    }
 }

@@ -13,6 +13,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <d2d1_3.h>
+#include <dwrite.h>
 #include <wincodec.h>
 #include <DispatcherQueue.h>
 #include <windows.ui.composition.interop.h>

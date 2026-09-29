@@ -10,15 +10,20 @@ public:
     using Done = std::function<void(wuc::CompositionDrawingSurface)>;
 
     // One-shot Windows.Graphics.Capture of `hwnd`, cropped to `frame` and scaled down to <= kMaxWidth.
-    // Starting a capture session takes ~100ms, so the blocking form is only for startup.
-    wuc::CompositionDrawingSurface Capture(HWND hwnd, RECT const& frame);
-    // Same, but returns immediately; `done` runs later on this thread (nullptr on failure or timeout).
+    // Returns immediately (a capture session takes ~100ms to start); `done` runs later on this thread,
+    // with nullptr on failure or timeout.
     void CaptureAsync(HWND hwnd, RECT const& frame, Done done);
     // The window's app icon rendered at `px` x `px`.
     wuc::CompositionDrawingSurface Icon(HWND hwnd, int px);
+    // Stand-in for a window we could not photograph (it was minimized): app icon and title on a dark
+    // card, with the same aspect ratio as the window.
+    wuc::CompositionDrawingSurface Placeholder(HWND hwnd, float w, float h);
+    IDWriteFactory* Text();                         // created on first use
+    // A transparent surface of the given size, drawn once by `draw`.
+    wuc::CompositionDrawingSurface Paint(float w, float h, std::function<void(ID2D1DeviceContext*)> const& draw);
 
 private:
-    static constexpr float kMaxWidth = 560.f;   // sidebar shows ~260px; enough for the fly-in too
+    static constexpr float kMaxWidth = 440.f;   // sidebar shows ~260px; the fly-in copy fades into the real window
 
     struct Job;
     std::shared_ptr<Job> Start(HWND hwnd, RECT const& frame);
@@ -28,6 +33,7 @@ private:
     winrt::com_ptr<ID3D11Device> m_d3d;
     winrt::com_ptr<ID2D1Device> m_d2d;
     winrt::com_ptr<IWICImagingFactory> m_wic;
+    winrt::com_ptr<IDWriteFactory> m_dwrite;
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_device{ nullptr };
     wuc::CompositionGraphicsDevice m_graphics{ nullptr };
 };

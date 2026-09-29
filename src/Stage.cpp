@@ -9,10 +9,17 @@ namespace
     constexpr UINT ID_EXIT = 1;
     constexpr UINT ID_PIN = 2;
     constexpr UINT ID_UNPIN = 3;
+    constexpr UINT ID_CLOSE = 4;
+
+    // Card menu metrics (at 96 dpi).
+    constexpr float kMenuW = 176.f;
+    constexpr float kMenuItemH = 34.f;
+    constexpr float kMenuPad = 5.f;
+    constexpr float kMenuRadius = 10.f;
     constexpr int kHotkeyBase = 100;     // hotkey ids 100..103 = Alt+1..4
     constexpr UINT_PTR kTimerPopulate = 1;
     constexpr UINT_PTR kTimerActiveSnap = 2;
-    constexpr UINT kActiveSnapDelayMs = 1200;
+    constexpr UINT kActiveSnapDelayMs = 500;
     constexpr UINT_PTR kTimerMinimizeOut = 3;
     constexpr UINT_PTR kTimerFade = 4;
     constexpr UINT_PTR kTimerShrink = 5;
@@ -83,7 +90,6 @@ namespace
 bool Stage::Init(HINSTANCE inst)
 {
     g_stage = this;
-    m_inst = inst;
     {
         wchar_t path[MAX_PATH];
         GetTempPathW(MAX_PATH, path);
@@ -220,19 +226,180 @@ void Stage::ShowMenu(HMENU menu, UINT* command)
         SetForegroundWindow(m_active);
 }
 
-void Stage::ShowCardMenu(size_t index)
+void Stage::OpenCardMenu(size_t index)
 {
+    if (m_menu.open)
+        CloseCardMenu();
     auto card = m_visible[index];
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, card->pinned ? ID_UNPIN : ID_PIN, card->pinned ? L"고정 해제" : L"탭 고정");
-    UINT command = 0;
-    ShowMenu(menu, &command);
+    m_menu = {};
+    m_menu.open = true;
+    m_menu.card = card;
+    m_menu.items = {
+        card->pinned ? MenuItem{ ID_UNPIN, L"\xE77A", L"고정 해제" } : MenuItem{ ID_PIN, L"\xE718", L"탭 고정" },
+        MenuItem{ ID_CLOSE, L"\xE8BB", L"창 닫기" },
+    };
+    float w = S(kMenuW), h = S(kMenuPad) * 2 + S(kMenuItemH) * m_menu.items.size();
+
+    auto dwrite = m_snap.Text();
+    winrt::com_ptr<IDWriteTextFormat> text, icon;
+    dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, S(13.5f), L"ko-kr", text.put());
+    if (FAILED(dwrite->CreateTextFormat(L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, S(14.f), L"", icon.put())))
+        dwrite->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, S(14.f), L"", icon.put());
+    for (auto* f : { text.get(), icon.get() })
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    auto labels = m_snap.Paint(w, h, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> ink, dim;
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.94f), ink.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.72f), dim.put());
+        for (size_t i = 0; i < m_menu.items.size(); ++i)
+        {
+            auto& item = m_menu.items[i];
+            float top = S(kMenuPad) + S(kMenuItemH) * i;
+            D2D1_RECT_F iconRect{ S(14), top, S(40), top + S(kMenuItemH) };
+            D2D1_RECT_F textRect{ S(42), top, w - S(10), top + S(kMenuItemH) };
+            dc->DrawTextW(item.glyph, 1, icon.get(), iconRect, dim.get());
+            dc->DrawTextW(item.label, static_cast<UINT32>(wcslen(item.label)), text.get(), textRect, ink.get());
+        }
+    });
+
+    auto rounded = [&](float2 size, float radius) {
+        auto g = m_compositor.CreateRoundedRectangleGeometry();
+        g.Size(size);
+        g.CornerRadius({ radius, radius });
+        return m_compositor.CreateGeometricClip(g);
+    };
+    m_menu.root = m_compositor.CreateContainerVisual();
+    m_menu.root.Size({ w, h });
+
+    auto shadow = m_compositor.CreateDropShadow();
+    shadow.BlurRadius(S(24));
+    shadow.Opacity(0.45f);
+    shadow.Offset({ 0.f, S(6), 0.f });
+    auto shadowHost = m_compositor.CreateSpriteVisual();
+    shadowHost.Size({ w - S(8), h - S(8) });
+    shadowHost.Offset({ S(4), S(4), 0.f });
+    shadowHost.Shadow(shadow);
+    m_menu.root.Children().InsertAtTop(shadowHost);
+
+    auto border = m_compositor.CreateSpriteVisual();                 // 1px hairline around the panel
+    border.Size({ w, h });
+    border.Brush(m_compositor.CreateColorBrush({ 40, 255, 255, 255 }));
+    border.Clip(rounded({ w, h }, S(kMenuRadius)));
+    m_menu.root.Children().InsertAtTop(border);
+
+    auto panel = m_compositor.CreateSpriteVisual();
+    panel.Size({ w - 2.f, h - 2.f });
+    panel.Offset({ 1.f, 1.f, 0.f });
+    panel.Brush(m_compositor.CreateColorBrush({ 246, 36, 36, 40 }));
+    panel.Clip(rounded({ w - 2.f, h - 2.f }, S(kMenuRadius) - 1.f));
+    m_menu.root.Children().InsertAtTop(panel);
+
+    m_menu.highlight = m_compositor.CreateSpriteVisual();
+    m_menu.highlight.Size({ w - S(kMenuPad) * 2, S(kMenuItemH) });
+    m_menu.highlight.Brush(m_compositor.CreateColorBrush({ 26, 255, 255, 255 }));
+    m_menu.highlight.Clip(rounded({ w - S(kMenuPad) * 2, S(kMenuItemH) }, S(6)));
+    m_menu.highlight.Opacity(0.f);
+    m_menu.root.Children().InsertAtTop(m_menu.highlight);
+
+    auto text2 = m_compositor.CreateSpriteVisual();
+    text2.Size({ w, h });
+    text2.Brush(m_compositor.CreateSurfaceBrush(labels));
+    m_menu.root.Children().InsertAtTop(text2);
+
+    // Next to the card, kept on screen.
+    float2 cardCenter = SideToAnim(SlotCenter(index));
+    float x = static_cast<float>(m_bar.right - m_monitor.left) + S(6);
+    float y = std::clamp(cardCenter.y - h / 2.f, S(8), static_cast<float>(m_monitor.bottom - m_monitor.top) - h - S(8));
+    m_menu.origin = { x, y };
+    m_menu.root.Offset({ x, y, 0.f });
+    m_menu.root.CenterPoint({ 0.f, h / 2.f, 0.f });
+    m_root.Children().InsertAtTop(m_menu.root);
+
+    auto grow = m_compositor.CreateVector3KeyFrameAnimation();
+    grow.InsertKeyFrame(0.f, { 0.94f, 0.94f, 1.f });
+    grow.InsertKeyFrame(1.f, { 1.f, 1.f, 1.f }, m_ease);
+    grow.Duration(std::chrono::milliseconds(160));
+    m_menu.root.StartAnimation(L"Scale", grow);
+    auto fade = m_compositor.CreateScalarKeyFrameAnimation();
+    fade.InsertKeyFrame(0.f, 0.f);
+    fade.InsertKeyFrame(1.f, 1.f, m_ease);
+    fade.Duration(std::chrono::milliseconds(120));
+    m_menu.root.StartAnimation(L"Opacity", fade);
+
+    SetHover(-1);
+    GrowView();         // the menu sits outside the bar, and a click anywhere else closes it
+}
+
+void Stage::CloseCardMenu()
+{
+    if (!m_menu.open)
+        return;
+    auto root = m_menu.root;
+    m_menu = {};
+    auto fade = m_compositor.CreateScalarKeyFrameAnimation();
+    fade.InsertKeyFrame(1.f, 0.f);
+    fade.Duration(std::chrono::milliseconds(90));
+    auto batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    root.StartAnimation(L"Opacity", fade);
+    batch.End();
+    batch.Completed([this, root](auto&&, auto&&) {
+        m_root.Children().Remove(root);         // releases the text surface too
+        if (!m_busy && !m_dragging && !m_menu.open)
+            ShrinkView();
+    });
+}
+
+int Stage::MenuItemAt(POINT viewPt) const
+{
+    float x = viewPt.x - m_menu.origin.x, y = viewPt.y - m_menu.origin.y - S(kMenuPad);
+    if (x < 0 || x > S(kMenuW) || y < 0)
+        return -1;
+    int item = static_cast<int>(y / S(kMenuItemH));
+    return item < static_cast<int>(m_menu.items.size()) ? item : -1;
+}
+
+void Stage::SetMenuHover(int item)
+{
+    if (item == m_menu.hover)
+        return;
+    bool wasHidden = m_menu.hover < 0;
+    m_menu.hover = item;
+    auto fade = m_compositor.CreateScalarKeyFrameAnimation();
+    fade.InsertKeyFrame(1.f, item >= 0 ? 1.f : 0.f);
+    fade.Duration(std::chrono::milliseconds(100));
+    m_menu.highlight.StartAnimation(L"Opacity", fade);
+    if (item < 0)
+        return;
+    float3 to{ S(kMenuPad), S(kMenuPad) + S(kMenuItemH) * item, 0.f };
+    if (wasHidden)
+        m_menu.highlight.Offset(to);
+    else
+    {
+        auto slide = m_compositor.CreateVector3KeyFrameAnimation();
+        slide.InsertKeyFrame(1.f, to, m_ease);
+        slide.Duration(std::chrono::milliseconds(120));
+        m_menu.highlight.StartAnimation(L"Offset", slide);
+    }
+}
+
+void Stage::RunMenuItem(int item)
+{
+    UINT command = m_menu.items[item].command;
+    auto card = m_menu.card;
+    CloseCardMenu();
     if (command == ID_PIN || command == ID_UNPIN)
         SetPinned(*card, command == ID_PIN);
+    else if (command == ID_CLOSE)
+        PostMessageW(card->hwnd, WM_CLOSE, 0, 0);   // the card goes away when the window is destroyed
 }
 
 void Stage::SetPinned(Card& c, bool pinned)
 {
+    Trace(pinned ? L"pinned" : L"unpinned", c.hwnd);
     c.pinned = pinned;
     if (c.side.pin)
         c.side.pin.IsVisible(pinned);
@@ -273,20 +440,32 @@ Crop Stage::CropFor(Card const& c, bool thumb) const
 // parallel instead of each card fanning out around its own center.
 // Where the app icon goes, relative to the card's center: on the card's bottom-left corner as it
 // actually appears after the tilt and the shared camera, so every slot gets the same look.
+float2 Stage::Project(Pose const& p, float2 local, float z) const
+{
+    float2 eye{ S(kSidebarW) / 2.f, (m_bar.bottom - m_bar.top) / 2.f };
+    float2 point = p.center + local;
+    return eye + (point - eye) / (1.f - z / (kDepthRatio * S(kThumbW))) - p.center;
+}
+
 float2 Stage::BadgeOffset(Card const& c, Pose const& p) const
 {
     Crop k = CropFor(c, p.thumb);
     float halfW = k.size.x * p.scale / 2.f, halfH = k.size.y * p.scale / 2.f;
     float rad = p.angle * 3.14159265f / 180.f;
-    float x = -halfW * std::cos(rad), z = halfW * std::sin(rad);    // left edge swings toward the viewer
-    float depth = kDepthRatio * S(kThumbW);
-    float2 eye{ S(kSidebarW) / 2.f, (m_bar.bottom - m_bar.top) / 2.f };
-    float2 corner{ p.center.x + x, p.center.y + halfH };
-    float2 seen = eye + (corner - eye) / (1.f - z / depth);
-    float2 badgeCenter = seen - p.center + float2{ S(12), -S(8) };
-    float2 offset = badgeCenter - float2{ S(kBadge), S(kBadge) } / 2.f;
+    // The left edge swings toward the viewer.
+    float2 corner = Project(p, { -halfW * std::cos(rad), halfH }, halfW * std::sin(rad));
+    float2 offset = corner + float2{ S(12), -S(8) } - float2{ S(kBadge), S(kBadge) } / 2.f;
     offset.x = std::max(offset.x, -p.center.x + S(2));               // never past the bar's left edge
     return offset;
+}
+
+float2 Stage::PinOffset(Card const& c, Pose const& p) const
+{
+    Crop k = CropFor(c, p.thumb);
+    float halfW = k.size.x * p.scale / 2.f, halfH = k.size.y * p.scale / 2.f;
+    float rad = p.angle * 3.14159265f / 180.f;
+    float2 corner = Project(p, { halfW * std::cos(rad), -halfH }, -halfW * std::sin(rad));
+    return corner + float2{ -S(14), S(10) } - float2{ S(4), S(4) };
 }
 
 float4x4 Stage::Perspective(float2 eye) const
@@ -315,15 +494,8 @@ void Stage::Populate()
 
     for (HWND h : windows)
     {
-        if (h == m_active)
-            continue;
-        auto card = MakeCard(h);
-        if (!IsIconic(h))
-        {
-            Refresh(*card);
-            MinimizeQuiet(h);
-        }
-        m_cards.push_back(card);
+        if (h != m_active)
+            Adopt(h);
     }
     Relayout(false);
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
@@ -349,6 +521,7 @@ void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id
 void Stage::OnForeground(HWND hwnd)
 {
     Trace(L"foreground", hwnd);
+    CloseCardMenu();
     if (!m_ready || m_busy)
         return;
     GUID desktop = CurrentDesktopId();
@@ -485,7 +658,7 @@ void Stage::Adopt(HWND hwnd)
     m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
         SetSnapshot(*card, frame, surface);
         if (!OnStage(card->hwnd) && IsWindow(card->hwnd))
-            MinimizeQuiet(card->hwnd);
+            ShowWindowAsync(card->hwnd, SW_MINIMIZE);
     });
 }
 
@@ -511,13 +684,9 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->snapshot = m_compositor.CreateSurfaceBrush();
     c->snapshot.Stretch(wuc::CompositionStretch::Fill);
     c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(S(kBadge) * 1.5f)));
+    c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h));
+    c->hasPicture = true;
     return c;
-}
-
-void Stage::Refresh(Card& c)
-{
-    RECT frame = wt::FrameRect(c.hwnd);
-    SetSnapshot(c, frame, m_snap.Capture(c.hwnd, frame));
 }
 
 void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface)
@@ -535,6 +704,7 @@ void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurfa
     c.h = static_cast<float>(frame.bottom - frame.top);
     c.snapshot.Surface(surface);
     c.hasSnapshot = true;
+    c.hasPicture = true;
     if (c.side.holder)
         ApplySize(c.side, c);
 }
@@ -542,7 +712,7 @@ void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurfa
 void Stage::ApplySize(CardVis const& v, Card const& c)
 {
     v.sprite.Size({ c.w, c.h });
-    v.sprite.Brush(c.hasSnapshot ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
+    v.sprite.Brush(c.hasPicture ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
 }
 
 void Stage::SetMinAnimate(bool on)
@@ -551,12 +721,6 @@ void Stage::SetMinAnimate(bool on)
         return;
     ANIMATIONINFO ai{ sizeof(ai), on ? m_savedMinAnimate : 0 };
     SystemParametersInfoW(SPI_SETANIMATION, sizeof(ai), &ai, 0);
-}
-
-// Minimizes without the system's shrink-to-taskbar animation.
-void Stage::MinimizeQuiet(HWND hwnd)
-{
-    ShowWindowAsync(hwnd, SW_MINIMIZE);
 }
 
 CardVis Stage::MakeVis(Card const& c, bool withBadge)
@@ -614,9 +778,8 @@ void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
     }
     if (v.pin)
     {
-        // Top-right corner of the card, which the tilt pushes away from the viewer.
-        Crop kk = CropFor(c, p.thumb);
-        v.pin.Offset({ kk.size.x * p.scale * 0.30f, -kk.size.y * p.scale * 0.42f, 0.f });
+        float2 pin = PinOffset(c, p);
+        v.pin.Offset({ pin.x, pin.y, 0.f });
     }
 }
 
@@ -664,12 +827,23 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
         badge.Duration(dur);
         v.badge.StartAnimation(L"Offset", badge);
     }
+    if (v.pin)
+    {
+        float2 pin = PinOffset(c, to);
+        auto move = m_compositor.CreateVector3KeyFrameAnimation();
+        move.InsertKeyFrame(1.f, { pin.x, pin.y, 0.f }, m_ease);
+        move.Duration(dur);
+        v.pin.StartAnimation(L"Offset", move);
+    }
 }
 
 void Stage::Relayout(bool animate)
 {
     std::stable_partition(m_cards.begin(), m_cards.end(), [](auto& c) { return c->pinned; });
     m_visible.clear();
+    // Every desktop's sidebar shows its 4 most recent cards; a card pushed out of its own desktop's
+    // top 4 can never be seen again, so its snapshot is released.
+    std::vector<std::pair<GUID, size_t>> perDesktop;
     for (auto& c : m_cards)
     {
         bool here = OnCurrentDesktop(c->hwnd);
@@ -680,11 +854,20 @@ void Stage::Relayout(bool animate)
         }
         if (c->side.holder)
             c->side.holder.IsVisible(false);
-        // Pushed out of this desktop's sidebar: its snapshot would only hold memory.
-        if (here && c->hasSnapshot)
+        bool shown = false;
+        GUID desk{};
+        if (!here && m_desktops && SUCCEEDED(m_desktops->GetWindowDesktopId(c->hwnd, &desk)))
+        {
+            auto it = std::find_if(perDesktop.begin(), perDesktop.end(), [&](auto& d) { return d.first == desk; });
+            if (it == perDesktop.end())
+                it = perDesktop.insert(perDesktop.end(), { desk, 0 });
+            shown = it->second++ < kMaxCards;
+        }
+        if (!shown && c->hasPicture)
         {
             c->snapshot.Surface(nullptr);
             c->hasSnapshot = false;
+            c->hasPicture = false;
             if (c->side.holder)
                 ApplySize(c->side, *c);
         }
@@ -692,6 +875,14 @@ void Stage::Relayout(bool animate)
     for (size_t i = 0; i < m_visible.size(); ++i)
     {
         auto& c = *m_visible[i];
+        if (!c.hasPicture)
+        {
+            // Back in view after its picture was released.
+            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h));
+            c.hasPicture = true;
+            if (c.side.holder)
+                ApplySize(c.side, c);
+        }
         Pose target = SlotPose(c, i);
         if (!c.side.holder)
         {
@@ -1232,6 +1423,29 @@ POINT Stage::ViewToSide(LPARAM lp) const
 
 LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (m_menu.open)
+    {
+        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        switch (msg)
+        {
+        case WM_MOUSEMOVE:
+            SetMenuHover(MenuItemAt(pt));
+            return 0;
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        {
+            int item = MenuItemAt(pt);
+            if (item >= 0)
+                RunMenuItem(item);
+            else
+                CloseCardMenu();
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+            return 0;
+        }
+    }
     switch (msg)
     {
     case WM_MOUSEACTIVATE:
@@ -1245,9 +1459,16 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         }
         if (m_dragging)
         {
-            MoveDrag({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            // No mouse capture: we never take focus, so Windows won't keep capture for us. Once a drag
+            // starts the view covers the whole monitor anyway; a release we missed shows up here.
+            if (wp & MK_LBUTTON)
+                MoveDrag({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            else
+                EndDrag({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }, false);
             return 0;
         }
+        if (!(wp & MK_LBUTTON))
+            m_pressIndex = -1;          // released outside the view before it became a drag
         if (m_pressIndex >= 0 && !m_busy &&
             std::hypot(GET_X_LPARAM(lp) - m_pressPt.x, GET_Y_LPARAM(lp) - m_pressPt.y) > S(kDragStart))
         {
@@ -1262,8 +1483,6 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             m_pressIndex = HitTest(ViewToSide(lp));
             m_pressPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            if (m_pressIndex >= 0)
-                SetCapture(m_view);
         }
         return 0;
     case WM_LBUTTONUP:
@@ -1271,29 +1490,19 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int pressed = m_pressIndex;
         m_pressIndex = -1;
-        if (GetCapture() == m_view)
-            ReleaseCapture();
         if (m_dragging)
             EndDrag(pt, false);
         else if (!m_busy && pressed >= 0 && HitTest(ViewToSide(lp)) == pressed)
             SwitchTo(static_cast<size_t>(pressed));
         return 0;
     }
-    case WM_CAPTURECHANGED:
-        if (m_dragging && reinterpret_cast<HWND>(lp) != m_view)
-        {
-            POINT pt;
-            GetCursorPos(&pt);
-            EndDrag({ pt.x - m_monitor.left, pt.y - m_monitor.top }, true);
-        }
-        m_pressIndex = -1;
-        return 0;
+
     case WM_RBUTTONUP:
         if (!m_busy)
         {
             int index = HitTest(ViewToSide(lp));
             if (index >= 0)
-                ShowCardMenu(static_cast<size_t>(index));
+                OpenCardMenu(static_cast<size_t>(index));
         }
         return 0;
     case WM_MOUSELEAVE:
@@ -1319,6 +1528,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_HOTKEY:
     {
         size_t index = static_cast<size_t>(wp - kHotkeyBase);
+        CloseCardMenu();
         if (!m_busy && !m_tucked && index < m_visible.size())
         {
             Prefetch();     // no hover happened; the outgoing window is captured on the way
@@ -1389,7 +1599,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         }
         else if (wp == kTimerFade)
             FadeOutFlyIn();
-        else if (wp == kTimerShrink && !m_busy && !m_dragging)
+        else if (wp == kTimerShrink && !m_busy && !m_dragging && !m_menu.open)
             ShrinkView();
         return 0;
     case WM_DISPLAYCHANGE:

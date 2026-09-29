@@ -190,27 +190,6 @@ wuc::CompositionDrawingSurface Snapshot::Render(Job const& job, Direct3D11Captur
     }
 }
 
-wuc::CompositionDrawingSurface Snapshot::Capture(HWND hwnd, RECT const& frame)
-{
-    auto job = Start(hwnd, frame);
-    if (!job)
-        return nullptr;
-    // Wait on the arrival event instead of polling; Sleep() granularity alone costs ~15ms per try.
-    winrt::handle arrived{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
-    HANDLE ev = arrived.get();
-    job->arrivedToken = job->pool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
-    job->session.StartCapture();
-    WaitForSingleObject(ev, 250);
-    wuc::CompositionDrawingSurface surface{ nullptr };
-    if (auto captured = job->pool.TryGetNextFrame())
-    {
-        surface = Render(*job, captured);
-        captured.Close();
-    }
-    job->Close();
-    return surface;
-}
-
 void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
 {
     auto queue = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
@@ -250,30 +229,80 @@ void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
     job->timeout.Start();
 }
 
+namespace
+{
+    // The window's app icon as a premultiplied WIC source D2D can draw.
+    winrt::com_ptr<IWICFormatConverter> IconSource(IWICImagingFactory* wic, HWND hwnd, int px)
+    {
+        bool owned = false;
+        HICON icon = LoadAppIcon(hwnd, px, owned);
+        winrt::com_ptr<IWICBitmap> bitmap;
+        winrt::com_ptr<IWICFormatConverter> converter;
+        bool ok = SUCCEEDED(wic->CreateBitmapFromHICON(icon, bitmap.put())) &&
+                  SUCCEEDED(wic->CreateFormatConverter(converter.put())) &&
+                  SUCCEEDED(converter->Initialize(bitmap.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                      nullptr, 0.f, WICBitmapPaletteTypeCustom));
+        if (owned)
+            DestroyIcon(icon);
+        return ok ? converter : nullptr;
+    }
+
+    void DrawIcon(ID2D1DeviceContext* dc, IWICFormatConverter* source, D2D1_RECT_F const& dst)
+    {
+        winrt::com_ptr<ID2D1Bitmap> bitmap;
+        if (source && SUCCEEDED(dc->CreateBitmapFromWicBitmap(source, nullptr, bitmap.put())))
+            dc->DrawBitmap(bitmap.get(), &dst, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
+    }
+}
+
 wuc::CompositionDrawingSurface Snapshot::Icon(HWND hwnd, int px)
 {
-    bool owned = false;
-    HICON icon = LoadAppIcon(hwnd, px, owned);
-    auto surface = m_graphics.CreateDrawingSurface({ static_cast<float>(px), static_cast<float>(px) },
-        DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
+    auto source = IconSource(m_wic.get(), hwnd, px);
+    float size = static_cast<float>(px);
+    return Paint(size, size, [&](ID2D1DeviceContext* dc) { DrawIcon(dc, source.get(), { 0, 0, size, size }); });
+}
 
-    winrt::com_ptr<IWICBitmap> wicBitmap;
-    winrt::com_ptr<IWICFormatConverter> converter;
-    if (SUCCEEDED(m_wic->CreateBitmapFromHICON(icon, wicBitmap.put())) &&
-        SUCCEEDED(m_wic->CreateFormatConverter(converter.put())) &&
-        SUCCEEDED(converter->Initialize(wicBitmap.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
-            nullptr, 0.f, WICBitmapPaletteTypeCustom)))
-    {
-        Draw(surface, [&](ID2D1DeviceContext* dc) {
-            winrt::com_ptr<ID2D1Bitmap> bitmap;
-            if (SUCCEEDED(dc->CreateBitmapFromWicBitmap(converter.get(), nullptr, bitmap.put())))
-            {
-                D2D1_RECT_F dst{ 0, 0, static_cast<float>(px), static_cast<float>(px) };
-                dc->DrawBitmap(bitmap.get(), &dst, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
-            }
-        });
-    }
-    if (owned)
-        DestroyIcon(icon);
+IDWriteFactory* Snapshot::Text()
+{
+    if (!m_dwrite)
+        winrt::check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(m_dwrite.put())));
+    return m_dwrite.get();
+}
+
+wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h)
+{
+    // Only the top 3:2 part of a card is visible in the sidebar; center the content there.
+    float pw = 320.f, ph = pw * h / w;
+    float visible = std::min(ph, pw / 1.5f);
+    auto source = IconSource(m_wic.get(), hwnd, 64);
+
+    wchar_t title[128]{};
+    GetWindowTextW(hwnd, title, ARRAYSIZE(title));
+    winrt::com_ptr<IDWriteTextFormat> format;
+    Text()->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 17.f, L"ko-kr", format.put());
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    DWRITE_TRIMMING trim{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+    winrt::com_ptr<IDWriteInlineObject> ellipsis;
+    Text()->CreateEllipsisTrimmingSign(format.get(), ellipsis.put());
+    format->SetTrimming(&trim, ellipsis.get());
+
+    return Paint(pw, ph, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> fill, ink;
+        dc->CreateSolidColorBrush(D2D1::ColorF(0.17f, 0.17f, 0.19f), fill.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.72f), ink.put());
+        dc->FillRectangle({ 0, 0, pw, ph }, fill.get());
+        float cy = visible / 2.f - 12.f;
+        DrawIcon(dc, source.get(), { pw / 2 - 32, cy - 32, pw / 2 + 32, cy + 32 });
+        dc->DrawTextW(title, static_cast<UINT32>(wcslen(title)), format.get(), { 20, cy + 44, pw - 20, cy + 70 }, ink.get());
+    });
+}
+
+wuc::CompositionDrawingSurface Snapshot::Paint(float w, float h, std::function<void(ID2D1DeviceContext*)> const& draw)
+{
+    auto surface = m_graphics.CreateDrawingSurface({ w, h }, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
+    Draw(surface, draw);
     return surface;
 }
