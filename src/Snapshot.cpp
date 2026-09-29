@@ -27,8 +27,9 @@ namespace
         owned = false;
         auto path = wt::ProcessPath(hwnd);
         // UWP apps are hosted by ApplicationFrameHost, whose exe icon is generic; ask the window instead.
+        // So is a browser web app whose icon file wasn't found: the window has the app's icon.
         bool frameHost = path.size() >= 24 && _wcsicmp(path.c_str() + path.size() - 24, L"ApplicationFrameHost.exe") == 0;
-        if (!path.empty() && !frameHost)
+        if (!path.empty() && !frameHost && wt::AppId(hwnd) == path)
         {
             HICON icon = nullptr;
             if (SUCCEEDED(SHDefExtractIconW(path.c_str(), 0, 0, &icon, nullptr, MAKELONG(px, 16))) && icon)
@@ -215,8 +216,25 @@ namespace
     // be scaled down crisply to whatever size it is shown at.
     winrt::com_ptr<IWICFormatConverter> IconSource(IWICImagingFactory* wic, HWND hwnd, int px)
     {
+        // A browser web app (YouTube, GitHub...): its own icon, not the browser's.
+        auto webIcon = wt::WebAppIcon(hwnd);
+        if (!webIcon.empty())
+        {
+            winrt::com_ptr<IWICBitmapDecoder> decoder;
+            winrt::com_ptr<IWICBitmapFrameDecode> frame;
+            winrt::com_ptr<IWICBitmap> bitmap;
+            winrt::com_ptr<IWICFormatConverter> converter;
+            // Decoded once into memory, so the file isn't held open while the icon is cached.
+            if (SUCCEEDED(wic->CreateDecoderFromFilename(webIcon.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.put())) &&
+                SUCCEEDED(decoder->GetFrame(0, frame.put())) &&
+                SUCCEEDED(wic->CreateBitmapFromSource(frame.get(), WICBitmapCacheOnLoad, bitmap.put())) &&
+                SUCCEEDED(wic->CreateFormatConverter(converter.put())) &&
+                SUCCEEDED(converter->Initialize(bitmap.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                    nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+                return converter;
+        }
         auto path = wt::ProcessPath(hwnd);
-        if (!path.empty() && !IsFrameHost(path))
+        if (!path.empty() && !IsFrameHost(path) && wt::AppId(hwnd) == path)
         {
             winrt::com_ptr<IShellItemImageFactory> images;
             HBITMAP hbmp = nullptr;
@@ -257,7 +275,7 @@ namespace
 
 winrt::com_ptr<IWICFormatConverter> Snapshot::CachedIcon(HWND hwnd)
 {
-    auto path = wt::ProcessPath(hwnd);
+    auto path = wt::AppId(hwnd);
     // UWP windows all belong to ApplicationFrameHost; their icons differ per window, so no caching.
     if (path.empty() || IsFrameHost(path))
         return IconSource(m_wic.get(), hwnd, 128);

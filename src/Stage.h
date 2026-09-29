@@ -154,6 +154,8 @@ private:
     Pose TargetPose(Card const& c) const;
     static void ForceForeground(HWND hwnd);
     static void BringBack(HWND hwnd);
+    static void Minimize(HWND hwnd);
+    void OnHidden(HWND hwnd);
     void GrowView();                                // whole monitor, for a transition
     void ShrinkView();                              // back to just the bar
     void Prefetch();
@@ -215,6 +217,7 @@ private:
     CardVis m_flyIn;
     std::shared_ptr<Card> m_inCard;
     std::vector<std::shared_ptr<OutFlight>> m_outs;
+    std::vector<HWND> m_hidden;                     // stage windows just hidden, see OnHidden
     std::vector<HWND> m_toMinimize;                 // stage windows whose flying copy is now on screen
     int m_pending = 0;                              // fly-out and fly-in steps still running
     wuc::CompositionScopedBatch m_inBatch{ nullptr };

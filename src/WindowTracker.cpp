@@ -31,7 +31,7 @@ namespace wt
         DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
         if (cloaked && !(otherDesktops && cloaked == DWM_CLOAKED_SHELL))
             return false;
-        if (GetWindow(hwnd, GW_OWNER))
+        if (GetWindow(hwnd, GW_OWNER) || ModalOwner(hwnd))
             return false;
         LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
         // Always-on-top windows (desktop pets, PiP players, overlays) stay where they are.
@@ -132,5 +132,145 @@ namespace wt
         RECT r = wp.rcNormalPosition;
         OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
         return r;
+    }
+
+    static bool IsDialog(HWND hwnd)
+    {
+        wchar_t cls[16]{};
+        GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+        return wcscmp(cls, L"#32770") == 0;
+    }
+
+    HWND ModalOwner(HWND dialog)
+    {
+        if (!dialog || !IsDialog(dialog))
+            return nullptr;
+        HWND root = GetAncestor(dialog, GA_ROOTOWNER);
+        if (root && root != dialog)
+            return root;
+        // Unowned (KakaoTalk's file picker): the window it blocks is a disabled window of the same
+        // process, preferably on the same thread, since a modal loop runs on the blocked window's thread.
+        struct Ctx { HWND self; DWORD pid, tid; HWND sameThread, sameProcess; } ctx{ dialog, 0, 0, nullptr, nullptr };
+        ctx.tid = GetWindowThreadProcessId(dialog, &ctx.pid);
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto c = reinterpret_cast<Ctx*>(lp);
+            if (h == c->self || IsWindowEnabled(h) || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) ||
+                GetWindowTextLengthW(h) == 0 || IsDialog(h))
+                return TRUE;
+            DWORD pid = 0;
+            DWORD tid = GetWindowThreadProcessId(h, &pid);
+            if (pid != c->pid)
+                return TRUE;
+            if (tid == c->tid)
+            {
+                c->sameThread = h;
+                return FALSE;
+            }
+            if (!c->sameProcess)
+                c->sameProcess = h;
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.sameThread ? ctx.sameThread : ctx.sameProcess;
+    }
+
+    HWND ModalDialog(HWND owner)
+    {
+        if (!owner || !IsWindow(owner) || IsWindowEnabled(owner))
+            return nullptr;
+        HWND popup = GetLastActivePopup(owner);
+        if (popup && popup != owner && IsWindowEnabled(popup))
+            return popup;
+        struct Ctx { HWND owner; DWORD pid; HWND found; } ctx{ owner, 0, nullptr };
+        GetWindowThreadProcessId(owner, &ctx.pid);
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto c = reinterpret_cast<Ctx*>(lp);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid == c->pid && h != c->owner && IsWindowVisible(h) && IsWindowEnabled(h) && IsDialog(h) &&
+                ModalOwner(h) == c->owner)
+            {
+                c->found = h;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.found;
+    }
+
+    // A browser web app window carries its own AppUserModelID, e.g. "Chrome._crx_<id>".
+    static std::wstring WebAppModelId(HWND hwnd)
+    {
+        winrt::com_ptr<IPropertyStore> store;
+        if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(store.put()))))
+            return {};
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        std::wstring id;
+        if (SUCCEEDED(store->GetValue(PKEY_AppUserModel_ID, &v)) && v.vt == VT_LPWSTR && v.pwszVal)
+            id = v.pwszVal;
+        PropVariantClear(&v);
+        return id.find(L"_crx_") != std::wstring::npos ? id : std::wstring{};
+    }
+
+    std::wstring AppId(HWND hwnd)
+    {
+        auto path = ProcessPath(hwnd);
+        auto web = WebAppModelId(hwnd);
+        return web.empty() || path.empty() ? path : path + L"#" + web;
+    }
+
+    std::wstring WebAppIcon(HWND hwnd)
+    {
+        auto id = WebAppModelId(hwnd);
+        if (id.empty())
+            return {};
+        // "Chrome._crx_<app id>[.<profile>]"; a long app id is shortened to its head and tail.
+        auto part = id.substr(id.find(L"_crx_") + 5);
+        part = part.substr(0, part.find(L'.'));
+        if (part.size() < 8)
+            return {};
+        auto head = part.substr(0, 6), tail = part.substr(part.size() - 6);
+
+        wchar_t local[MAX_PATH];
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH))
+            return {};
+        auto exe = ProcessPath(hwnd);
+        bool edge = exe.size() >= 10 && _wcsicmp(exe.c_str() + exe.size() - 10, L"msedge.exe") == 0;
+        std::wstring userData = std::wstring(local) + (edge ? L"\\Microsoft\\Edge\\User Data\\" : L"\\Google\\Chrome\\User Data\\");
+
+        // <profile>\Web Applications\Manifest Resources\<app id>\Icons\<size>.png, in any profile.
+        WIN32_FIND_DATAW profile;
+        HANDLE profiles = FindFirstFileW((userData + L"*").c_str(), &profile);
+        if (profiles == INVALID_HANDLE_VALUE)
+            return {};
+        std::wstring found;
+        do
+        {
+            if (!(profile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || profile.cFileName[0] == L'.')
+                continue;
+            auto base = userData + profile.cFileName + L"\\Web Applications\\Manifest Resources\\";
+            WIN32_FIND_DATAW app;
+            HANDLE apps = FindFirstFileW((base + head + L"*").c_str(), &app);
+            if (apps == INVALID_HANDLE_VALUE)
+                continue;
+            do
+            {
+                std::wstring name = app.cFileName;
+                if (name.size() < tail.size() || _wcsicmp(name.c_str() + name.size() - tail.size(), tail.c_str()) != 0)
+                    continue;
+                for (auto size : { L"128", L"144", L"192", L"256", L"96", L"64" })   // 128 is plenty, and small
+                {
+                    auto file = base + name + L"\\Icons\\" + size + L".png";
+                    if (GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    {
+                        found = file;
+                        break;
+                    }
+                }
+            } while (found.empty() && FindNextFileW(apps, &app));
+            FindClose(apps);
+        } while (found.empty() && FindNextFileW(profiles, &profile));
+        FindClose(profiles);
+        return found;
     }
 }

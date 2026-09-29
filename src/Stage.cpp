@@ -33,6 +33,8 @@ namespace
     constexpr UINT_PTR kTimerRecheck = 8;
     constexpr UINT_PTR kTimerDock = 9;
     constexpr UINT_PTR kTimerWatchdog = 10;
+    constexpr UINT_PTR kTimerHidden = 12;     // a hidden stage window: closed, or only put away?
+    constexpr UINT kHiddenMs = 300;
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
@@ -821,7 +823,7 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
         break;
     case EVENT_OBJECT_HIDE:
         if (g_stage->OnStage(hwnd))
-            g_stage->OnMinimizeStart(hwnd);        // put away like a minimize: into the sidebar
+            g_stage->OnHidden(hwnd);
         break;
     }
 }
@@ -829,6 +831,9 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
 void Stage::OnForeground(HWND hwnd)
 {
     Trace(L"foreground", hwnd);
+    // A dialog stands in for the window it blocks (a file picker in front of its chat window).
+    if (HWND owner = wt::ModalOwner(hwnd); owner && (OnStage(owner) || !IsIconic(owner)))
+        hwnd = owner;
     CloseCardMenu();
     if (!m_ready || m_busy)
         return;
@@ -930,7 +935,7 @@ void Stage::OnGone(HWND hwnd)
     if (IsWindow(hwnd))
     {
         if (!IsWindowVisible(hwnd) && OnStage(hwnd))
-            OnMinimizeStart(hwnd);                  // put away like a minimize: into the sidebar
+            OnHidden(hwnd);
         // Many apps hide a window just before destroying it; the second notice never comes, since it
         // already left the taskbar. Check again shortly.
         SetTimer(m_sidebar, kTimerSweep, 300, nullptr);
@@ -939,6 +944,18 @@ void Stage::OnGone(HWND hwnd)
     LeaveStage(hwnd);
     if (!m_busy)
         RemoveCard(hwnd, true);
+}
+
+// A stage window was hidden: closed to the tray (KakaoTalk, Discord: kept as a card, it can be
+// brought back), or about to be destroyed (a KakaoTalk chat closed with Esc: hidden first, destroyed
+// right after). Decided a moment later, so a closed window doesn't fly into the sidebar first.
+void Stage::OnHidden(HWND hwnd)
+{
+    if (std::find(m_hidden.begin(), m_hidden.end(), hwnd) == m_hidden.end())
+        m_hidden.push_back(hwnd);
+    // Off the stage meanwhile, or a focus change in between would fly it out as a leaving window.
+    LeaveStage(hwnd);
+    SetTimer(m_sidebar, kTimerHidden, kHiddenMs, nullptr);
 }
 
 bool Stage::OnStage(HWND hwnd) const
@@ -996,7 +1013,7 @@ void Stage::AdoptPinnedElsewhere()
     {
         if (!wt::IsCloaked(h) || OnStage(h) || std::any_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
             continue;
-        auto app = wt::ProcessPath(h);
+        auto app = wt::AppId(h);
         if (app.empty() || std::none_of(m_pinnedApps.begin(), m_pinnedApps.end(),
                 [&](auto& e) { return e.size() >= app.size() && _wcsicmp(e.c_str() + e.size() - app.size(), app.c_str()) == 0; }))
             continue;
@@ -1077,7 +1094,7 @@ void Stage::Adopt(HWND hwnd)
         SetSnapshot(*card, frame, surface);
         TrimMemory();
         if (!OnStage(card->hwnd) && IsWindow(card->hwnd))
-            ShowWindowAsync(card->hwnd, SW_MINIMIZE);
+            Minimize(card->hwnd);
     });
 }
 
@@ -1118,7 +1135,7 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
 {
     auto c = std::make_shared<Card>();
     c->hwnd = hwnd;
-    c->app = wt::ProcessPath(hwnd);
+    c->app = wt::AppId(hwnd);
     c->desktop = m_desktopId;                   // cards are only made for windows on the current desktop
     // Pinned if this app on this desktop has more pin entries than pinned cards. The desktop is only
     // asked for (a call into Explorer) when the app has a pin at all.
@@ -1588,7 +1605,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     std::erase_if(m_outs, [](auto& flight) {
         if (flight->card->side.holder)
             return false;
-        ShowWindowAsync(flight->card->hwnd, SW_MINIMIZE);
+        Minimize(flight->card->hwnd);
         return true;
     });
     for (auto& flight : m_outs)
@@ -1918,10 +1935,25 @@ void Stage::BringBack(HWND hwnd)
         ShowWindowAsync(hwnd, SW_RESTORE);
         PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
     }
+    // An unowned dialog blocking it was put away with it (see Minimize); owned ones follow by themselves.
+    if (HWND dialog = wt::ModalDialog(hwnd); dialog && IsIconic(dialog))
+        ShowWindowAsync(dialog, SW_RESTORE);
+}
+
+// Minimizes a window leaving the stage, together with an unowned dialog blocking it, which would
+// otherwise stay behind on screen with its window gone.
+void Stage::Minimize(HWND hwnd)
+{
+    ShowWindowAsync(hwnd, SW_MINIMIZE);
+    if (HWND dialog = wt::ModalDialog(hwnd); dialog && !GetWindow(dialog, GW_OWNER) && !IsIconic(dialog))
+        ShowWindowAsync(dialog, SW_MINIMIZE);
 }
 
 void Stage::ForceForeground(HWND hwnd)
 {
+    // A window blocked by a dialog can't take focus; the dialog is what the user needs.
+    if (HWND dialog = wt::ModalDialog(hwnd))
+        hwnd = dialog;
     if (SetForegroundWindow(hwnd))
         return;
     // Foreground lock: a synthetic Alt tap counts as input and lets us hand focus over.
@@ -2294,7 +2326,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 // A window the app hid itself (closed to the tray) stays hidden; minimizing it would
                 // bring it back onto the taskbar.
                 if (IsWindowVisible(h) && !IsIconic(h))
-                    ShowWindowAsync(h, SW_MINIMIZE);
+                    Minimize(h);
             }
             m_toMinimize.clear();
         }
@@ -2309,6 +2341,29 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             TrimMemory();
         else if (wp == kTimerDock)
             UpdateDock();
+        else if (wp == kTimerHidden)
+        {
+            if (m_busy)
+                SetTimer(m_sidebar, kTimerHidden, kHiddenMs, nullptr);
+            else
+            {
+                auto hidden = std::move(m_hidden);
+                m_hidden.clear();
+                KillTimer(m_sidebar, kTimerHidden);
+                for (HWND h : hidden)
+                {
+                    if (!IsWindow(h))
+                        OnGone(h);                  // closed: no card
+                    else if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [h](auto& c) { return c->hwnd == h; }))
+                    {
+                        m_stage.push_back(h);       // back where it was, then:
+                        if (!IsWindowVisible(h))
+                            OnMinimizeStart(h);     // put away like a minimize: into the sidebar
+                    }
+                }
+                UpdateDock();
+            }
+        }
         else if (wp == kTimerSweep)
         {
             if (m_busy)
