@@ -15,6 +15,7 @@ struct Card
 {
     HWND hwnd{};
     RECT frame{};           // last known on-screen frame (physical px)
+    RECT border{};          // invisible resize borders: window rect minus visible frame, per side
     bool hasSnapshot = false;
     float w = 0, h = 0;     // sprite size = frame size
     wuc::CompositionSurfaceBrush snapshot{ nullptr };
@@ -68,7 +69,7 @@ private:
     float S(float v) const { return v * m_scale; }
     float2 SlotCenter(size_t i) const;          // sidebar coords
     float ThumbScale(Card const& c) const;
-    float4x4 Perspective() const;
+    float4x4 Perspective(float2 eye) const;
     Crop CropFor(Card const& c, bool thumb) const;
     Pose SlotPose(Card const& c, size_t i) const;
 
@@ -102,6 +103,7 @@ private:
     static void ForceForeground(HWND hwnd);
     void ShowAnimLayer();
     void HideAnimLayer();
+    void Prefetch();                                // snapshot the stage window before a click needs it
 
     HINSTANCE m_inst{};
     HMONITOR m_mon{};
@@ -122,7 +124,9 @@ private:
     // All sidebar cards. Lives under m_sideRoot, but moves into the animation layer during a
     // transition: a layered window on top hides the composition content of windows below it.
     wuc::ContainerVisual m_sideContent{ nullptr };
+    wuc::SpriteVisual m_mirror{ nullptr };          // live copy of the sidebar inside the animation layer
     wuc::ContainerVisual m_animRoot{ nullptr };
+    wuc::ContainerVisual m_animStage{ nullptr };    // flying cards; same camera as the sidebar
     wuc::CompositionColorBrush m_placeholderBrush{ nullptr };
     wuc::CompositionEasingFunction m_ease{ nullptr };
 
@@ -139,6 +143,14 @@ private:
     std::shared_ptr<Card> m_outCard, m_inCard;
     int m_pending = 0;                              // fly-out and fly-in steps still running
     wuc::CompositionScopedBatch m_inBatch{ nullptr };
+    // Snapshot of the stage window taken when the pointer enters the sidebar, so a click can send it
+    // off immediately instead of waiting ~100ms for a capture session.
+    HWND m_prefetchHwnd{};
+    RECT m_prefetchFrame{};
+    ULONGLONG m_prefetchAt = 0;
+    bool m_prefetching = false;
+    bool m_outWaitsForPrefetch = false;
+    wuc::CompositionDrawingSurface m_prefetch{ nullptr };
     wuc::CompositionScopedBatch m_outBatch{ nullptr };
     int m_hover = -1;
     bool m_tracking = false;

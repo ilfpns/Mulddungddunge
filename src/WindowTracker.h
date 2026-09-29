@@ -8,5 +8,5 @@ namespace wt
     bool IsFullscreen(HWND hwnd);
     std::vector<HWND> EnumManageable(HMONITOR monitor);   // top of z-order first
     RECT FrameRect(HWND hwnd);                              // visible frame, without invisible resize borders
-    RECT RestoreRect(HWND hwnd);                            // where a minimized window comes back to
+    RECT RestoreRect(HWND hwnd, bool* maximized = nullptr); // window rect a minimized window comes back to
 }

@@ -17,14 +17,16 @@ namespace
     constexpr float kThumbH = 140.f;
     constexpr float kPitch = 172.f;
     constexpr float kTilt = 42.f;        // degrees
-    constexpr float kDepthRatio = 2.2f;  // perspective distance relative to card width, so every card bends alike
+    constexpr float kDepthRatio = 2.4f;  // camera distance relative to card width
     constexpr float kRadius = 8.f;
     constexpr float kBadge = 34.f;
     constexpr float kHoverGrow = 1.07f;
     constexpr size_t kMaxCards = 4;
     constexpr int kSlideMs = 260;
-    constexpr int kFlyMs = 380;
-    constexpr int kFadeMs = 120;
+    constexpr int kFlyMs = 420;
+    constexpr int kFadeMs = 150;
+    constexpr int kPaintWaitMs = 110;    // restored windows need a moment to repaint before the copy fades
+    constexpr ULONGLONG kPrefetchMaxAge = 4000;
     constexpr ULONGLONG kQuietMs = 700;
 
     Stage* g_stage = nullptr;
@@ -45,7 +47,8 @@ namespace
 
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
     {
-        return c.CreateCubicBezierEasingFunction({ 0.2f, 0.9f }, { 0.25f, 1.f });
+        // Smooth ease-out: quick departure, long gentle landing.
+        return c.CreateCubicBezierEasingFunction({ 0.22f, 0.8f }, { 0.28f, 1.f });
     }
 }
 
@@ -104,6 +107,8 @@ bool Stage::Init(HINSTANCE inst)
     m_sideContent = m_compositor.CreateContainerVisual();
     m_sideRoot.Children().InsertAtTop(m_sideContent);
     m_animTarget.Root(m_animRoot);
+    m_animStage = m_compositor.CreateContainerVisual();
+    m_animRoot.Children().InsertAtTop(m_animStage);
     m_placeholderBrush = m_compositor.CreateColorBrush({ 255, 58, 58, 64 });
     m_ease = MakeEase(m_compositor);
     m_snap.Init(m_compositor);
@@ -139,6 +144,26 @@ void Stage::Dock()
     m_bar = appbar::Dock(m_sidebar, m_monitor, static_cast<int>(S(kSidebarW)));
     SetWindowPos(m_sidebar, HWND_TOPMOST, m_bar.left, m_bar.top,
         m_bar.right - m_bar.left, m_bar.bottom - m_bar.top, SWP_NOACTIVATE);
+
+    // A layered window on top hides the composition content of the sidebar below it, so while the
+    // animation layer is up it shows a live mirror of the sidebar. The mirror is only rendered while
+    // that window is visible, so it costs nothing at rest.
+    float2 barSize{ static_cast<float>(m_bar.right - m_bar.left), static_cast<float>(m_bar.bottom - m_bar.top) };
+    auto mirrorSource = m_compositor.CreateVisualSurface();
+    mirrorSource.SourceVisual(m_sideRoot);
+    mirrorSource.SourceSize(barSize);
+    auto mirror = m_compositor.CreateSpriteVisual();
+    mirror.Size(barSize);
+    mirror.Offset({ static_cast<float>(m_bar.left - m_monitor.left), static_cast<float>(m_bar.top - m_monitor.top), 0.f });
+    mirror.Brush(m_compositor.CreateSurfaceBrush(mirrorSource));
+    if (m_mirror)
+        m_animRoot.Children().Remove(m_mirror);
+    m_mirror = mirror;
+    m_animRoot.Children().InsertAtBottom(m_mirror);
+
+    float2 eye{ S(kSidebarW) / 2.f, barSize.y / 2.f };
+    m_sideContent.TransformMatrix(Perspective(eye));
+    m_animStage.TransformMatrix(Perspective(SideToAnim(eye)));
 }
 
 void Stage::AddTrayIcon()
@@ -194,11 +219,14 @@ Crop Stage::CropFor(Card const& c, bool thumb) const
     return { { (c.w - cw) / 2.f, 0.f }, { cw, ch } };
 }
 
-float4x4 Stage::Perspective() const
+// One camera for the whole sidebar, looking at its center (like macOS): the cards' edges then run
+// parallel instead of each card fanning out around its own center.
+float4x4 Stage::Perspective(float2 eye) const
 {
-    auto m = float4x4::identity();
-    m.m34 = -1.f / (kDepthRatio * S(kThumbW));
-    return m;
+    using namespace winrt::Windows::Foundation::Numerics;
+    auto p = float4x4::identity();
+    p.m34 = -1.f / (kDepthRatio * S(kThumbW));
+    return make_float4x4_translation(-eye.x, -eye.y, 0.f) * p * make_float4x4_translation(eye.x, eye.y, 0.f);
 }
 
 Pose Stage::SlotPose(Card const& c, size_t i) const
@@ -373,6 +401,12 @@ void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurfa
 {
     if (!surface)
         return;
+    if (!IsZoomed(c.hwnd))
+    {
+        RECT wr;
+        GetWindowRect(c.hwnd, &wr);
+        c.border = { frame.left - wr.left, frame.top - wr.top, wr.right - frame.right, wr.bottom - frame.bottom };
+    }
     c.frame = frame;
     c.w = static_cast<float>(frame.right - frame.left);
     c.h = static_cast<float>(frame.bottom - frame.top);
@@ -386,7 +420,6 @@ void Stage::ApplySize(CardVis const& v, Card const& c)
 {
     v.sprite.Size({ c.w, c.h });
     v.sprite.Brush(c.hasSnapshot ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
-    v.holder.TransformMatrix(Perspective());
 }
 
 void Stage::SetMinAnimate(bool on)
@@ -586,7 +619,17 @@ Pose Stage::FramePose(Card const& c) const
 
 Pose Stage::TargetPose(Card const& c) const
 {
-    RECT r = IsIconic(c.hwnd) ? wt::RestoreRect(c.hwnd) : wt::FrameRect(c.hwnd);
+    RECT r;
+    if (IsIconic(c.hwnd))
+    {
+        // The placement rect includes invisible resize borders; land exactly on the visible frame.
+        bool maximized = false;
+        r = wt::RestoreRect(c.hwnd, &maximized);
+        if (!maximized)
+            r = { r.left + c.border.left, r.top + c.border.top, r.right - c.border.right, r.bottom - c.border.bottom };
+    }
+    else
+        r = wt::FrameRect(c.hwnd);
     return PoseForRect(r, m_monitor, c.w);
 }
 
@@ -650,15 +693,26 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         ++m_pending;
         m_outCard->side.holder.Opacity(0.f);
         RECT frame = wt::FrameRect(prev);
-        m_snap.CaptureAsync(prev, frame, [this, card = m_outCard, frame](auto const& surface) {
-            OnOutCaptured(card, frame, surface);
-        });
+        bool fresh = m_prefetch && m_prefetchHwnd == prev && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge &&
+                     EqualRect(&frame, &m_prefetchFrame);
+        if (fresh)
+        {
+            auto surface = m_prefetch;
+            m_prefetch = nullptr;
+            OnOutCaptured(m_outCard, frame, surface);
+        }
+        else if (m_prefetching && m_prefetchHwnd == prev)
+            m_outWaitsForPrefetch = true;
+        else
+            m_snap.CaptureAsync(prev, frame, [this, card = m_outCard, frame](auto const& surface) {
+                OnOutCaptured(card, frame, surface);
+            });
     }
     if (m_inCard)
     {
         ++m_pending;
         m_flyIn = MakeVis(*m_inCard, false);
-        m_animRoot.Children().InsertAtTop(m_flyIn.holder);
+        m_animStage.Children().InsertAtTop(m_flyIn.holder);
         Pose to = TargetPose(*m_inCard);
         ApplyPose(m_flyIn, *m_inCard, nextFrom);
         m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
@@ -676,18 +730,39 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
 
 void Stage::ShowAnimLayer()
 {
-    m_sideRoot.Children().Remove(m_sideContent);
-    m_sideContent.Offset({ static_cast<float>(m_bar.left - m_monitor.left), static_cast<float>(m_bar.top - m_monitor.top), 0.f });
-    m_animRoot.Children().InsertAtBottom(m_sideContent);
     SetWindowPos(m_anim, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 void Stage::HideAnimLayer()
 {
-    m_animRoot.Children().RemoveAll();
-    m_sideContent.Offset({ 0.f, 0.f, 0.f });
-    m_sideRoot.Children().InsertAtTop(m_sideContent);
+    if (m_flyOut.holder)
+        m_animStage.Children().Remove(m_flyOut.holder);
+    if (m_flyIn.holder)
+        m_animStage.Children().Remove(m_flyIn.holder);
     ShowWindow(m_anim, SW_HIDE);
+}
+
+void Stage::Prefetch()
+{
+    HWND h = m_active;
+    if (m_busy || m_prefetching || !h || !IsWindowVisible(h) || IsIconic(h))
+        return;
+    if (h == m_prefetchHwnd && m_prefetch && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge / 2)
+        return;
+    m_prefetching = true;
+    m_prefetchHwnd = h;
+    m_prefetchFrame = wt::FrameRect(h);
+    m_snap.CaptureAsync(h, m_prefetchFrame, [this, h](auto const& surface) {
+        m_prefetching = false;
+        m_prefetch = surface;
+        m_prefetchAt = GetTickCount64();
+        if (m_outWaitsForPrefetch && m_outCard && m_outCard->hwnd == h)
+        {
+            m_outWaitsForPrefetch = false;
+            m_prefetch = nullptr;
+            OnOutCaptured(m_outCard, m_prefetchFrame, surface);
+        }
+    });
 }
 
 void Stage::OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::CompositionDrawingSurface const& surface)
@@ -698,7 +773,7 @@ void Stage::OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::Co
 
     // Below the incoming copy, so the new window visibly lands on top.
     m_flyOut = MakeVis(*card, false);
-    m_animRoot.Children().InsertAtBottom(m_flyOut.holder);
+    m_animStage.Children().InsertAtBottom(m_flyOut.holder);
     Pose from = PoseForRect(frame, m_monitor, card->w);
     Pose to = SlotPose(*card, 0);
     to.center = SideToAnim(to.center);
@@ -709,7 +784,7 @@ void Stage::OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::Co
     m_outBatch.Completed([this](auto&&, auto&&) {
         m_outBatch = nullptr;
         if (m_flyOut.holder)
-            m_animRoot.Children().Remove(m_flyOut.holder);
+            m_animStage.Children().Remove(m_flyOut.holder);
         m_flyOut = {};
         if (m_outCard && m_outCard->side.holder)
             m_outCard->side.holder.Opacity(1.f);
@@ -726,7 +801,7 @@ void Stage::OnFlyInDone()
         ShowWindowAsync(m_inCard->hwnd, SW_RESTORE);
     ForceForeground(m_inCard->hwnd);
     // Give the real window a moment to paint before the flying copy fades away.
-    SetTimer(m_sidebar, kTimerFade, 90, nullptr);
+    SetTimer(m_sidebar, kTimerFade, kPaintWaitMs, nullptr);
 }
 
 void Stage::FadeOutFlyIn()
@@ -760,6 +835,8 @@ void Stage::FinishTransition()
     m_outCard = nullptr;
     m_inCard = nullptr;
     m_pending = 0;
+    m_outWaitsForPrefetch = false;
+    m_prefetch = nullptr;
     if (shown)
         HideAnimLayer();
     m_quietUntil = GetTickCount64() + kQuietMs / 2;
@@ -830,6 +907,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, m_sidebar, 0 };
             m_tracking = TrackMouseEvent(&tme);
+            Prefetch();
         }
         if (!m_busy)
             SetHover(HitTest({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }));
@@ -844,6 +922,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSELEAVE:
         m_tracking = false;
+        if (!m_busy)
+            m_prefetch = nullptr;       // don't hold the memory once the pointer leaves
         SetHover(-1);
         return 0;
     case WM_APPBAR_CB:

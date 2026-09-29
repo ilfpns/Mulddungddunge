@@ -75,13 +75,16 @@ namespace wt
         return r;
     }
 
-    RECT RestoreRect(HWND hwnd)
+    RECT RestoreRect(HWND hwnd, bool* maximized)
     {
         WINDOWPLACEMENT wp{ sizeof(wp) };
         GetWindowPlacement(hwnd, &wp);
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-        if (wp.flags & WPF_RESTORETOMAXIMIZED)
+        bool max = (wp.flags & WPF_RESTORETOMAXIMIZED) != 0;
+        if (maximized)
+            *maximized = max;
+        if (max)
             return mi.rcWork;
         // rcNormalPosition is in workspace coordinates.
         RECT r = wp.rcNormalPosition;
