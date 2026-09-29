@@ -28,6 +28,7 @@ namespace
     constexpr UINT_PTR kTimerTrim = 6;
     constexpr UINT_PTR kTimerTuck = 7;
     constexpr UINT_PTR kTimerRecheck = 8;
+    constexpr UINT_PTR kTimerDock = 9;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
 
     constexpr float kSidebarW = 210.f;
@@ -437,6 +438,7 @@ void Stage::CloseCardMenu()
     batch.End();
     batch.Completed([this, root](auto&&, auto&&) {
         m_root.Children().Remove(root);         // releases the text surface too
+        TrimMemory();
         if (!m_busy && !m_dragging && !m_menu.open)
             ShrinkView();
     });
@@ -664,6 +666,8 @@ void Stage::OnForeground(HWND hwnd)
 
 void Stage::OnMinimizeStart(HWND hwnd)
 {
+    if (m_ready)
+        SetTimer(m_sidebar, kTimerDock, 100, nullptr);     // e.g. a fullscreen game minimized by Alt+Tab
     if (!m_ready || !OnStage(hwnd))
         return;
     // Minimized by the user (button, Win+D, four-finger swipe). It can't be photographed any more, so
@@ -719,6 +723,8 @@ void Stage::SnapActiveSoon()
 void Stage::OnGone(HWND hwnd)
 {
     Trace(L"gone", hwnd);
+    // A fullscreen app closing may bring no focus change with it (e.g. focus already on a pet window).
+    SetTimer(m_sidebar, kTimerDock, 100, nullptr);
     if (!IsWindowVisible(hwnd))
         LeaveStage(hwnd);
     if (m_busy || IsWindowVisible(hwnd))
@@ -810,12 +816,14 @@ void Stage::Adopt(HWND hwnd)
             Trace(surface ? L"minimized window photographed via DWM" : L"minimized window: no DWM picture", card->hwnd);
             if (surface)
                 SetSnapshot(*card, card->frame, surface);
+            TrimMemory();
         });
         return;
     }
     RECT frame = wt::FrameRect(hwnd);
     m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
         SetSnapshot(*card, frame, surface);
+        TrimMemory();
         if (!OnStage(card->hwnd) && IsWindow(card->hwnd))
             ShowWindowAsync(card->hwnd, SW_MINIMIZE);
     });
@@ -850,7 +858,7 @@ void Stage::Park(std::shared_ptr<Card> card)
     card->side = {};
     std::erase_if(m_offstage, [&](auto& c) { return c->hwnd == card->hwnd; });
     m_offstage.push_back(card);
-    if (m_offstage.size() > 8)                      // only windows currently on stage need one
+    if (m_offstage.size() > 4)                      // only windows currently on stage need one
         m_offstage.erase(m_offstage.begin());
 }
 
@@ -1878,6 +1886,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                     if (!surface || h != m_active)
                         return;
                     Trace(L"stage window photographed", h);
+                    TrimMemory();
                     m_activeSnap = surface;
                     m_activeSnapHwnd = h;
                     m_activeSnapFrame = frame;
@@ -1900,6 +1909,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         }
         else if (wp == kTimerTrim)
             TrimMemory();
+        else if (wp == kTimerDock)
+            UpdateDock();
         else if (wp == kTimerRecheck)
         {
             HWND fg = GetForegroundWindow();
