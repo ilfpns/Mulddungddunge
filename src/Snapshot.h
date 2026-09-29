@@ -38,6 +38,10 @@ private:
     winrt::com_ptr<ID2D1Device> m_d2d;
     winrt::com_ptr<IWICImagingFactory> m_wic;
     winrt::com_ptr<IDWriteFactory> m_dwrite;
+    // App icons, decoded once per executable (128px): extracting them through the shell is the slowest
+    // part of making a card.
+    winrt::com_ptr<IWICFormatConverter> CachedIcon(HWND hwnd);
+    std::vector<std::pair<std::wstring, winrt::com_ptr<IWICFormatConverter>>> m_icons;
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_device{ nullptr };
     wuc::CompositionGraphicsDevice m_graphics{ nullptr };
 };

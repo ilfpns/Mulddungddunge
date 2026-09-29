@@ -2,7 +2,7 @@
 
 namespace wt
 {
-    static bool IsCloaked(HWND hwnd)
+    bool IsCloaked(HWND hwnd)
     {
         DWORD cloaked = 0;
         return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked;
@@ -45,7 +45,9 @@ namespace wt
 
     bool IsFullscreen(HWND hwnd)
     {
-        if (!hwnd || IsIconic(hwnd) || (GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
+        // A maximized borderless app (Discord, Spotify, VS Code...) also covers the whole monitor when the
+        // taskbar auto-hides; it is maximized, not fullscreen.
+        if (!hwnd || IsIconic(hwnd) || IsZoomed(hwnd) || (GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
             return false;
         RECT r;
         GetWindowRect(hwnd, &r);

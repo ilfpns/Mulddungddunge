@@ -27,6 +27,7 @@ struct Card
 {
     HWND hwnd{};
     std::wstring app;       // executable path; pins are remembered per app
+    GUID desktop{};         // virtual desktop it was last seen on (GUID_NULL: unknown, treated as everywhere)
     RECT frame{};           // last known on-screen frame (physical px)
     RECT border{};          // invisible resize borders: window rect minus visible frame, per side
     bool hasSnapshot = false;   // a real picture of the window (otherwise a placeholder, or nothing if released)
@@ -85,7 +86,8 @@ private:
     void SetMenuHover(int item);
     void RunMenuItem(int item);
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
-    bool OnCurrentDesktop(HWND hwnd) const;
+    GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
+    bool Here(Card const& c) const;                 // uses the cached desktop: no call
     static GUID CurrentDesktopId();
     void SyncDesktop();
     void Adopt(HWND hwnd);
@@ -215,6 +217,7 @@ private:
     // photographed once shortly after it takes the stage.
     HWND m_activeSnapHwnd{};
     RECT m_activeSnapFrame{};
+    ULONGLONG m_activeSnapAt = 0;
     wuc::CompositionDrawingSurface m_activeSnap{ nullptr };
     int m_hover = -1;
     bool m_tracking = false;

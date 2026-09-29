@@ -48,6 +48,9 @@ namespace
     constexpr int kFadeMs = 150;
     constexpr int kPaintWaitMs = 110;    // restored windows need a moment to repaint before the copy fades
     constexpr ULONGLONG kPrefetchMaxAge = 4000;
+    // A picture of the stage window this recent (and with the window unmoved) is reused instead of
+    // starting another capture session, which is most of what a switch costs.
+    constexpr ULONGLONG kReuseMaxAge = 3000;
     constexpr float kDragStart = 8.f;    // px of movement before a press turns into a drag
     constexpr ULONGLONG kQuietMs = 700;
 
@@ -56,23 +59,19 @@ namespace
 
     // Opt-in event trace for diagnosing window-manager interactions: create %TEMP%\stage-manager.trace
     // before starting and events are appended to it. Off (one check at startup) otherwise.
-    bool g_trace = false;
+    // Opened once at startup when enabled and kept open: opening a file per event (with antivirus
+    // scanning each open) cost tens of milliseconds per event.
+    FILE* g_trace = nullptr;
 
     void Trace(wchar_t const* what, HWND hwnd = nullptr)
     {
         if (!g_trace)
             return;
-        wchar_t path[MAX_PATH], title[64]{};
-        GetTempPathW(MAX_PATH, path);
-        wcscat_s(path, L"stage-manager.trace");
+        wchar_t title[64]{};
         if (hwnd)
             GetWindowTextW(hwnd, title, ARRAYSIZE(title));
-        FILE* f = nullptr;
-        if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f)
-        {
-            fwprintf(f, L"%llu %s %p '%s'\n", GetTickCount64(), what, hwnd, title);
-            fclose(f);
-        }
+        fwprintf(g_trace, L"%llu %s %p '%s'\n", GetTickCount64(), what, hwnd, title);
+        fflush(g_trace);
     }
 
     // Appends to %TEMP%\stage-manager.log; only written when something goes wrong.
@@ -89,6 +88,17 @@ namespace
         }
     }
 
+    // Keeps Task Manager's "Memory" (private working set) under ~8MB. Trimming has a cost of its own
+    // (and pages are faulted back in right after), so it only happens when above that.
+    void TrimMemory()
+    {
+        PROCESS_MEMORY_COUNTERS_EX2 pmc{ sizeof(pmc) };
+        if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) &&
+            pmc.PrivateWorkingSetSize < 8u * 1024 * 1024)
+            return;
+        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+    }
+
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
     {
         // Smooth ease-out: quick departure, long gentle landing.
@@ -103,7 +113,8 @@ bool Stage::Init(HINSTANCE inst)
         wchar_t path[MAX_PATH];
         GetTempPathW(MAX_PATH, path);
         wcscat_s(path, L"stage-manager.trace");
-        g_trace = GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+            g_trace = _wfsopen(path, L"a, ccs=UTF-8", _SH_DENYNO);   // others can read it while we run
     }
 
     m_mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -185,6 +196,8 @@ void Stage::Shutdown()
     for (auto& [pid, hook] : m_moveHooks)
         UnhookWinEvent(hook);
     DeregisterShellHookWindow(m_sidebar);
+    if (g_trace)
+        fclose(g_trace);
     NOTIFYICONDATAW nid{ sizeof(nid) };
     nid.hWnd = m_sidebar;
     nid.uID = 1;
@@ -727,20 +740,36 @@ void Stage::LeaveStage(HWND hwnd)
         m_active = m_stage.empty() ? nullptr : m_stage.back();
 }
 
-bool Stage::OnCurrentDesktop(HWND hwnd) const
+GUID Stage::DesktopOf(HWND hwnd) const
 {
-    BOOL on = TRUE;
-    if (m_desktops && FAILED(m_desktops->IsWindowOnCurrentVirtualDesktop(hwnd, &on)))
-        return true;
-    return on != FALSE;
+    GUID id{};
+    if (m_desktops)
+        m_desktops->GetWindowDesktopId(hwnd, &id);
+    return id;
 }
 
+// Card desktops are cached so layout never has to ask Explorer; they are refreshed when the desktop
+// changes (windows may have been moved between desktops in Task View meanwhile).
+bool Stage::Here(Card const& c) const
+{
+    return c.desktop == GUID_NULL || m_desktopId == GUID_NULL || c.desktop == m_desktopId;
+}
+
+// Explorer keeps the current desktop in the registry: under Explorer\VirtualDesktops on Windows 11,
+// under the session's key on Windows 10. Reading it is far cheaper than asking Explorer.
 GUID Stage::CurrentDesktopId()
 {
     GUID id{};
     DWORD size = sizeof(id);
-    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
-        L"CurrentVirtualDesktop", RRF_RT_REG_BINARY, nullptr, &id, &size);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
+            L"CurrentVirtualDesktop", RRF_RT_REG_BINARY, nullptr, &id, &size) == ERROR_SUCCESS)
+        return id;
+    DWORD session = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    wchar_t key[160];
+    swprintf_s(key, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\%lu\\VirtualDesktops", session);
+    size = sizeof(id);
+    RegGetValueW(HKEY_CURRENT_USER, key, L"CurrentVirtualDesktop", RRF_RT_REG_BINARY, nullptr, &id, &size);
     return id;
 }
 
@@ -749,6 +778,8 @@ GUID Stage::CurrentDesktopId()
 void Stage::SyncDesktop()
 {
     Trace(L"desktop switched");
+    for (auto& c : m_cards)
+        c->desktop = DesktopOf(c->hwnd);
     HWND fg = GetForegroundWindow();
     m_active = wt::IsManageable(fg, m_mon) ? fg : nullptr;
     m_stage.clear();
@@ -828,6 +859,7 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     auto c = std::make_shared<Card>();
     c->hwnd = hwnd;
     c->app = wt::ProcessPath(hwnd);
+    c->desktop = m_desktopId;                   // cards are only made for windows on the current desktop
     // Pinned if this app has more pin entries than it currently has pinned cards.
     auto same = [&](auto const& app) { return !c->app.empty() && _wcsicmp(app.c_str(), c->app.c_str()) == 0; };
     auto wanted = std::count_if(m_pinnedApps.begin(), m_pinnedApps.end(), same);
@@ -839,8 +871,12 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->snapshot = m_compositor.CreateSurfaceBrush();
     c->snapshot.Stretch(wuc::CompositionStretch::Fill);
     c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
-    c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, kPlaceholderScale * S(kThumbW) * c->w / CropFor(*c, true).size.x));
-    c->hasPicture = true;
+    // Only a minimized window needs a stand-in; a visible one is photographed right away.
+    if (IsIconic(hwnd))
+    {
+        c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, kPlaceholderScale * S(kThumbW) * c->w / CropFor(*c, true).size.x));
+        c->hasPicture = true;
+    }
     return c;
 }
 
@@ -1001,7 +1037,7 @@ void Stage::Relayout(bool animate)
     std::vector<std::pair<GUID, size_t>> perDesktop;
     for (auto& c : m_cards)
     {
-        bool here = OnCurrentDesktop(c->hwnd);
+        bool here = Here(*c);
         if (here && m_visible.size() < kMaxCards)
         {
             m_visible.push_back(c);
@@ -1010,12 +1046,11 @@ void Stage::Relayout(bool animate)
         if (c->side.holder)
             c->side.holder.IsVisible(false);
         bool shown = false;
-        GUID desk{};
-        if (!here && m_desktops && SUCCEEDED(m_desktops->GetWindowDesktopId(c->hwnd, &desk)))
+        if (!here)
         {
-            auto it = std::find_if(perDesktop.begin(), perDesktop.end(), [&](auto& d) { return d.first == desk; });
+            auto it = std::find_if(perDesktop.begin(), perDesktop.end(), [&](auto& d) { return d.first == c->desktop; });
             if (it == perDesktop.end())
-                it = perDesktop.insert(perDesktop.end(), { desk, 0 });
+                it = perDesktop.insert(perDesktop.end(), { c->desktop, 0 });
             shown = it->second++ < kMaxCards;
         }
         if (!shown && c->hasPicture)
@@ -1030,7 +1065,7 @@ void Stage::Relayout(bool animate)
     for (size_t i = 0; i < m_visible.size(); ++i)
     {
         auto& c = *m_visible[i];
-        if (!c.hasPicture)
+        if (!c.hasPicture && IsIconic(c.hwnd))
         {
             // Back in view after its picture was released.
             c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, kPlaceholderScale * S(kThumbW) * c.w / CropFor(c, true).size.x));
@@ -1131,6 +1166,7 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
             return MakeCard(hwnd);
         auto card = *parked;
         m_offstage.erase(parked);
+        card->desktop = m_desktopId;
         return card;
     }
     auto card = *it;
@@ -1170,7 +1206,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     std::vector<HWND> leaving;
     for (HWND h : m_stage)
     {
-        if (h == next || !IsWindow(h) || !OnCurrentDesktop(h))
+        if (h == next || !IsWindow(h) || wt::IsCloaked(h))
             continue;
         if (IsWindowVisible(h) && !IsIconic(h))
             leaving.push_back(h);
@@ -1217,10 +1253,18 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         RECT frame = wt::FrameRect(h);
         bool fresh = m_prefetch && m_prefetchHwnd == h && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge &&
                      EqualRect(&frame, &m_prefetchFrame);
+        bool recent = m_activeSnap && m_activeSnapHwnd == h && GetTickCount64() - m_activeSnapAt < kReuseMaxAge &&
+                      EqualRect(&frame, &m_activeSnapFrame);
         if (fresh)
         {
             auto surface = m_prefetch;
             m_prefetch = nullptr;
+            OnOutCaptured(flight, frame, surface);
+        }
+        else if (recent)
+        {
+            auto surface = m_activeSnap;
+            m_activeSnap = nullptr;
             OnOutCaptured(flight, frame, surface);
         }
         else if (m_prefetching && m_prefetchHwnd == h)
@@ -1308,7 +1352,8 @@ void Stage::SetDock(DockState state)
 
 bool Stage::CoversBar(HWND hwnd) const
 {
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !OnCurrentDesktop(hwnd))
+    // Windows on other desktops are cloaked by DWM: a cheap attribute read instead of asking Explorer.
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || wt::IsCloaked(hwnd))
         return false;
     RECT frame = wt::FrameRect(hwnd), overlap;
     return IntersectRect(&overlap, &frame, &m_bar) && overlap.right - overlap.left > S(4);
@@ -1381,6 +1426,8 @@ void Stage::Prefetch()
         return;
     if (h == m_prefetchHwnd && m_prefetch && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge / 2)
         return;
+    if (h == m_activeSnapHwnd && m_activeSnap && GetTickCount64() - m_activeSnapAt < kReuseMaxAge)
+        return;                                     // the stage window's recent picture will do
     m_prefetching = true;
     m_prefetchHwnd = h;
     m_prefetchFrame = wt::FrameRect(h);
@@ -1489,7 +1536,7 @@ void Stage::FinishTransition()
     StageChanged();                                 // after m_busy is cleared, or the dock won't update
     // Focus changes that arrived while animating were ignored; catch up once things have settled.
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
-    SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+    TrimMemory();
 }
 
 void Stage::ForceForeground(HWND hwnd)
@@ -1805,13 +1852,12 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         KillTimer(m_sidebar, wp);
         if (wp == kTimerPopulate)
         {
+            m_desktopId = CurrentDesktopId();
             Populate();
             SnapActiveSoon();
             m_ready = true;
             StageChanged();
             SetTimer(m_sidebar, kTimerTrim, 3000, nullptr);     // after the startup captures have landed
-            m_desktopId = CurrentDesktopId();
-            m_ready = true;
             m_quietUntil = GetTickCount64() + kQuietMs;
             DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
             m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, flags));
@@ -1835,6 +1881,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                     m_activeSnap = surface;
                     m_activeSnapHwnd = h;
                     m_activeSnapFrame = frame;
+                    m_activeSnapAt = GetTickCount64();
                 });
             }
         }
@@ -1852,7 +1899,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             UpdateDock();
         }
         else if (wp == kTimerTrim)
-            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+            TrimMemory();
         else if (wp == kTimerRecheck)
         {
             HWND fg = GetForegroundWindow();

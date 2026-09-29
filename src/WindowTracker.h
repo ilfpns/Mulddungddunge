@@ -6,6 +6,7 @@ namespace wt
 {
     bool IsManageable(HWND hwnd, HMONITOR monitor);
     bool IsFullscreen(HWND hwnd);
+    bool IsCloaked(HWND hwnd);                              // hidden by DWM, e.g. on another virtual desktop
     // The top-most ordinary window on the monitor: skips always-on-top windows (pets, PiP players),
     // tool windows and our own, which may hold focus without being what the user is looking at.
     HWND TopWindow(HMONITOR monitor);

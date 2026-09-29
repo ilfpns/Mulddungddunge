@@ -10,6 +10,7 @@
 #include <shobjidl.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
+#include <psapi.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <d2d1_3.h>
@@ -36,7 +37,9 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <share.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace wuc = winrt::Windows::UI::Composition;

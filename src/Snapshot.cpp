@@ -80,9 +80,6 @@ struct Snapshot::Job
     Direct3D11CaptureFramePool pool{ nullptr };
     GraphicsCaptureSession session{ nullptr };
     winrt::event_token arrivedToken{};
-    winrt::Windows::System::DispatcherQueueTimer timeout{ nullptr };
-    Done done;
-    std::atomic<bool> finished{ false };
 
     // Also breaks the job <-> handler reference cycles.
     void Close()
@@ -98,11 +95,6 @@ struct Snapshot::Job
         {
             session.Close();
             session = nullptr;
-        }
-        if (timeout)
-        {
-            timeout.Stop();
-            timeout = nullptr;
         }
         item = nullptr;
     }
@@ -178,40 +170,34 @@ wuc::CompositionDrawingSurface Snapshot::Render(Job const& job, Direct3D11Captur
 void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
 {
     auto queue = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
-    auto job = Start(hwnd, frame);
-    if (!job)
-    {
-        queue.TryEnqueue([done] { done(nullptr); });
-        return;
-    }
-    job->done = std::move(done);
-
-    // FrameArrived fires on a capture worker thread; rendering and the callback happen back on ours.
-    job->arrivedToken = job->pool.FrameArrived([this, job, queue](Direct3D11CaptureFramePool const& pool, auto&&) {
-        if (job->finished.exchange(true))
-            return;
-        auto captured = pool.TryGetNextFrame();
-        queue.TryEnqueue([this, job, captured] {
-            auto surface = captured ? Render(*job, captured) : nullptr;
+    // Setting up a capture session blocks for ~100ms, so it happens on a short-lived worker thread;
+    // the UI thread keeps animating. The capture objects are agile, and only the final drawing into a
+    // composition surface comes back to the UI thread.
+    std::thread([this, hwnd, frame, queue, done = std::move(done)]() mutable {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        auto job = Start(hwnd, frame);
+        Direct3D11CaptureFrame captured{ nullptr };
+        if (job)
+        {
+            winrt::handle arrived{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+            HANDLE ev = arrived.get();
+            job->arrivedToken = job->pool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
+            job->session.StartCapture();
+            if (WaitForSingleObject(ev, 400) == WAIT_OBJECT_0)
+                captured = job->pool.TryGetNextFrame();
+        }
+        queue.TryEnqueue([this, job, captured, done = std::move(done)] {
+            wuc::CompositionDrawingSurface surface{ nullptr };
+            if (job && captured)
+                surface = Render(*job, captured);
             if (captured)
                 captured.Close();
-            job->Close();
-            job->done(surface);
+            if (job)
+                job->Close();
+            done(surface);
         });
-    });
-
-    job->timeout = queue.CreateTimer();
-    job->timeout.Interval(std::chrono::milliseconds(400));
-    job->timeout.IsRepeating(false);
-    job->timeout.Tick([job](auto&&, auto&&) {
-        if (job->finished.exchange(true))
-            return;
-        job->Close();
-        job->done(nullptr);
-    });
-
-    job->session.StartCapture();
-    job->timeout.Start();
+        winrt::uninit_apartment();
+    }).detach();
 }
 
 namespace
@@ -266,9 +252,24 @@ namespace
     }
 }
 
+winrt::com_ptr<IWICFormatConverter> Snapshot::CachedIcon(HWND hwnd)
+{
+    auto path = wt::ProcessPath(hwnd);
+    // UWP windows all belong to ApplicationFrameHost; their icons differ per window, so no caching.
+    if (path.empty() || IsFrameHost(path))
+        return IconSource(m_wic.get(), hwnd, 128);
+    for (auto& [app, source] : m_icons)
+        if (_wcsicmp(app.c_str(), path.c_str()) == 0)
+            return source;
+    auto source = IconSource(m_wic.get(), hwnd, 128);
+    if (source)
+        m_icons.emplace_back(path, source);
+    return source;
+}
+
 wuc::CompositionDrawingSurface Snapshot::Icon(HWND hwnd, int px)
 {
-    auto source = IconSource(m_wic.get(), hwnd, 256);
+    auto source = CachedIcon(hwnd);
     float size = static_cast<float>(px);
     return Paint(size, size, [&](ID2D1DeviceContext* dc) { DrawIcon(dc, source.get(), { 0, 0, size, size }); });
 }
@@ -287,7 +288,7 @@ wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h
     float pw = std::round(displayWidth), ph = std::round(pw * h / w);
     float u = pw / 320.f;                           // layout below was designed at 320px wide
     float visible = std::min(ph, pw / 1.5f);
-    auto source = IconSource(m_wic.get(), hwnd, 256);
+    auto source = CachedIcon(hwnd);
 
     wchar_t title[128]{};
     GetWindowTextW(hwnd, title, ARRAYSIZE(title));
