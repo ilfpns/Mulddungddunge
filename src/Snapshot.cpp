@@ -86,42 +86,77 @@ void Snapshot::Init(wuc::Compositor const& compositor)
         __uuidof(IWICImagingFactory), m_wic.put_void()));
 }
 
-wuc::CompositionDrawingSurface Snapshot::Capture(HWND hwnd, RECT const& frame)
+struct Snapshot::Job
+{
+    HWND hwnd{};
+    RECT frame{};
+    winrt::Windows::Graphics::SizeInt32 size{};
+    GraphicsCaptureItem item{ nullptr };
+    Direct3D11CaptureFramePool pool{ nullptr };
+    GraphicsCaptureSession session{ nullptr };
+    winrt::event_token arrivedToken{};
+    winrt::Windows::System::DispatcherQueueTimer timeout{ nullptr };
+    Done done;
+    std::atomic<bool> finished{ false };
+
+    // Also breaks the job <-> handler reference cycles.
+    void Close()
+    {
+        if (pool)
+        {
+            if (arrivedToken)
+                pool.FrameArrived(arrivedToken);
+            pool.Close();
+            pool = nullptr;
+        }
+        if (session)
+        {
+            session.Close();
+            session = nullptr;
+        }
+        if (timeout)
+        {
+            timeout.Stop();
+            timeout = nullptr;
+        }
+        item = nullptr;
+    }
+};
+
+std::shared_ptr<Snapshot::Job> Snapshot::Start(HWND hwnd, RECT const& frame)
 {
     try
     {
+        auto job = std::make_shared<Job>();
+        job->hwnd = hwnd;
+        job->frame = frame;
         auto factory = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        GraphicsCaptureItem item{ nullptr };
-        winrt::check_hresult(factory->CreateForWindow(hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)));
+        winrt::check_hresult(factory->CreateForWindow(hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(job->item)));
+        job->size = job->item.Size();
+        job->pool = Direct3D11CaptureFramePool::CreateFreeThreaded(m_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, job->size);
+        job->session = job->pool.CreateCaptureSession(job->item);
+        try { job->session.IsCursorCaptureEnabled(false); } catch (...) {}
+        try { job->session.IsBorderRequired(false); } catch (...) {}
+        return job;
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
 
-        auto itemSize = item.Size();
-        auto pool = Direct3D11CaptureFramePool::CreateFreeThreaded(m_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, itemSize);
-        auto session = pool.CreateCaptureSession(item);
-        try { session.IsCursorCaptureEnabled(false); } catch (...) {}
-        try { session.IsBorderRequired(false); } catch (...) {}
-        session.StartCapture();
-
-        Direct3D11CaptureFrame captured{ nullptr };
-        for (int i = 0; i < 100 && !captured; ++i)
-        {
-            captured = pool.TryGetNextFrame();
-            if (!captured)
-                Sleep(2);
-        }
-        if (!captured)
-        {
-            session.Close();
-            pool.Close();
-            return nullptr;
-        }
-
+wuc::CompositionDrawingSurface Snapshot::Render(Job const& job, Direct3D11CaptureFrame const& captured)
+{
+    try
+    {
         // The capture covers the window rect including invisible resize borders; crop to the visible frame.
+        RECT const& frame = job.frame;
         RECT wr;
-        GetWindowRect(hwnd, &wr);
+        GetWindowRect(job.hwnd, &wr);
         float fw = static_cast<float>(frame.right - frame.left);
         float fh = static_cast<float>(frame.bottom - frame.top);
         float ox = 0, oy = 0;
-        if (itemSize.Width != static_cast<int>(fw) || itemSize.Height != static_cast<int>(fh))
+        if (job.size.Width != static_cast<int>(fw) || job.size.Height != static_cast<int>(fh))
         {
             ox = static_cast<float>(frame.left - wr.left);
             oy = static_cast<float>(frame.top - wr.top);
@@ -147,16 +182,72 @@ wuc::CompositionDrawingSurface Snapshot::Capture(HWND hwnd, RECT const& frame)
                 dc->DrawBitmap(bitmap.get(), &dst, 1.f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, &src, nullptr);
             }
         });
-
-        captured.Close();
-        session.Close();
-        pool.Close();
         return surface;
     }
     catch (...)
     {
         return nullptr;
     }
+}
+
+wuc::CompositionDrawingSurface Snapshot::Capture(HWND hwnd, RECT const& frame)
+{
+    auto job = Start(hwnd, frame);
+    if (!job)
+        return nullptr;
+    // Wait on the arrival event instead of polling; Sleep() granularity alone costs ~15ms per try.
+    winrt::handle arrived{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+    HANDLE ev = arrived.get();
+    job->arrivedToken = job->pool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
+    job->session.StartCapture();
+    WaitForSingleObject(ev, 250);
+    wuc::CompositionDrawingSurface surface{ nullptr };
+    if (auto captured = job->pool.TryGetNextFrame())
+    {
+        surface = Render(*job, captured);
+        captured.Close();
+    }
+    job->Close();
+    return surface;
+}
+
+void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
+{
+    auto queue = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
+    auto job = Start(hwnd, frame);
+    if (!job)
+    {
+        queue.TryEnqueue([done] { done(nullptr); });
+        return;
+    }
+    job->done = std::move(done);
+
+    // FrameArrived fires on a capture worker thread; rendering and the callback happen back on ours.
+    job->arrivedToken = job->pool.FrameArrived([this, job, queue](Direct3D11CaptureFramePool const& pool, auto&&) {
+        if (job->finished.exchange(true))
+            return;
+        auto captured = pool.TryGetNextFrame();
+        queue.TryEnqueue([this, job, captured] {
+            auto surface = captured ? Render(*job, captured) : nullptr;
+            if (captured)
+                captured.Close();
+            job->Close();
+            job->done(surface);
+        });
+    });
+
+    job->timeout = queue.CreateTimer();
+    job->timeout.Interval(std::chrono::milliseconds(400));
+    job->timeout.IsRepeating(false);
+    job->timeout.Tick([job](auto&&, auto&&) {
+        if (job->finished.exchange(true))
+            return;
+        job->Close();
+        job->done(nullptr);
+    });
+
+    job->session.StartCapture();
+    job->timeout.Start();
 }
 
 wuc::CompositionDrawingSurface Snapshot::Icon(HWND hwnd, int px)

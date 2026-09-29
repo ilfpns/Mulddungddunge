@@ -59,10 +59,27 @@ private:
 
     void Populate();
     std::shared_ptr<Card> MakeCard(HWND hwnd);
-    void Refresh(Card& c);                       // re-capture the snapshot while the window is visible
+    void Refresh(Card& c);                       // blocking re-capture while the window is visible
+    void SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
     void ApplySize(CardVis const& v, Card const& c);
     void SetMinAnimate(bool on);
     void MinimizeQuiet(HWND hwnd);
+
+    // Transitions: `next` comes on stage, the current window flies into the sidebar.
+    void SwitchTo(size_t index);
+    void BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom);
+    void OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
+    void OnFlyInDone();
+    void FadeOutFlyIn();
+    void StepDone();
+    void FinishTransition();
+    std::shared_ptr<Card> TakeCard(HWND hwnd);
+    float2 SideToAnim(float2 p) const;
+    Pose FramePose(Card const& c) const;
+    Pose TargetPose(Card const& c) const;
+    static void ForceForeground(HWND hwnd);
+    void ShowAnimLayer();
+    void HideAnimLayer();
 
     HINSTANCE m_inst{};
     HMONITOR m_mon{};
@@ -80,11 +97,20 @@ private:
     wuc::Desktop::DesktopWindowTarget m_sideTarget{ nullptr };
     wuc::Desktop::DesktopWindowTarget m_animTarget{ nullptr };
     wuc::ContainerVisual m_sideRoot{ nullptr };
+    // All sidebar cards. Lives under m_sideRoot, but moves into the animation layer during a
+    // transition: a layered window on top hides the composition content of windows below it.
+    wuc::ContainerVisual m_sideContent{ nullptr };
     wuc::ContainerVisual m_animRoot{ nullptr };
     wuc::CompositionColorBrush m_placeholderBrush{ nullptr };
     wuc::CompositionEasingFunction m_ease{ nullptr };
 
     std::vector<std::shared_ptr<Card>> m_cards;     // sidebar order, top first
+    bool m_busy = false;
+    CardVis m_flyOut, m_flyIn;
+    std::shared_ptr<Card> m_outCard, m_inCard;
+    int m_pending = 0;                              // fly-out and fly-in steps still running
+    wuc::CompositionScopedBatch m_inBatch{ nullptr };
+    wuc::CompositionScopedBatch m_outBatch{ nullptr };
     int m_hover = -1;
     bool m_tracking = false;
 };

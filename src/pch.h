@@ -31,6 +31,8 @@
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
