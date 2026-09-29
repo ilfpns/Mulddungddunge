@@ -106,6 +106,7 @@ private:
     void GrowView();                                // whole monitor, for a transition
     void ShrinkView();                              // back to just the bar
     void Prefetch();
+    void SnapActiveSoon();                          // keep a recent picture of the stage window for minimize
     void SlideSidebar(bool out);                    // fullscreen apps: tuck the sidebar away to the left
     void SetHotkeys(bool on);                       // Alt+1..4 jump to sidebar cards                                // snapshot the stage window before a click needs it
 
@@ -156,6 +157,11 @@ private:
     bool m_prefetching = false;
     bool m_outWaitsForPrefetch = false;
     wuc::CompositionDrawingSurface m_prefetch{ nullptr };
+    // Minimizing (button, Win+D, four-finger swipe) gives no chance to capture, so the stage window is
+    // photographed once shortly after it takes the stage.
+    HWND m_activeSnapHwnd{};
+    RECT m_activeSnapFrame{};
+    wuc::CompositionDrawingSurface m_activeSnap{ nullptr };
     wuc::CompositionScopedBatch m_outBatch{ nullptr };
     int m_hover = -1;
     bool m_tracking = false;

@@ -9,7 +9,8 @@ namespace
     constexpr UINT ID_EXIT = 1;
     constexpr int kHotkeyBase = 100;     // hotkey ids 100..103 = Alt+1..4
     constexpr UINT_PTR kTimerPopulate = 1;
-    constexpr UINT_PTR kTimerMinAnimate = 2;
+    constexpr UINT_PTR kTimerActiveSnap = 2;
+    constexpr UINT kActiveSnapDelayMs = 1200;
     constexpr UINT_PTR kTimerMinimizeOut = 3;
     constexpr UINT_PTR kTimerFade = 4;
     constexpr UINT_PTR kTimerShrink = 5;
@@ -70,6 +71,9 @@ bool Stage::Init(HINSTANCE inst)
     ANIMATIONINFO ai{ sizeof(ai) };
     SystemParametersInfoW(SPI_GETANIMATION, sizeof(ai), &ai, 0);
     m_savedMinAnimate = ai.iMinAnimate;
+    // While we run, a minimized stage window flies into the sidebar instead of shrinking to the
+    // taskbar. Not persisted (no SPIF_UPDATEINIFILE); restored on exit.
+    SetMinAnimate(false);
     m_scale = dpiX / 96.f;
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -285,11 +289,31 @@ void Stage::OnMinimizeStart(HWND hwnd)
 {
     if (!m_ready || m_busy || hwnd != m_active)
         return;
-    // Minimized by the user: keep its last snapshot in the sidebar; nothing is on stage now.
+    // Minimized by the user (button, Win+D, four-finger swipe): it flies into the sidebar from where
+    // it was, using the picture taken when it came on stage.
     auto card = TakeCard(hwnd);
     m_cards.insert(m_cards.begin(), card);
     m_active = nullptr;
     Relayout(true);
+    if (!m_activeSnap || m_activeSnapHwnd != hwnd)
+        return;
+    m_busy = true;
+    m_inCard = nullptr;
+    m_outCard = card;
+    m_pending = 1;
+    card->side.holder.Opacity(0.f);
+    GrowView();
+    auto surface = m_activeSnap;
+    m_activeSnap = nullptr;
+    OnOutCaptured(card, m_activeSnapFrame, surface);
+}
+
+void Stage::SnapActiveSoon()
+{
+    m_activeSnap = nullptr;
+    KillTimer(m_sidebar, kTimerActiveSnap);
+    if (m_active)
+        SetTimer(m_sidebar, kTimerActiveSnap, kActiveSnapDelayMs, nullptr);
 }
 
 void Stage::OnGone(HWND hwnd)
@@ -333,6 +357,7 @@ void Stage::SyncDesktop()
     }
     m_hover = -1;
     Relayout(false);
+    SnapActiveSoon();
 }
 
 // A window seen for the first time on this desktop joins the sidebar like at startup.
@@ -417,9 +442,7 @@ void Stage::SetMinAnimate(bool on)
 // Minimizes without the system's shrink-to-taskbar animation.
 void Stage::MinimizeQuiet(HWND hwnd)
 {
-    SetMinAnimate(false);
     ShowWindowAsync(hwnd, SW_MINIMIZE);
-    SetTimer(m_sidebar, kTimerMinAnimate, 600, nullptr);
 }
 
 CardVis Stage::MakeVis(Card const& c, bool withBadge)
@@ -654,8 +677,6 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     m_busy = true;
     HWND prev = m_active;
     m_active = next;
-    KillTimer(m_sidebar, kTimerMinAnimate);
-    SetMinAnimate(false);
 
     m_flyOut = {};
     m_flyIn = {};
@@ -868,7 +889,7 @@ void Stage::FinishTransition()
     // Shrink only after the removal above has been composited, or the last frame could be cut.
     SetTimer(m_sidebar, kTimerShrink, 50, nullptr);
     m_quietUntil = GetTickCount64() + kQuietMs / 2;
-    SetMinAnimate(true);
+    SnapActiveSoon();
     m_busy = false;
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
 }
@@ -1018,6 +1039,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         if (wp == kTimerPopulate)
         {
             Populate();
+            SnapActiveSoon();
             m_desktopId = CurrentDesktopId();
             m_ready = true;
             m_quietUntil = GetTickCount64() + kQuietMs;
@@ -1030,8 +1052,21 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             RegisterShellHookWindow(m_sidebar);
             SetHotkeys(true);
         }
-        else if (wp == kTimerMinAnimate)
-            SetMinAnimate(true);
+        else if (wp == kTimerActiveSnap)
+        {
+            HWND h = m_active;
+            if (h && !m_busy && IsWindowVisible(h) && !IsIconic(h))
+            {
+                RECT frame = wt::FrameRect(h);
+                m_snap.CaptureAsync(h, frame, [this, h, frame](auto const& surface) {
+                    if (!surface || h != m_active)
+                        return;
+                    m_activeSnap = surface;
+                    m_activeSnapHwnd = h;
+                    m_activeSnapFrame = frame;
+                });
+            }
+        }
         else if (wp == kTimerMinimizeOut && m_outCard)
             ShowWindowAsync(m_outCard->hwnd, SW_MINIMIZE);
         else if (wp == kTimerFade)
