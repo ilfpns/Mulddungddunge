@@ -13,6 +13,7 @@ namespace
     constexpr UINT ID_AUTOSTART = 5;
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValue[] = L"StageManager";
+    constexpr wchar_t kStateKey[] = L"Software\\StageManager";
 
     // Card menu metrics (at 96 dpi).
     constexpr float kMenuW = 176.f;
@@ -108,9 +109,19 @@ bool Stage::Init(HINSTANCE inst)
     UINT dpiX = 96, dpiY = 96;
     GetDpiForMonitor(m_mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
 
-    ANIMATIONINFO ai{ sizeof(ai) };
-    SystemParametersInfoW(SPI_GETANIMATION, sizeof(ai), &ai, 0);
-    m_savedMinAnimate = ai.iMinAnimate;
+    // The user's minimize-animation setting is kept in the registry while we run, so it can still be
+    // restored after a crash or a forced kill: a value left over from last time is the real original.
+    DWORD saved = 0, size = sizeof(saved);
+    if (RegGetValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate", RRF_RT_REG_DWORD, nullptr, &saved, &size) == ERROR_SUCCESS)
+        m_savedMinAnimate = static_cast<int>(saved);
+    else
+    {
+        ANIMATIONINFO ai{ sizeof(ai) };
+        SystemParametersInfoW(SPI_GETANIMATION, sizeof(ai), &ai, 0);
+        m_savedMinAnimate = ai.iMinAnimate;
+        saved = static_cast<DWORD>(m_savedMinAnimate);
+        RegSetKeyValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate", REG_DWORD, &saved, sizeof(saved));
+    }
     // While we run, a minimized stage window flies into the sidebar instead of shrinking to the
     // taskbar. Not persisted (no SPIF_UPDATEINIFILE); restored on exit.
     SetMinAnimate(false);
@@ -176,6 +187,7 @@ void Stage::Shutdown()
     Shell_NotifyIconW(NIM_DELETE, &nid);
     appbar::Remove(m_sidebar);
     SetMinAnimate(true);
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate");
     DestroyWindow(m_view);
     DestroyWindow(m_sidebar);
 }
@@ -592,7 +604,9 @@ void Stage::OnMinimizeStart(HWND hwnd)
     if (!card->pinned)
         m_cards.insert(m_cards.begin(), card);
     Relayout(true);
-    if (!m_activeSnap || m_activeSnapHwnd != hwnd)
+    // No flight without a picture to fly, or without a visible sidebar card to land on (the card can
+    // be out of view, e.g. while Windows is still moving the window between desktops).
+    if (!m_activeSnap || m_activeSnapHwnd != hwnd || !card->side.holder)
         return;
     m_busy = true;
     m_inCard = nullptr;
@@ -1063,6 +1077,13 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     }
     Relayout(true);
 
+    // A leaving window whose card is not in view has nowhere to land: it is just minimized.
+    std::erase_if(m_outs, [](auto& flight) {
+        if (flight->card->side.holder)
+            return false;
+        ShowWindowAsync(flight->card->hwnd, SW_MINIMIZE);
+        return true;
+    });
     for (auto& flight : m_outs)
     {
         // The sidebar copy stays hidden until the flying copy lands on it. The outgoing window stays
