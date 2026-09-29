@@ -26,6 +26,7 @@ namespace
     constexpr int kSlideMs = 260;
     constexpr int kFlyMs = 380;
     constexpr int kFadeMs = 120;
+    constexpr ULONGLONG kQuietMs = 700;
 
     Stage* g_stage = nullptr;
 
@@ -106,6 +107,8 @@ bool Stage::Init(HINSTANCE inst)
 
 void Stage::Shutdown()
 {
+    for (auto hook : m_hooks)
+        UnhookWinEvent(hook);
     NOTIFYICONDATAW nid{ sizeof(nid) };
     nid.hWnd = m_sidebar;
     nid.uID = 1;
@@ -188,6 +191,70 @@ void Stage::Populate()
     }
     Relayout(false);
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+}
+
+// ---- outside changes -------------------------------------------------------
+
+void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
+{
+    if (!g_stage || idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd)
+        return;
+    switch (event)
+    {
+    case EVENT_SYSTEM_FOREGROUND:
+        g_stage->OnForeground(hwnd);
+        break;
+    case EVENT_SYSTEM_MINIMIZESTART:
+        g_stage->OnMinimizeStart(hwnd);
+        break;
+    case EVENT_OBJECT_DESTROY:
+    case EVENT_OBJECT_HIDE:
+        g_stage->OnGone(hwnd);
+        break;
+    }
+}
+
+void Stage::OnForeground(HWND hwnd)
+{
+    if (!m_ready || m_busy || hwnd == m_active || GetTickCount64() < m_quietUntil)
+        return;
+    if (!wt::IsManageable(hwnd, m_mon))
+        return;
+    // Already on screen (Alt+Tab, taskbar, a new window): only the previous one needs to leave.
+    RemoveCard(hwnd);
+    BeginTransition(hwnd, nullptr, {});
+}
+
+void Stage::OnMinimizeStart(HWND hwnd)
+{
+    if (!m_ready || m_busy || hwnd != m_active)
+        return;
+    // Minimized by the user: keep its last snapshot in the sidebar; nothing is on stage now.
+    auto card = TakeCard(hwnd);
+    m_cards.insert(m_cards.begin(), card);
+    m_active = nullptr;
+    Relayout(true);
+}
+
+void Stage::OnGone(HWND hwnd)
+{
+    if (hwnd == m_active && !IsWindowVisible(hwnd))
+        m_active = nullptr;
+    if (m_busy || IsWindowVisible(hwnd))
+        return;
+    RemoveCard(hwnd);
+}
+
+void Stage::RemoveCard(HWND hwnd)
+{
+    auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
+    if (it == m_cards.end())
+        return;
+    if ((*it)->side.holder)
+        m_sideContent.Children().Remove((*it)->side.holder);
+    m_cards.erase(it);
+    m_hover = -1;
+    Relayout(true);
 }
 
 std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
@@ -580,6 +647,7 @@ void Stage::FinishTransition()
     m_pending = 0;
     if (shown)
         HideAnimLayer();
+    m_quietUntil = GetTickCount64() + kQuietMs / 2;
     SetMinAnimate(true);
     m_busy = false;
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
@@ -665,7 +733,16 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         KillTimer(m_sidebar, wp);
         if (wp == kTimerPopulate)
+        {
             Populate();
+            m_ready = true;
+            m_quietUntil = GetTickCount64() + kQuietMs;
+            DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+            m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, flags));
+            m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, nullptr, WinEventProc, 0, 0, flags));
+            m_hooks.push_back(SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, nullptr, WinEventProc, 0, 0, flags));
+            m_hooks.push_back(SetWinEventHook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE, nullptr, WinEventProc, 0, 0, flags));
+        }
         else if (wp == kTimerMinAnimate)
             SetMinAnimate(true);
         else if (wp == kTimerMinimizeOut && m_outCard)

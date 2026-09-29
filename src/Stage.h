@@ -39,6 +39,13 @@ public:
 private:
     static LRESULT CALLBACK SidebarProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK AnimProc(HWND, UINT, WPARAM, LPARAM);
+    static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD);
+
+    // Changes made outside the sidebar: Alt+Tab, taskbar, new windows, minimize, close.
+    void OnForeground(HWND hwnd);
+    void OnMinimizeStart(HWND hwnd);
+    void OnGone(HWND hwnd);
+    void RemoveCard(HWND hwnd);
     LRESULT OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp);
 
     void Dock();
@@ -106,6 +113,9 @@ private:
 
     std::vector<std::shared_ptr<Card>> m_cards;     // sidebar order, top first
     bool m_busy = false;
+    bool m_ready = false;                           // initial population finished
+    ULONGLONG m_quietUntil = 0;                     // ignore focus churn caused by our own minimize/restore
+    std::vector<HWINEVENTHOOK> m_hooks;
     CardVis m_flyOut, m_flyIn;
     std::shared_ptr<Card> m_outCard, m_inCard;
     int m_pending = 0;                              // fly-out and fly-in steps still running
