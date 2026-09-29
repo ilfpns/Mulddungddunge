@@ -103,7 +103,8 @@ private:
     static void ForceForeground(HWND hwnd);
     void ShowAnimLayer();
     void HideAnimLayer();
-    void Prefetch();                                // snapshot the stage window before a click needs it
+    void Prefetch();
+    void SlideSidebar(bool out);                    // fullscreen apps: tuck the sidebar away to the left                                // snapshot the stage window before a click needs it
 
     HINSTANCE m_inst{};
     HMONITOR m_mon{};
@@ -138,7 +139,9 @@ private:
     bool m_ready = false;                           // initial population finished
     ULONGLONG m_quietUntil = 0;                     // ignore focus churn caused by our own minimize/restore
     std::vector<HWINEVENTHOOK> m_hooks;
-    UINT m_shellMsg = 0;                            // shell hook: fires only for app windows, unlike object WinEvents
+    UINT m_shellMsg = 0;
+    bool m_tucked = false;
+    wuc::CompositionScopedBatch m_slideBatch{ nullptr };                            // shell hook: fires only for app windows, unlike object WinEvents
     CardVis m_flyOut, m_flyIn;
     std::shared_ptr<Card> m_outCard, m_inCard;
     int m_pending = 0;                              // fly-out and fly-in steps still running

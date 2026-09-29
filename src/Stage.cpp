@@ -742,6 +742,30 @@ void Stage::HideAnimLayer()
     ShowWindow(m_anim, SW_HIDE);
 }
 
+// Slides the cards off the left edge and then hides the window entirely, so nothing of ours sits
+// above a fullscreen game or video; slides back in when it exits.
+void Stage::SlideSidebar(bool out)
+{
+    if (out == m_tucked)
+        return;
+    m_tucked = out;
+    float hidden = -static_cast<float>(m_bar.right - m_bar.left);
+    auto anim = m_compositor.CreateScalarKeyFrameAnimation();
+    anim.InsertKeyFrame(0.f, out ? 0.f : hidden);
+    anim.InsertKeyFrame(1.f, out ? hidden : 0.f, m_ease);
+    anim.Duration(std::chrono::milliseconds(kSlideMs));
+    if (!out)
+        ShowWindow(m_sidebar, SW_SHOWNOACTIVATE);
+    m_slideBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    m_sideRoot.StartAnimation(L"Offset.X", anim);
+    m_slideBatch.End();
+    m_slideBatch.Completed([this](auto&&, auto&&) {
+        m_slideBatch = nullptr;
+        if (m_tucked)
+            ShowWindow(m_sidebar, SW_HIDE);
+    });
+}
+
 void Stage::Prefetch()
 {
     HWND h = m_active;
@@ -930,7 +954,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         if (wp == ABN_POSCHANGED)
             Dock();
         else if (wp == ABN_FULLSCREENAPP)
-            ShowWindow(m_sidebar, lp ? SW_HIDE : SW_SHOWNOACTIVATE);
+            SlideSidebar(lp != 0);
         return 0;
     case WM_ACTIVATE:
         appbar::NotifyActivate(m_sidebar);
