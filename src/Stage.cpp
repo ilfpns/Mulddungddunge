@@ -10,6 +10,9 @@ namespace
     constexpr UINT ID_PIN = 2;
     constexpr UINT ID_UNPIN = 3;
     constexpr UINT ID_CLOSE = 4;
+    constexpr UINT ID_AUTOSTART = 5;
+    constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kRunValue[] = L"StageManager";
 
     // Card menu metrics (at 96 dpi).
     constexpr float kMenuW = 176.f;
@@ -116,6 +119,7 @@ bool Stage::Init(HINSTANCE inst)
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.lpfnWndProc = SidebarProc;
     wc.lpszClassName = L"StageManagerSidebar";
     RegisterClassExW(&wc);
@@ -198,7 +202,8 @@ void Stage::AddTrayIcon()
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    nid.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     wcscpy_s(nid.szTip, L"Stage Manager");
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -206,11 +211,38 @@ void Stage::AddTrayIcon()
 void Stage::ShowTrayMenu()
 {
     HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), ID_AUTOSTART, L"Windows 시작 시 실행");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"종료");
     UINT command = 0;
     ShowMenu(menu, &command);
-    if (command == ID_EXIT)
+    if (command == ID_AUTOSTART)
+        SetStartsWithWindows(!StartsWithWindows());
+    else if (command == ID_EXIT)
         PostQuitMessage(0);
+}
+
+bool Stage::StartsWithWindows()
+{
+    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
+void Stage::SetStartsWithWindows(bool on)
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+        return;
+    if (on)
+    {
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring command = L"\"" + std::wstring(exe) + L"\"";
+        RegSetValueExW(key, kRunValue, 0, REG_SZ, reinterpret_cast<BYTE const*>(command.c_str()),
+            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    }
+    else
+        RegDeleteValueW(key, kRunValue);
+    RegCloseKey(key);
 }
 
 // Popup menus only dismiss properly when their owner is the foreground window; afterwards focus

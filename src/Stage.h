@@ -90,6 +90,8 @@ private:
     void Dock();
     void AddTrayIcon();
     void ShowTrayMenu();
+    static bool StartsWithWindows();
+    static void SetStartsWithWindows(bool on);
 
     float S(float v) const { return v * m_scale; }
     float2 SlotCenter(size_t i) const;          // sidebar coords

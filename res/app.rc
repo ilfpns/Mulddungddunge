@@ -1,0 +1,33 @@
+#include <winres.h>
+#include "version.h"
+
+1 ICON "app.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+ PRODUCTVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041204b0"
+        BEGIN
+            VALUE "CompanyName", "Mulddungddunge"
+            VALUE "FileDescription", "Stage Manager for Windows"
+            VALUE "FileVersion", APP_VERSION_STR
+            VALUE "InternalName", "stage-manager"
+            VALUE "OriginalFilename", "stage-manager.exe"
+            VALUE "ProductName", "Stage Manager for Windows"
+            VALUE "ProductVersion", APP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0412, 1200
+    END
+END
