@@ -17,9 +17,9 @@ cd /d "%~dp0"
 if not exist bin mkdir bin
 if not exist obj mkdir obj
 rem Compiler scratch files next to the project instead of %TEMP% (which may be on a nearly full C: drive).
-if not exist obj	mp mkdir obj	mp
-set TMP=%~dp0obj	mp
-set TEMP=%~dp0obj	mp
+if not exist obj\tmp mkdir obj\tmp
+set TMP=%~dp0obj\tmp
+set TEMP=%~dp0obj\tmp
 
 rc /nologo /fo obj\app.res res\app.rc || exit /b 1
 
