@@ -23,6 +23,7 @@ namespace
     constexpr UINT_PTR kTimerMinimizeOut = 3;
     constexpr UINT_PTR kTimerFade = 4;
     constexpr UINT_PTR kTimerShrink = 5;
+    constexpr UINT_PTR kTimerTrim = 6;
 
     constexpr float kSidebarW = 210.f;
     constexpr float kThumbW = 210.f;     // card size before the tilt foreshortens it; every card has this shape
@@ -498,7 +499,6 @@ void Stage::Populate()
             Adopt(h);
     }
     Relayout(false);
-    SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
 }
 
 // ---- outside changes -------------------------------------------------------
@@ -1563,6 +1563,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             Populate();
             SnapActiveSoon();
+            SetTimer(m_sidebar, kTimerTrim, 3000, nullptr);     // after the startup captures have landed
             m_desktopId = CurrentDesktopId();
             m_ready = true;
             m_quietUntil = GetTickCount64() + kQuietMs;
@@ -1601,6 +1602,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             FadeOutFlyIn();
         else if (wp == kTimerShrink && !m_busy && !m_dragging && !m_menu.open)
             ShrinkView();
+        else if (wp == kTimerTrim)
+            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         return 0;
     case WM_DISPLAYCHANGE:
         Dock();
