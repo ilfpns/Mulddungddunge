@@ -32,7 +32,8 @@ namespace
     constexpr UINT_PTR kTimerTuck = 7;
     constexpr UINT_PTR kTimerRecheck = 8;
     constexpr UINT_PTR kTimerDock = 9;
-    constexpr UINT_PTR kTimerWatchdog = 10;    // a transition still running after this long is forced to end
+    constexpr UINT_PTR kTimerWatchdog = 10;
+    constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
 
@@ -930,6 +931,9 @@ void Stage::OnGone(HWND hwnd)
     {
         if (!IsWindowVisible(hwnd) && OnStage(hwnd))
             OnMinimizeStart(hwnd);                  // put away like a minimize: into the sidebar
+        // Many apps hide a window just before destroying it; the second notice never comes, since it
+        // already left the taskbar. Check again shortly.
+        SetTimer(m_sidebar, kTimerSweep, 300, nullptr);
         return;
     }
     LeaveStage(hwnd);
@@ -2305,6 +2309,22 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             TrimMemory();
         else if (wp == kTimerDock)
             UpdateDock();
+        else if (wp == kTimerSweep)
+        {
+            if (m_busy)
+                SetTimer(m_sidebar, kTimerSweep, 300, nullptr);
+            else
+            {
+                std::vector<HWND> dead;
+                for (auto& c : m_cards)
+                    if (!IsWindow(c->hwnd))
+                        dead.push_back(c->hwnd);
+                for (HWND h : dead)
+                    RemoveCard(h, true);
+                std::erase_if(m_offstage, [](auto& c) { return !IsWindow(c->hwnd); });
+                std::erase_if(m_stage, [](HWND h) { return !IsWindow(h); });
+            }
+        }
         else if (wp == kTimerWatchdog && m_busy)
         {
             // Something went wrong mid-transition (an exception, a lost device, a batch that never
