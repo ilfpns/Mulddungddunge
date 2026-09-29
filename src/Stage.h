@@ -12,6 +12,17 @@ struct CardVis
     wuc::SpriteVisual pin{ nullptr };
 };
 
+struct Card;
+
+// One window leaving the stage for its sidebar slot.
+struct OutFlight
+{
+    std::shared_ptr<Card> card;
+    CardVis vis;
+    wuc::CompositionScopedBatch batch{ nullptr };
+    bool waitsForPrefetch = false;
+};
+
 struct Card
 {
     HWND hwnd{};
@@ -99,7 +110,15 @@ private:
     // Transitions: `next` comes on stage, the current window flies into the sidebar.
     void SwitchTo(size_t index);
     void BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom);
-    void OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
+    void OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
+    bool OnStage(HWND hwnd) const;
+    void LeaveStage(HWND hwnd);
+
+    // Dragging a card onto the stage adds its window next to the ones already there.
+    void BeginDrag(POINT viewPt);
+    void MoveDrag(POINT viewPt);
+    void EndDrag(POINT viewPt, bool cancel);
+    void JoinStage(std::shared_ptr<Card> card, POINT viewPt);
     void OnFlyInDone();
     void FadeOutFlyIn();
     void StepDone();
@@ -118,7 +137,8 @@ private:
 
     HINSTANCE m_inst{};
     HMONITOR m_mon{};
-    HWND m_active{};                // the window on stage (not in the sidebar)
+    HWND m_active{};                // the focused window on stage
+    std::vector<HWND> m_stage;      // every window on stage, most recently focused last
     int m_savedMinAnimate = 0;
     Snapshot m_snap;
     // m_sidebar is a hidden message window (AppBar, tray icon, hotkeys, timers, shell hook).
@@ -151,8 +171,10 @@ private:
     UINT m_shellMsg = 0;
     bool m_tucked = false;
     wuc::CompositionScopedBatch m_slideBatch{ nullptr };                            // shell hook: fires only for app windows, unlike object WinEvents
-    CardVis m_flyOut, m_flyIn;
-    std::shared_ptr<Card> m_outCard, m_inCard;
+    CardVis m_flyIn;
+    std::shared_ptr<Card> m_inCard;
+    std::vector<std::shared_ptr<OutFlight>> m_outs;
+    std::vector<HWND> m_toMinimize;                 // stage windows whose flying copy is now on screen
     int m_pending = 0;                              // fly-out and fly-in steps still running
     wuc::CompositionScopedBatch m_inBatch{ nullptr };
     // Snapshot of the stage window taken when the pointer enters the sidebar, so a click can send it
@@ -161,14 +183,20 @@ private:
     RECT m_prefetchFrame{};
     ULONGLONG m_prefetchAt = 0;
     bool m_prefetching = false;
-    bool m_outWaitsForPrefetch = false;
     wuc::CompositionDrawingSurface m_prefetch{ nullptr };
     // Minimizing (button, Win+D, four-finger swipe) gives no chance to capture, so the stage window is
     // photographed once shortly after it takes the stage.
     HWND m_activeSnapHwnd{};
     RECT m_activeSnapFrame{};
     wuc::CompositionDrawingSurface m_activeSnap{ nullptr };
-    wuc::CompositionScopedBatch m_outBatch{ nullptr };
     int m_hover = -1;
     bool m_tracking = false;
+
+    // Pointer state on the sidebar: a press becomes a drag once it moves far enough.
+    int m_pressIndex = -1;
+    POINT m_pressPt{};
+    bool m_dragging = false;
+    std::shared_ptr<Card> m_dragCard;
+    CardVis m_dragVis;
+    Pose m_dragPose{};
 };

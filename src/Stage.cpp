@@ -32,6 +32,7 @@ namespace
     constexpr int kFadeMs = 150;
     constexpr int kPaintWaitMs = 110;    // restored windows need a moment to repaint before the copy fades
     constexpr ULONGLONG kPrefetchMaxAge = 4000;
+    constexpr float kDragStart = 8.f;    // px of movement before a press turns into a drag
     constexpr ULONGLONG kQuietMs = 700;
 
     Stage* g_stage = nullptr;
@@ -310,6 +311,7 @@ void Stage::Populate()
         return;
     HWND fg = GetForegroundWindow();
     m_active = std::find(windows.begin(), windows.end(), fg) != windows.end() ? fg : windows.front();
+    m_stage = { m_active };
 
     for (HWND h : windows)
     {
@@ -358,6 +360,14 @@ void Stage::OnForeground(HWND hwnd)
     }
     if (hwnd == m_active || GetTickCount64() < m_quietUntil)
         return;
+    if (OnStage(hwnd))
+    {
+        m_stage.erase(std::find(m_stage.begin(), m_stage.end(), hwnd));
+        m_stage.push_back(hwnd);
+        m_active = hwnd;
+        SnapActiveSoon();
+        return;
+    }
     if (!wt::IsManageable(hwnd, m_mon))
         return;
     // Already on screen (Alt+Tab, taskbar, a new window): only the previous one needs to leave.
@@ -368,26 +378,28 @@ void Stage::OnForeground(HWND hwnd)
 void Stage::OnMinimizeStart(HWND hwnd)
 {
     Trace(m_activeSnap && m_activeSnapHwnd == hwnd ? L"minimize (has snap)" : L"minimize (no snap)", hwnd);
-    if (!m_ready || m_busy || hwnd != m_active)
+    if (!m_ready || m_busy || !OnStage(hwnd))
         return;
     // Minimized by the user (button, Win+D, four-finger swipe): it flies into the sidebar from where
-    // it was, using the picture taken when it came on stage.
+    // it was, using the picture taken when it became the focused stage window.
+    LeaveStage(hwnd);
     auto card = TakeCard(hwnd);
     if (!card->pinned)
         m_cards.insert(m_cards.begin(), card);
-    m_active = nullptr;
     Relayout(true);
     if (!m_activeSnap || m_activeSnapHwnd != hwnd)
         return;
     m_busy = true;
     m_inCard = nullptr;
-    m_outCard = card;
+    auto flight = std::make_shared<OutFlight>();
+    flight->card = card;
+    m_outs = { flight };
     m_pending = 1;
     card->side.holder.Opacity(0.f);
     GrowView();
     auto surface = m_activeSnap;
     m_activeSnap = nullptr;
-    OnOutCaptured(card, m_activeSnapFrame, surface);
+    OnOutCaptured(flight, m_activeSnapFrame, surface);
 }
 
 void Stage::SnapActiveSoon()
@@ -401,11 +413,25 @@ void Stage::SnapActiveSoon()
 void Stage::OnGone(HWND hwnd)
 {
     Trace(L"gone", hwnd);
-    if (hwnd == m_active && !IsWindowVisible(hwnd))
-        m_active = nullptr;
+    if (!IsWindowVisible(hwnd))
+        LeaveStage(hwnd);
     if (m_busy || IsWindowVisible(hwnd))
         return;
     RemoveCard(hwnd, true);
+}
+
+bool Stage::OnStage(HWND hwnd) const
+{
+    return hwnd && std::find(m_stage.begin(), m_stage.end(), hwnd) != m_stage.end();
+}
+
+void Stage::LeaveStage(HWND hwnd)
+{
+    auto it = std::find(m_stage.begin(), m_stage.end(), hwnd);
+    if (it != m_stage.end())
+        m_stage.erase(it);
+    if (hwnd == m_active)
+        m_active = m_stage.empty() ? nullptr : m_stage.back();
 }
 
 bool Stage::OnCurrentDesktop(HWND hwnd) const
@@ -432,11 +458,15 @@ void Stage::SyncDesktop()
     Trace(L"desktop switched");
     HWND fg = GetForegroundWindow();
     m_active = wt::IsManageable(fg, m_mon) ? fg : nullptr;
+    m_stage.clear();
     if (m_active)
+    {
+        m_stage.push_back(m_active);
         RemoveCard(m_active);
+    }
     for (HWND h : wt::EnumManageable(m_mon))
     {
-        if (h != m_active && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
+        if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
             Adopt(h);
     }
     m_hover = -1;
@@ -454,7 +484,7 @@ void Stage::Adopt(HWND hwnd)
     RECT frame = wt::FrameRect(hwnd);
     m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
         SetSnapshot(*card, frame, surface);
-        if (card->hwnd != m_active && IsWindow(card->hwnd))
+        if (!OnStage(card->hwnd) && IsWindow(card->hwnd))
             MinimizeQuiet(card->hwnd);
     });
 }
@@ -786,44 +816,50 @@ void Stage::SwitchTo(size_t index)
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
     m_busy = true;
-    HWND prev = m_active;
+    std::vector<HWND> leaving;
+    for (HWND h : m_stage)
+    {
+        if (h != next && IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && OnCurrentDesktop(h))
+            leaving.push_back(h);
+    }
+    m_stage = { next };
     m_active = next;
-
-    m_flyOut = {};
     m_flyIn = {};
-    m_outCard = nullptr;
     m_inCard = nextCard;
+    m_outs.clear();
     m_pending = 0;
 
-    if (prev && prev != next && IsWindow(prev) && IsWindowVisible(prev) && !IsIconic(prev) && OnCurrentDesktop(prev))
+    // Most recently focused ends up on top of the sidebar.
+    for (HWND h : leaving)
     {
-        m_outCard = TakeCard(prev);
-        if (!m_outCard->pinned)
-            m_cards.insert(m_cards.begin(), m_outCard);
+        auto flight = std::make_shared<OutFlight>();
+        flight->card = TakeCard(h);
+        if (!flight->card->pinned)
+            m_cards.insert(m_cards.begin(), flight->card);
+        m_outs.push_back(flight);
     }
     Relayout(true);
 
-    if (m_outCard)
+    for (auto& flight : m_outs)
     {
         // The sidebar copy stays hidden until the flying copy lands on it. The outgoing window stays
         // visible until its fresh snapshot is ready, so the incoming one can start moving right away.
         ++m_pending;
-        m_outCard->side.holder.Opacity(0.f);
-        RECT frame = wt::FrameRect(prev);
-        bool fresh = m_prefetch && m_prefetchHwnd == prev && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge &&
+        flight->card->side.holder.Opacity(0.f);
+        HWND h = flight->card->hwnd;
+        RECT frame = wt::FrameRect(h);
+        bool fresh = m_prefetch && m_prefetchHwnd == h && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge &&
                      EqualRect(&frame, &m_prefetchFrame);
         if (fresh)
         {
             auto surface = m_prefetch;
             m_prefetch = nullptr;
-            OnOutCaptured(m_outCard, frame, surface);
+            OnOutCaptured(flight, frame, surface);
         }
-        else if (m_prefetching && m_prefetchHwnd == prev)
-            m_outWaitsForPrefetch = true;
+        else if (m_prefetching && m_prefetchHwnd == h)
+            flight->waitsForPrefetch = true;
         else
-            m_snap.CaptureAsync(prev, frame, [this, card = m_outCard, frame](auto const& surface) {
-                OnOutCaptured(card, frame, surface);
-            });
+            m_snap.CaptureAsync(h, frame, [this, flight, frame](auto const& surface) { OnOutCaptured(flight, frame, surface); });
     }
     if (m_inCard)
     {
@@ -914,42 +950,47 @@ void Stage::Prefetch()
         m_prefetching = false;
         m_prefetch = surface;
         m_prefetchAt = GetTickCount64();
-        if (m_outWaitsForPrefetch && m_outCard && m_outCard->hwnd == h)
+        for (auto& flight : m_outs)
         {
-            m_outWaitsForPrefetch = false;
-            m_prefetch = nullptr;
-            OnOutCaptured(m_outCard, m_prefetchFrame, surface);
+            if (flight->waitsForPrefetch && flight->card->hwnd == h)
+            {
+                flight->waitsForPrefetch = false;
+                m_prefetch = nullptr;
+                OnOutCaptured(flight, m_prefetchFrame, surface);
+            }
         }
     });
 }
 
-void Stage::OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::CompositionDrawingSurface const& surface)
+void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, wuc::CompositionDrawingSurface const& surface)
 {
-    if (card != m_outCard)
+    if (std::find(m_outs.begin(), m_outs.end(), flight) == m_outs.end())
         return;
+    auto card = flight->card;
     SetSnapshot(*card, frame, surface);
 
     // Below the incoming copy, so the new window visibly lands on top.
-    m_flyOut = MakeVis(*card, false);
-    m_animStage.Children().InsertAtBottom(m_flyOut.holder);
+    flight->vis = MakeVis(*card, false);
+    m_animStage.Children().InsertAtBottom(flight->vis.holder);
     Pose from = PoseForRect(frame, m_monitor, card->w);
     size_t slot = static_cast<size_t>(std::find(m_visible.begin(), m_visible.end(), card) - m_visible.begin());
     Pose to = SlotPose(*card, std::min(slot, m_visible.empty() ? 0 : m_visible.size() - 1));
     to.center = SideToAnim(to.center);
-    ApplyPose(m_flyOut, *card, from);
-    m_outBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    AnimatePose(m_flyOut, *card, from, to, kFlyMs);
-    m_outBatch.End();
-    m_outBatch.Completed([this](auto&&, auto&&) {
-        m_outBatch = nullptr;
-        if (m_flyOut.holder)
-            m_animStage.Children().Remove(m_flyOut.holder);
-        m_flyOut = {};
-        if (m_outCard && m_outCard->side.holder)
-            m_outCard->side.holder.Opacity(1.f);
+    ApplyPose(flight->vis, *card, from);
+    flight->batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    AnimatePose(flight->vis, *card, from, to, kFlyMs);
+    flight->batch.End();
+    flight->batch.Completed([this, flight](auto&&, auto&&) {
+        flight->batch = nullptr;
+        if (flight->vis.holder)
+            m_animStage.Children().Remove(flight->vis.holder);
+        flight->vis = {};
+        if (flight->card->side.holder)
+            flight->card->side.holder.Opacity(1.f);
         StepDone();
     });
     // Hide the real window only once the flying copy is on screen above it.
+    m_toMinimize.push_back(card->hwnd);
     SetTimer(m_sidebar, kTimerMinimizeOut, 30, nullptr);
 }
 
@@ -987,17 +1028,19 @@ void Stage::StepDone()
 void Stage::FinishTransition()
 {
     m_inBatch = nullptr;
-    m_outBatch = nullptr;
-    if (m_flyOut.holder)
-        m_animStage.Children().Remove(m_flyOut.holder);
+    for (auto& flight : m_outs)
+    {
+        if (flight->vis.holder)
+            m_animStage.Children().Remove(flight->vis.holder);
+        if (flight->card->side.holder)
+            flight->card->side.holder.Opacity(1.f);
+    }
+    m_outs.clear();
     if (m_flyIn.holder)
         m_animStage.Children().Remove(m_flyIn.holder);
-    m_flyOut = {};
     m_flyIn = {};
-    m_outCard = nullptr;
     m_inCard = nullptr;
     m_pending = 0;
-    m_outWaitsForPrefetch = false;
     m_prefetch = nullptr;
     // Shrink only after the removal above has been composited, or the last frame could be cut.
     SetTimer(m_sidebar, kTimerShrink, 50, nullptr);
@@ -1019,6 +1062,121 @@ void Stage::ForceForeground(HWND hwnd)
     in[1].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(2, in, sizeof(INPUT));
     SetForegroundWindow(hwnd);
+}
+
+// ---- drag a card onto the stage ---------------------------------------------
+
+void Stage::BeginDrag(POINT viewPt)
+{
+    if (m_pressIndex < 0 || m_pressIndex >= static_cast<int>(m_visible.size()))
+        return;
+    m_dragging = true;
+    m_dragCard = m_visible[m_pressIndex];
+    SetHover(-1);
+    if (!m_dragCard->pinned && m_dragCard->side.holder)
+        m_dragCard->side.holder.Opacity(0.f);
+    m_dragVis = MakeVis(*m_dragCard, false);
+    m_animStage.Children().InsertAtTop(m_dragVis.holder);
+    Pose from = SlotPose(*m_dragCard, m_pressIndex);
+    from.center = SideToAnim(from.center);
+    // Lifted: it straightens out and grows a little while following the pointer.
+    m_dragPose = { { static_cast<float>(viewPt.x), static_cast<float>(viewPt.y) }, from.scale * 1.25f, 0.f, true };
+    ApplyPose(m_dragVis, *m_dragCard, from);
+    AnimatePose(m_dragVis, *m_dragCard, from, m_dragPose, 180);
+    GrowView();
+}
+
+void Stage::MoveDrag(POINT viewPt)
+{
+    m_dragPose.center = { static_cast<float>(viewPt.x), static_cast<float>(viewPt.y) };
+    m_dragVis.holder.StopAnimation(L"Offset");
+    m_dragVis.holder.Offset({ m_dragPose.center.x, m_dragPose.center.y, 0.f });
+}
+
+void Stage::EndDrag(POINT viewPt, bool cancel)
+{
+    m_dragging = false;
+    m_pressIndex = -1;
+    auto card = m_dragCard;
+    m_dragCard = nullptr;
+    bool onStage = !cancel && viewPt.x > m_bar.right - m_monitor.left && IsWindow(card->hwnd);
+    if (onStage && !m_busy)
+    {
+        JoinStage(card, viewPt);
+        return;
+    }
+    // Dropped back on the sidebar: return to its slot.
+    size_t slot = static_cast<size_t>(std::find(m_visible.begin(), m_visible.end(), card) - m_visible.begin());
+    Pose home = SlotPose(*card, std::min(slot, m_visible.empty() ? 0 : m_visible.size() - 1));
+    home.center = SideToAnim(home.center);
+    auto vis = m_dragVis;
+    m_dragVis = {};
+    auto batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    AnimatePose(vis, *card, m_dragPose, home, kSlideMs);
+    batch.End();
+    batch.Completed([this, vis, card](auto&&, auto&&) {
+        m_animStage.Children().Remove(vis.holder);
+        if (card->side.holder)
+            card->side.holder.Opacity(1.f);
+        if (!m_busy)
+            SetTimer(m_sidebar, kTimerShrink, 50, nullptr);
+    });
+}
+
+// The dragged window opens where it was dropped, at its own size, next to what is already on stage.
+void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
+{
+    m_busy = true;
+    HWND h = card->hwnd;
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(m_mon, &mi);
+    RECT work = mi.rcWork;
+
+    bool maximized = false;
+    RECT restore = wt::RestoreRect(h, &maximized);
+    LONG w = std::min<LONG>(restore.right - restore.left, work.right - work.left);
+    LONG hgt = std::min<LONG>(restore.bottom - restore.top, work.bottom - work.top);
+    if (maximized)
+    {
+        w = (work.right - work.left) * 2 / 3;
+        hgt = (work.bottom - work.top) * 2 / 3;
+    }
+    LONG cx = viewPt.x + m_monitor.left, cy = viewPt.y + m_monitor.top;
+    RECT target{ cx - w / 2, cy - hgt / 2, cx - w / 2 + w, cy - hgt / 2 + hgt };
+    OffsetRect(&target, std::max(0L, work.left - target.left) - std::max(0L, target.right - work.right),
+        std::max(0L, work.top - target.top) - std::max(0L, target.bottom - work.bottom));
+
+    // Put the window there while it is still minimized, so restoring it doesn't flash at the old spot.
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    GetWindowPlacement(h, &wp);
+    wp.flags &= ~WPF_RESTORETOMAXIMIZED;
+    wp.showCmd = IsIconic(h) ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE;
+    wp.rcNormalPosition = target;
+    OffsetRect(&wp.rcNormalPosition, mi.rcMonitor.left - mi.rcWork.left, mi.rcMonitor.top - mi.rcWork.top);
+    SetWindowPlacement(h, &wp);
+
+    if (!card->pinned)
+    {
+        m_cards.erase(std::find(m_cards.begin(), m_cards.end(), card));
+        if (card->side.holder)
+            m_sideContent.Children().Remove(card->side.holder);
+        card->side = {};
+    }
+    Relayout(true);
+
+    RECT frame{ target.left + card->border.left, target.top + card->border.top,
+                target.right - card->border.right, target.bottom - card->border.bottom };
+    m_stage.push_back(h);
+    m_active = h;
+    m_inCard = card;
+    m_flyIn = m_dragVis;
+    m_dragVis = {};
+    m_outs.clear();
+    m_pending = 1;
+    m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    AnimatePose(m_flyIn, *card, m_dragPose, PoseForRect(frame, m_monitor, card->w), kFlyMs);
+    m_inBatch.End();
+    m_inBatch.Completed([this](auto&&, auto&&) { OnFlyInDone(); });
 }
 
 // ---- window procs ---------------------------------------------------------
@@ -1085,16 +1243,50 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             m_tracking = TrackMouseEvent(&tme);
             Prefetch();
         }
+        if (m_dragging)
+        {
+            MoveDrag({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            return 0;
+        }
+        if (m_pressIndex >= 0 && !m_busy &&
+            std::hypot(GET_X_LPARAM(lp) - m_pressPt.x, GET_Y_LPARAM(lp) - m_pressPt.y) > S(kDragStart))
+        {
+            BeginDrag({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            return 0;
+        }
         if (!m_busy)
             SetHover(HitTest(ViewToSide(lp)));
         return 0;
-    case WM_LBUTTONUP:
+    case WM_LBUTTONDOWN:
         if (!m_busy)
         {
-            int index = HitTest(ViewToSide(lp));
-            if (index >= 0)
-                SwitchTo(static_cast<size_t>(index));
+            m_pressIndex = HitTest(ViewToSide(lp));
+            m_pressPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (m_pressIndex >= 0)
+                SetCapture(m_view);
         }
+        return 0;
+    case WM_LBUTTONUP:
+    {
+        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int pressed = m_pressIndex;
+        m_pressIndex = -1;
+        if (GetCapture() == m_view)
+            ReleaseCapture();
+        if (m_dragging)
+            EndDrag(pt, false);
+        else if (!m_busy && pressed >= 0 && HitTest(ViewToSide(lp)) == pressed)
+            SwitchTo(static_cast<size_t>(pressed));
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (m_dragging && reinterpret_cast<HWND>(lp) != m_view)
+        {
+            POINT pt;
+            GetCursorPos(&pt);
+            EndDrag({ pt.x - m_monitor.left, pt.y - m_monitor.top }, true);
+        }
+        m_pressIndex = -1;
         return 0;
     case WM_RBUTTONUP:
         if (!m_busy)
@@ -1189,11 +1381,15 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 });
             }
         }
-        else if (wp == kTimerMinimizeOut && m_outCard)
-            ShowWindowAsync(m_outCard->hwnd, SW_MINIMIZE);
+        else if (wp == kTimerMinimizeOut)
+        {
+            for (HWND h : m_toMinimize)
+                ShowWindowAsync(h, SW_MINIMIZE);
+            m_toMinimize.clear();
+        }
         else if (wp == kTimerFade)
             FadeOutFlyIn();
-        else if (wp == kTimerShrink && !m_busy)
+        else if (wp == kTimerShrink && !m_busy && !m_dragging)
             ShrinkView();
         return 0;
     case WM_DISPLAYCHANGE:
