@@ -81,7 +81,11 @@ private:
     void ShowMenu(HMENU menu, UINT* command);           // plain Win32 menu (tray icon)
 
     // Card context menu, drawn with composition so it matches the sidebar.
-    void OpenCardMenu(size_t index);
+    void OpenCardMenu(int index, int anchorY);      // index < 0: right-click on empty sidebar space
+    // Settings: a modal panel over a dimmed screen. Its contents are to be filled in later.
+    void OpenSettings();
+    void CloseSettings();
+    bool InSettingsClose(POINT viewPt) const;
     void CloseCardMenu();
     int MenuItemAt(POINT viewPt) const;
     void SetMenuHover(int item);
@@ -245,6 +249,12 @@ private:
         float2 origin{};                            // view coordinates of the panel's top-left
         int hover = -1;
     } m_menu;
+    struct SettingsModal
+    {
+        bool open = false;
+        wuc::ContainerVisual root{ nullptr };
+        float2 origin{}, size{};                    // panel, view coordinates
+    } m_settings;
 
     // Pointer state on the sidebar: a press becomes a drag once it moves far enough.
     int m_pressIndex = -1;
