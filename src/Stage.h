@@ -26,6 +26,7 @@ struct OutFlight
 struct Card
 {
     HWND hwnd{};
+    std::wstring app;       // executable path; pins are remembered per app
     RECT frame{};           // last known on-screen frame (physical px)
     RECT border{};          // invisible resize borders: window rect minus visible frame, per side
     bool hasSnapshot = false;   // a real picture of the window (otherwise a placeholder, or nothing if released)
@@ -72,6 +73,8 @@ private:
     void OnGone(HWND hwnd);
     void RemoveCard(HWND hwnd, bool evenIfPinned = false);
     void SetPinned(Card& c, bool pinned);
+    void LoadPins();
+    void SavePins() const;
     void ShowMenu(HMENU menu, UINT* command);           // plain Win32 menu (tray icon)
 
     // Card context menu, drawn with composition so it matches the sidebar.
@@ -170,6 +173,9 @@ private:
 
     std::vector<std::shared_ptr<Card>> m_cards;     // all known windows, most recent first
     std::vector<std::shared_ptr<Card>> m_visible;   // the ones in the sidebar right now (current desktop, max 4)
+    // Pinned apps, one entry per pinned window, saved in the registry. Survives restarts and apps that
+    // destroy and recreate their window (close-to-tray apps).
+    std::vector<std::wstring> m_pinnedApps;
     winrt::com_ptr<IVirtualDesktopManager> m_desktops;
     GUID m_desktopId{};
     bool m_busy = false;

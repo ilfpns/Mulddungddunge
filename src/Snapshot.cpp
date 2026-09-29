@@ -1,4 +1,5 @@
 #include "Snapshot.h"
+#include "WindowTracker.h"
 
 using namespace winrt::Windows::Graphics::Capture;
 using winrt::Windows::Graphics::DirectX::DirectXAlphaMode;
@@ -21,26 +22,10 @@ namespace
         interop->EndDraw();
     }
 
-    std::wstring ProcessPath(HWND hwnd)
-    {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (!proc)
-            return {};
-        wchar_t path[MAX_PATH];
-        DWORD len = MAX_PATH;
-        std::wstring out;
-        if (QueryFullProcessImageNameW(proc, 0, path, &len))
-            out.assign(path, len);
-        CloseHandle(proc);
-        return out;
-    }
-
     HICON LoadAppIcon(HWND hwnd, int px, bool& owned)
     {
         owned = false;
-        auto path = ProcessPath(hwnd);
+        auto path = wt::ProcessPath(hwnd);
         // UWP apps are hosted by ApplicationFrameHost, whose exe icon is generic; ask the window instead.
         bool frameHost = path.size() >= 24 && _wcsicmp(path.c_str() + path.size() - 24, L"ApplicationFrameHost.exe") == 0;
         if (!path.empty() && !frameHost)
@@ -241,7 +226,7 @@ namespace
     // be scaled down crisply to whatever size it is shown at.
     winrt::com_ptr<IWICFormatConverter> IconSource(IWICImagingFactory* wic, HWND hwnd, int px)
     {
-        auto path = ProcessPath(hwnd);
+        auto path = wt::ProcessPath(hwnd);
         if (!path.empty() && !IsFrameHost(path))
         {
             winrt::com_ptr<IShellItemImageFactory> images;

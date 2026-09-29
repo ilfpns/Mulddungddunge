@@ -75,6 +75,22 @@ namespace wt
         return r;
     }
 
+    std::wstring ProcessPath(HWND hwnd)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!proc)
+            return {};
+        wchar_t path[MAX_PATH];
+        DWORD len = MAX_PATH;
+        std::wstring out;
+        if (QueryFullProcessImageNameW(proc, 0, path, &len))
+            out.assign(path, len);
+        CloseHandle(proc);
+        return out;
+    }
+
     RECT RestoreRect(HWND hwnd, bool* maximized)
     {
         WINDOWPLACEMENT wp{ sizeof(wp) };

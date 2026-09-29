@@ -9,4 +9,5 @@ namespace wt
     std::vector<HWND> EnumManageable(HMONITOR monitor);   // top of z-order first
     RECT FrameRect(HWND hwnd);                              // visible frame, without invisible resize borders
     RECT RestoreRect(HWND hwnd, bool* maximized = nullptr); // window rect a minimized window comes back to
+    std::wstring ProcessPath(HWND hwnd);                    // full path of the window's executable
 }

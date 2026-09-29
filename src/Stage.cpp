@@ -163,6 +163,7 @@ bool Stage::Init(HINSTANCE inst)
     m_placeholderBrush = m_compositor.CreateColorBrush({ 255, 58, 58, 64 });
     m_ease = MakeEase(m_compositor);
     m_snap.Init(m_compositor);
+    LoadPins();
     m_desktops = winrt::try_create_instance<IVirtualDesktopManager>(CLSID_VirtualDesktopManager);
 
     appbar::Register(m_sidebar, WM_APPBAR_CB);
@@ -232,6 +233,29 @@ void Stage::ShowTrayMenu()
         SetStartsWithWindows(!StartsWithWindows());
     else if (command == ID_EXIT)
         PostQuitMessage(0);
+}
+
+// REG_MULTI_SZ HKCU\Software\StageManager\Pinned: one executable path per pinned window.
+void Stage::LoadPins()
+{
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kStateKey, L"Pinned", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS)
+        return;
+    std::wstring buffer(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kStateKey, L"Pinned", RRF_RT_REG_MULTI_SZ, nullptr, buffer.data(), &size) != ERROR_SUCCESS)
+        return;
+    for (wchar_t const* p = buffer.c_str(); *p; p += wcslen(p) + 1)
+        m_pinnedApps.emplace_back(p);
+}
+
+void Stage::SavePins() const
+{
+    std::wstring buffer;
+    for (auto& app : m_pinnedApps)
+        buffer.append(app).push_back(L'\0');
+    buffer.push_back(L'\0');
+    RegSetKeyValueW(HKEY_CURRENT_USER, kStateKey, L"Pinned", REG_MULTI_SZ, buffer.data(),
+        static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
 }
 
 bool Stage::StartsWithWindows()
@@ -445,7 +469,22 @@ void Stage::RunMenuItem(int item)
 void Stage::SetPinned(Card& c, bool pinned)
 {
     Trace(pinned ? L"pinned" : L"unpinned", c.hwnd);
+    if (c.pinned == pinned)
+        return;
     c.pinned = pinned;
+    if (!c.app.empty())
+    {
+        if (pinned)
+            m_pinnedApps.push_back(c.app);
+        else
+        {
+            auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(),
+                [&](auto const& app) { return _wcsicmp(app.c_str(), c.app.c_str()) == 0; });
+            if (it != m_pinnedApps.end())
+                m_pinnedApps.erase(it);
+        }
+        SavePins();
+    }
     if (c.side.pin)
         c.side.pin.IsVisible(pinned);
     m_hover = -1;
@@ -724,6 +763,12 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
 {
     auto c = std::make_shared<Card>();
     c->hwnd = hwnd;
+    c->app = wt::ProcessPath(hwnd);
+    // Pinned if this app has more pin entries than it currently has pinned cards.
+    auto same = [&](auto const& app) { return !c->app.empty() && _wcsicmp(app.c_str(), c->app.c_str()) == 0; };
+    auto wanted = std::count_if(m_pinnedApps.begin(), m_pinnedApps.end(), same);
+    auto have = std::count_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->pinned && same(o->app); });
+    c->pinned = have < wanted;
     c->frame = IsIconic(hwnd) ? wt::RestoreRect(hwnd) : wt::FrameRect(hwnd);
     c->w = static_cast<float>(std::max(1L, c->frame.right - c->frame.left));
     c->h = static_cast<float>(std::max(1L, c->frame.bottom - c->frame.top));
