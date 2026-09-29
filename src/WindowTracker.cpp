@@ -22,9 +22,14 @@ namespace wt
         return false;
     }
 
-    bool IsManageable(HWND hwnd, HMONITOR monitor)
+    bool IsManageable(HWND hwnd, HMONITOR monitor, bool otherDesktops)
     {
-        if (!hwnd || !IsWindowVisible(hwnd) || IsCloaked(hwnd))
+        if (!hwnd || !IsWindowVisible(hwnd))
+            return false;
+        // Cloaked by the shell = on another virtual desktop; any other cloaking means not shown at all.
+        DWORD cloaked = 0;
+        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+        if (cloaked && !(otherDesktops && cloaked == DWM_CLOAKED_SHELL))
             return false;
         if (GetWindow(hwnd, GW_OWNER))
             return false;
@@ -76,12 +81,12 @@ namespace wt
         return nullptr;
     }
 
-    std::vector<HWND> EnumManageable(HMONITOR monitor)
+    std::vector<HWND> EnumManageable(HMONITOR monitor, bool otherDesktops)
     {
-        struct Ctx { HMONITOR mon; std::vector<HWND> out; } ctx{ monitor, {} };
+        struct Ctx { HMONITOR mon; bool other; std::vector<HWND> out; } ctx{ monitor, otherDesktops, {} };
         EnumWindows([](HWND h, LPARAM lp) -> BOOL {
             auto c = reinterpret_cast<Ctx*>(lp);
-            if (IsManageable(h, c->mon))
+            if (IsManageable(h, c->mon, c->other))
                 c->out.push_back(h);
             return TRUE;
         }, reinterpret_cast<LPARAM>(&ctx));

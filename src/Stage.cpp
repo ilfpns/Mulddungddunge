@@ -39,7 +39,8 @@ namespace
     constexpr float kDepthRatio = 2.4f;  // camera distance relative to card width
     constexpr float kRadius = 8.f;
     constexpr float kBadge = 34.f;
-    constexpr float kHoverGrow = 1.07f;
+    constexpr float kPinBadge = 20.f;    // pin marker: dark disc with a white pin, readable on light and dark windows
+    constexpr float kHoverGrow = 1.14f;     // hovered card turns to face the viewer and grows
     // Placeholders are drawn at twice their on-screen size: the tilt magnifies the near edge, and the
     // far edge gets a clean 2:1 average instead of skipped pixels.
     constexpr float kPlaceholderScale = 2.f;
@@ -488,6 +489,33 @@ void Stage::RunMenuItem(int item)
         PostMessageW(card->hwnd, WM_CLOSE, 0, 0);   // the card goes away when the window is destroyed
 }
 
+wuc::CompositionSurfaceBrush Stage::PinBrush()
+{
+    if (m_pinBrush)
+        return m_pinBrush;
+    float size = std::round(S(kPinBadge));
+    winrt::com_ptr<IDWriteTextFormat> glyph;
+    if (FAILED(m_snap.Text()->CreateTextFormat(L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size * 0.55f, L"", glyph.put())))
+        m_snap.Text()->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size * 0.55f, L"", glyph.put());
+    glyph->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    glyph->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    auto surface = m_snap.Paint(size, size, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> disc, ring, ink;
+        dc->CreateSolidColorBrush(D2D1::ColorF(0.11f, 0.11f, 0.13f, 0.92f), disc.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.35f), ring.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f), ink.put());
+        D2D1_ELLIPSE e{ { size / 2, size / 2 }, size / 2 - 1, size / 2 - 1 };
+        dc->FillEllipse(e, disc.get());
+        dc->DrawEllipse(e, ring.get(), 1.f);
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        dc->DrawTextW(L"\xE718", 1, glyph.get(), { 0, 0, size, size }, ink.get());
+    });
+    m_pinBrush = m_compositor.CreateSurfaceBrush(surface);
+    return m_pinBrush;
+}
+
 void Stage::SetPinned(Card& c, bool pinned)
 {
     Trace(pinned ? L"pinned" : L"unpinned", c.hwnd);
@@ -496,12 +524,12 @@ void Stage::SetPinned(Card& c, bool pinned)
     c.pinned = pinned;
     if (!c.app.empty())
     {
+        c.desktop = DesktopOf(c.hwnd);
         if (pinned)
-            m_pinnedApps.push_back(c.app);
+            m_pinnedApps.push_back(PinKey(c));
         else
         {
-            auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(),
-                [&](auto const& app) { return _wcsicmp(app.c_str(), c.app.c_str()) == 0; });
+            auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, c); });
             if (it != m_pinnedApps.end())
                 m_pinnedApps.erase(it);
         }
@@ -571,7 +599,7 @@ float2 Stage::PinOffset(Card const& c, Pose const& p) const
     float halfW = k.size.x * p.scale / 2.f, halfH = k.size.y * p.scale / 2.f;
     float rad = p.angle * 3.14159265f / 180.f;
     float2 corner = Project(p, { halfW * std::cos(rad), -halfH }, -halfW * std::sin(rad));
-    return corner + float2{ -S(14), S(10) } - float2{ S(4), S(4) };
+    return corner + float2{ -S(16), S(14) } - float2{ S(kPinBadge), S(kPinBadge) } / 2.f;
 }
 
 float4x4 Stage::Perspective(float2 eye) const
@@ -603,6 +631,7 @@ void Stage::Populate()
         if (h != m_active)
             Adopt(h);
     }
+    AdoptPinnedElsewhere();
     Relayout(false);
 }
 
@@ -756,9 +785,53 @@ GUID Stage::DesktopOf(HWND hwnd) const
 
 // Card desktops are cached so layout never has to ask Explorer; they are refreshed when the desktop
 // changes (windows may have been moved between desktops in Task View meanwhile).
+// DWM cloaks windows that live on other desktops. Reading that attribute is a cheap local call and,
+// unlike a cached desktop id, follows windows moved between desktops in Task View.
 bool Stage::Here(Card const& c) const
 {
-    return c.desktop == GUID_NULL || m_desktopId == GUID_NULL || c.desktop == m_desktopId;
+    return !wt::IsCloaked(c.hwnd);
+}
+
+// A pin is remembered as "{desktop}|executable": it belongs to that app's window on that desktop only.
+// Entries without a desktop (saved by older versions) match the app anywhere.
+std::wstring Stage::PinKey(Card const& c)
+{
+    wchar_t guid[64]{};
+    StringFromGUID2(c.desktop, guid, ARRAYSIZE(guid));
+    return std::wstring(guid) + L"|" + c.app;
+}
+
+bool Stage::PinMatches(std::wstring const& entry, Card const& c)
+{
+    auto bar = entry.find(L'|');
+    if (bar == std::wstring::npos)
+        return _wcsicmp(entry.c_str(), c.app.c_str()) == 0;
+    return _wcsicmp(entry.c_str(), PinKey(c).c_str()) == 0;
+}
+
+// Pinned apps whose windows live on other desktops still get their (pinned) cards.
+void Stage::AdoptPinnedElsewhere()
+{
+    if (m_pinnedApps.empty())
+        return;
+    for (HWND h : wt::EnumManageable(m_mon, true))
+    {
+        if (!wt::IsCloaked(h) || OnStage(h) || std::any_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
+            continue;
+        auto app = wt::ProcessPath(h);
+        if (app.empty() || std::none_of(m_pinnedApps.begin(), m_pinnedApps.end(),
+                [&](auto& e) { return e.size() >= app.size() && _wcsicmp(e.c_str() + e.size() - app.size(), app.c_str()) == 0; }))
+            continue;
+        auto card = MakeCard(h);
+        if (!card->pinned)
+            continue;                               // not pinned on its desktop, or taken by another window
+        m_cards.push_back(card);
+        m_snap.CaptureMinimized(h, [this, card](auto const& surface) {
+            if (surface)
+                SetSnapshot(*card, card->frame, surface);
+            TrimMemory();
+        });
+    }
 }
 
 // Explorer keeps the current desktop in the registry: under Explorer\VirtualDesktops on Windows 11,
@@ -799,6 +872,7 @@ void Stage::SyncDesktop()
         if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
             Adopt(h);
     }
+    AdoptPinnedElsewhere();
     m_hover = -1;
     Relayout(false);
     SnapActiveSoon();
@@ -868,19 +942,33 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->hwnd = hwnd;
     c->app = wt::ProcessPath(hwnd);
     c->desktop = m_desktopId;                   // cards are only made for windows on the current desktop
-    // Pinned if this app has more pin entries than it currently has pinned cards.
-    auto same = [&](auto const& app) { return !c->app.empty() && _wcsicmp(app.c_str(), c->app.c_str()) == 0; };
-    auto wanted = std::count_if(m_pinnedApps.begin(), m_pinnedApps.end(), same);
-    auto have = std::count_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->pinned && same(o->app); });
-    c->pinned = have < wanted;
+    // Pinned if this app on this desktop has more pin entries than pinned cards. The desktop is only
+    // asked for (a call into Explorer) when the app has a pin at all.
+    if (!c->app.empty() && std::any_of(m_pinnedApps.begin(), m_pinnedApps.end(),
+            [&](auto const& e) { return e.size() >= c->app.size() && _wcsicmp(e.c_str() + e.size() - c->app.size(), c->app.c_str()) == 0; }))
+    {
+        c->desktop = DesktopOf(hwnd);
+        auto wanted = std::count_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, *c); });
+        auto have = std::count_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->pinned && o->desktop == c->desktop && o->app == c->app; });
+        c->pinned = have < wanted;
+        // Upgrade an old app-only entry to this window's desktop, so it stops matching elsewhere.
+        auto old = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(),
+            [&](auto const& e) { return e.find(L'|') == std::wstring::npos && PinMatches(e, *c); });
+        if (c->pinned && old != m_pinnedApps.end() && c->desktop != GUID_NULL)
+        {
+            *old = PinKey(*c);
+            SavePins();
+        }
+    }
     c->frame = IsIconic(hwnd) ? wt::RestoreRect(hwnd) : wt::FrameRect(hwnd);
     c->w = static_cast<float>(std::max(1L, c->frame.right - c->frame.left));
     c->h = static_cast<float>(std::max(1L, c->frame.bottom - c->frame.top));
     c->snapshot = m_compositor.CreateSurfaceBrush();
     c->snapshot.Stretch(wuc::CompositionStretch::Fill);
     c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
-    // Only a minimized window needs a stand-in; a visible one is photographed right away.
-    if (IsIconic(hwnd))
+    // Only a window that can't be photographed right now (minimized, or on another desktop) needs a
+    // stand-in; a visible one is photographed right away.
+    if (IsIconic(hwnd) || wt::IsCloaked(hwnd))
     {
         c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, kPlaceholderScale * S(kThumbW) * c->w / CropFor(*c, true).size.x));
         c->hasPicture = true;
@@ -937,12 +1025,8 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
     if (withBadge)
     {
         v.pin = m_compositor.CreateSpriteVisual();
-        v.pin.Size({ S(8), S(8) });
-        v.pin.Brush(m_compositor.CreateColorBrush({ 230, 255, 255, 255 }));
-        auto dot = m_compositor.CreateEllipseGeometry();
-        dot.Center({ S(4), S(4) });
-        dot.Radius({ S(4), S(4) });
-        v.pin.Clip(m_compositor.CreateGeometricClip(dot));
+        v.pin.Size({ S(kPinBadge), S(kPinBadge) });
+        v.pin.Brush(PinBrush());
         v.pin.IsVisible(c.pinned);
         v.holder.Children().InsertAtTop(v.pin);
     }
@@ -1109,22 +1193,64 @@ int Stage::HitTest(POINT pt) const
     return -1;
 }
 
+// The hovered card turns to face the viewer and grows; the previous one tilts back. Only end values
+// are given, so a quick sweep across cards continues from wherever each card is instead of jumping.
+Pose Stage::HoverPose(Card const& c, size_t i, bool hovered) const
+{
+    Pose p = SlotPose(c, i);
+    if (hovered)
+    {
+        p.scale *= kHoverGrow;
+        p.angle = 0.f;
+    }
+    return p;
+}
+
 void Stage::SetHover(int index)
 {
     if (index == m_hover)
         return;
-    auto grow = [&](int i, float factor) {
+    auto settle = [&](int i, bool hovered) {
         if (i < 0 || i >= static_cast<int>(m_visible.size()))
             return;
         auto& c = *m_visible[i];
-        float s = ThumbScale(c) * factor;
-        auto a = m_compositor.CreateVector3KeyFrameAnimation();
-        a.InsertKeyFrame(1.f, { s, s, 1.f }, m_ease);
-        a.Duration(std::chrono::milliseconds(150));
-        c.side.sprite.StartAnimation(L"Scale", a);
+        auto& v = c.side;
+        Pose p = HoverPose(c, i, hovered);
+        std::chrono::milliseconds dur(hovered ? 200 : 170);
+        auto vec = [&](auto const& target, wchar_t const* prop, float3 to) {
+            auto anim = m_compositor.CreateVector3KeyFrameAnimation();
+            anim.InsertKeyFrame(1.f, to, m_ease);
+            anim.Duration(dur);
+            target.StartAnimation(prop, anim);
+        };
+        vec(v.sprite, L"Scale", { p.scale, p.scale, 1.f });
+        auto angle = m_compositor.CreateScalarKeyFrameAnimation();
+        angle.InsertKeyFrame(1.f, p.angle, m_ease);
+        angle.Duration(dur);
+        v.sprite.StartAnimation(L"RotationAngleInDegrees", angle);
+        auto radius = m_compositor.CreateVector2KeyFrameAnimation();
+        radius.InsertKeyFrame(1.f, { S(kRadius) / p.scale, S(kRadius) / p.scale }, m_ease);
+        radius.Duration(dur);
+        v.clip.StartAnimation(L"CornerRadius", radius);
+        if (v.badge)
+        {
+            float2 o = BadgeOffset(c, p);
+            vec(v.badge, L"Offset", { o.x, o.y, 0.f });
+        }
+        if (v.pin)
+        {
+            float2 o = PinOffset(c, p);
+            vec(v.pin, L"Offset", { o.x, o.y, 0.f });
+        }
+        if (hovered)
+        {
+            // In front of its neighbours while it is larger than its slot.
+            m_sideContent.Children().Remove(v.holder);
+            m_sideContent.Children().InsertAtTop(v.holder);
+        }
     };
-    grow(m_hover, 1.f);
-    grow(index, kHoverGrow);
+    settle(m_hover, false);
+    settle(index, true);
     m_hover = index;
 }
 
@@ -1186,10 +1312,20 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
 void Stage::SwitchTo(size_t index)
 {
     auto next = m_visible[index];
+    if (wt::IsCloaked(next->hwnd))
+    {
+        // On another desktop: activating it makes Windows switch there (with its own animation);
+        // SyncDesktop takes over once the switch is seen.
+        m_hover = -1;
+        if (IsIconic(next->hwnd))
+            ShowWindowAsync(next->hwnd, SW_RESTORE);
+        ForceForeground(next->hwnd);
+        return;
+    }
     Pose from = SlotPose(*next, index);
     from.center = SideToAnim(from.center);
     if (m_hover == static_cast<int>(index))
-        from.scale *= kHoverGrow;
+        from = HoverPose(*next, index, true), from.center = SideToAnim(from.center);
     m_hover = -1;
 
     if (next->hwnd == m_active)
@@ -1569,15 +1705,17 @@ void Stage::BeginDrag(POINT viewPt)
         return;
     m_dragging = true;
     m_dragCard = m_visible[m_pressIndex];
+    // Starts from how the card looks right now (usually hovered: facing front and enlarged).
+    Pose from = HoverPose(*m_dragCard, m_pressIndex, m_hover == m_pressIndex);
+    from.center = SideToAnim(from.center);
+    float slotScale = SlotPose(*m_dragCard, m_pressIndex).scale;
     SetHover(-1);
     if (!m_dragCard->pinned && m_dragCard->side.holder)
         m_dragCard->side.holder.Opacity(0.f);
     m_dragVis = MakeVis(*m_dragCard, false);
     m_animStage.Children().InsertAtTop(m_dragVis.holder);
-    Pose from = SlotPose(*m_dragCard, m_pressIndex);
-    from.center = SideToAnim(from.center);
     // Lifted: it straightens out and grows a little while following the pointer.
-    m_dragPose = { { static_cast<float>(viewPt.x), static_cast<float>(viewPt.y) }, from.scale * 1.25f, 0.f, true };
+    m_dragPose = { { static_cast<float>(viewPt.x), static_cast<float>(viewPt.y) }, slotScale * 1.25f, 0.f, true };
     ApplyPose(m_dragVis, *m_dragCard, from);
     AnimatePose(m_dragVis, *m_dragCard, from, m_dragPose, 180);
     GrowView();

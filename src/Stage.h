@@ -75,6 +75,7 @@ private:
     void RemoveCard(HWND hwnd, bool evenIfPinned = false);
     void Park(std::shared_ptr<Card> card);
     void SetPinned(Card& c, bool pinned);
+    wuc::CompositionSurfaceBrush PinBrush();
     void LoadPins();
     void SavePins() const;
     void ShowMenu(HMENU menu, UINT* command);           // plain Win32 menu (tray icon)
@@ -91,6 +92,9 @@ private:
     static GUID CurrentDesktopId();
     void SyncDesktop();
     void Adopt(HWND hwnd);
+    void AdoptPinnedElsewhere();
+    static std::wstring PinKey(Card const& c);
+    static bool PinMatches(std::wstring const& entry, Card const& c);
     LRESULT OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp);
 
     void Dock();
@@ -115,6 +119,7 @@ private:
     void Relayout(bool animate);
     int HitTest(POINT pt) const;
     void SetHover(int index);
+    Pose HoverPose(Card const& c, size_t i, bool hovered) const;
 
     void Populate();
     std::shared_ptr<Card> MakeCard(HWND hwnd);
@@ -178,6 +183,7 @@ private:
     wuc::ContainerVisual m_sideContent{ nullptr };  // sidebar cards, positioned over the bar
     wuc::ContainerVisual m_animStage{ nullptr };    // flying cards; same camera as the sidebar
     wuc::CompositionColorBrush m_placeholderBrush{ nullptr };
+    wuc::CompositionSurfaceBrush m_pinBrush{ nullptr };
     wuc::CompositionEasingFunction m_ease{ nullptr };
 
     std::vector<std::shared_ptr<Card>> m_cards;     // all known windows, most recent first
