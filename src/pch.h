@@ -7,6 +7,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <d3d11_4.h>

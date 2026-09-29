@@ -28,6 +28,14 @@ struct Pose
     float2 center;
     float scale;
     float angle;
+    bool thumb = false;     // cropped to the uniform sidebar card shape
+};
+
+// Visible part of the sprite, in sprite-local pixels.
+struct Crop
+{
+    float2 offset;
+    float2 size;
 };
 
 class Stage
@@ -46,6 +54,11 @@ private:
     void OnMinimizeStart(HWND hwnd);
     void OnGone(HWND hwnd);
     void RemoveCard(HWND hwnd);
+    // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
+    bool OnCurrentDesktop(HWND hwnd) const;
+    static GUID CurrentDesktopId();
+    void SyncDesktop();
+    void Adopt(HWND hwnd);
     LRESULT OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp);
 
     void Dock();
@@ -55,7 +68,8 @@ private:
     float S(float v) const { return v * m_scale; }
     float2 SlotCenter(size_t i) const;          // sidebar coords
     float ThumbScale(Card const& c) const;
-    float4x4 Perspective(Card const& c) const;
+    float4x4 Perspective() const;
+    Crop CropFor(Card const& c, bool thumb) const;
     Pose SlotPose(Card const& c, size_t i) const;
 
     CardVis MakeVis(Card const& c, bool withBadge);
@@ -112,11 +126,15 @@ private:
     wuc::CompositionColorBrush m_placeholderBrush{ nullptr };
     wuc::CompositionEasingFunction m_ease{ nullptr };
 
-    std::vector<std::shared_ptr<Card>> m_cards;     // sidebar order, top first
+    std::vector<std::shared_ptr<Card>> m_cards;     // all known windows, most recent first
+    std::vector<std::shared_ptr<Card>> m_visible;   // the ones in the sidebar right now (current desktop, max 4)
+    winrt::com_ptr<IVirtualDesktopManager> m_desktops;
+    GUID m_desktopId{};
     bool m_busy = false;
     bool m_ready = false;                           // initial population finished
     ULONGLONG m_quietUntil = 0;                     // ignore focus churn caused by our own minimize/restore
     std::vector<HWINEVENTHOOK> m_hooks;
+    UINT m_shellMsg = 0;                            // shell hook: fires only for app windows, unlike object WinEvents
     CardVis m_flyOut, m_flyIn;
     std::shared_ptr<Card> m_outCard, m_inCard;
     int m_pending = 0;                              // fly-out and fly-in steps still running

@@ -13,9 +13,9 @@ namespace
     constexpr UINT_PTR kTimerFade = 4;
 
     constexpr float kSidebarW = 210.f;
-    constexpr float kThumbW = 210.f;     // card width before the tilt foreshortens it
-    constexpr float kThumbMaxH = 170.f;
-    constexpr float kPitch = 175.f;
+    constexpr float kThumbW = 210.f;     // card size before the tilt foreshortens it; every card has this shape
+    constexpr float kThumbH = 140.f;
+    constexpr float kPitch = 172.f;
     constexpr float kTilt = 42.f;        // degrees
     constexpr float kDepthRatio = 2.2f;  // perspective distance relative to card width, so every card bends alike
     constexpr float kRadius = 8.f;
@@ -28,6 +28,20 @@ namespace
     constexpr ULONGLONG kQuietMs = 700;
 
     Stage* g_stage = nullptr;
+
+    // Appends to %TEMP%\stage-manager.log; only written when something goes wrong.
+    void LogError(UINT msg, HRESULT hr, wchar_t const* text)
+    {
+        wchar_t path[MAX_PATH];
+        GetTempPathW(MAX_PATH, path);
+        wcscat_s(path, L"stage-manager.log");
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f)
+        {
+            fwprintf(f, L"msg=0x%04X hr=0x%08X %s\n", msg, static_cast<unsigned>(hr), text);
+            fclose(f);
+        }
+    }
 
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
     {
@@ -93,6 +107,7 @@ bool Stage::Init(HINSTANCE inst)
     m_placeholderBrush = m_compositor.CreateColorBrush({ 255, 58, 58, 64 });
     m_ease = MakeEase(m_compositor);
     m_snap.Init(m_compositor);
+    m_desktops = winrt::try_create_instance<IVirtualDesktopManager>(CLSID_VirtualDesktopManager);
 
     appbar::Register(m_sidebar, WM_APPBAR_CB);
     Dock();
@@ -108,6 +123,7 @@ void Stage::Shutdown()
 {
     for (auto hook : m_hooks)
         UnhookWinEvent(hook);
+    DeregisterShellHookWindow(m_sidebar);
     NOTIFYICONDATAW nid{ sizeof(nid) };
     nid.hWnd = m_sidebar;
     nid.uID = 1;
@@ -154,26 +170,40 @@ void Stage::ShowTrayMenu()
 float2 Stage::SlotCenter(size_t i) const
 {
     // The stack is centered vertically in the bar.
-    float n = static_cast<float>(std::min(m_cards.size(), kMaxCards));
+    float n = static_cast<float>(m_visible.size());
     float barH = static_cast<float>(m_bar.bottom - m_bar.top);
     return { S(kSidebarW) / 2.f, barH / 2.f + (i - (n - 1.f) / 2.f) * S(kPitch) };
 }
 
 float Stage::ThumbScale(Card const& c) const
 {
-    return std::min(S(kThumbW) / c.w, S(kThumbMaxH) / c.h);
+    return S(kThumbW) / CropFor(c, true).size.x;
 }
 
-float4x4 Stage::Perspective(Card const& c) const
+// Sidebar cards all share one shape; a window with another aspect ratio is cropped (top-anchored).
+Crop Stage::CropFor(Card const& c, bool thumb) const
+{
+    if (!thumb)
+        return { { 0.f, 0.f }, { c.w, c.h } };
+    float aspect = kThumbW / kThumbH;
+    float cw = c.w, ch = c.h;
+    if (cw / ch > aspect)
+        cw = ch * aspect;
+    else
+        ch = cw / aspect;
+    return { { (c.w - cw) / 2.f, 0.f }, { cw, ch } };
+}
+
+float4x4 Stage::Perspective() const
 {
     auto m = float4x4::identity();
-    m.m34 = -1.f / (kDepthRatio * c.w * ThumbScale(c));
+    m.m34 = -1.f / (kDepthRatio * S(kThumbW));
     return m;
 }
 
 Pose Stage::SlotPose(Card const& c, size_t i) const
 {
-    return { SlotCenter(i), ThumbScale(c), kTilt };
+    return { SlotCenter(i), ThumbScale(c), kTilt, true };
 }
 
 // ---- cards ----------------------------------------------------------------
@@ -216,16 +246,21 @@ void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id
     case EVENT_SYSTEM_MINIMIZESTART:
         g_stage->OnMinimizeStart(hwnd);
         break;
-    case EVENT_OBJECT_DESTROY:
-    case EVENT_OBJECT_HIDE:
-        g_stage->OnGone(hwnd);
-        break;
     }
 }
 
 void Stage::OnForeground(HWND hwnd)
 {
-    if (!m_ready || m_busy || hwnd == m_active || GetTickCount64() < m_quietUntil)
+    if (!m_ready || m_busy)
+        return;
+    GUID desktop = CurrentDesktopId();
+    if (desktop != m_desktopId)
+    {
+        m_desktopId = desktop;
+        SyncDesktop();
+        return;
+    }
+    if (hwnd == m_active || GetTickCount64() < m_quietUntil)
         return;
     if (!wt::IsManageable(hwnd, m_mon))
         return;
@@ -252,6 +287,55 @@ void Stage::OnGone(HWND hwnd)
     if (m_busy || IsWindowVisible(hwnd))
         return;
     RemoveCard(hwnd);
+}
+
+bool Stage::OnCurrentDesktop(HWND hwnd) const
+{
+    BOOL on = TRUE;
+    if (m_desktops && FAILED(m_desktops->IsWindowOnCurrentVirtualDesktop(hwnd, &on)))
+        return true;
+    return on != FALSE;
+}
+
+GUID Stage::CurrentDesktopId()
+{
+    GUID id{};
+    DWORD size = sizeof(id);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
+        L"CurrentVirtualDesktop", RRF_RT_REG_BINARY, nullptr, &id, &size);
+    return id;
+}
+
+// After switching desktops the previous stage window stays put on its own desktop; the new desktop's
+// windows take over the sidebar, and ones never seen before are adopted.
+void Stage::SyncDesktop()
+{
+    HWND fg = GetForegroundWindow();
+    m_active = wt::IsManageable(fg, m_mon) ? fg : nullptr;
+    if (m_active)
+        RemoveCard(m_active);
+    for (HWND h : wt::EnumManageable(m_mon))
+    {
+        if (h != m_active && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
+            Adopt(h);
+    }
+    m_hover = -1;
+    Relayout(false);
+}
+
+// A window seen for the first time on this desktop joins the sidebar like at startup.
+void Stage::Adopt(HWND hwnd)
+{
+    auto card = MakeCard(hwnd);
+    m_cards.push_back(card);
+    if (IsIconic(hwnd))
+        return;
+    RECT frame = wt::FrameRect(hwnd);
+    m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
+        SetSnapshot(*card, frame, surface);
+        if (card->hwnd != m_active && IsWindow(card->hwnd))
+            MinimizeQuiet(card->hwnd);
+    });
 }
 
 void Stage::RemoveCard(HWND hwnd)
@@ -301,11 +385,8 @@ void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurfa
 void Stage::ApplySize(CardVis const& v, Card const& c)
 {
     v.sprite.Size({ c.w, c.h });
-    v.sprite.Offset({ -c.w / 2.f, -c.h / 2.f, 0.f });
-    v.sprite.CenterPoint({ c.w / 2.f, c.h / 2.f, 0.f });
     v.sprite.Brush(c.hasSnapshot ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
-    v.clip.Size({ c.w, c.h });
-    v.holder.TransformMatrix(Perspective(c));
+    v.holder.TransformMatrix(Perspective());
 }
 
 void Stage::SetMinAnimate(bool on)
@@ -346,34 +427,56 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
     return v;
 }
 
+// The holder sits at the card's visual center; the sprite is shifted so the visible (cropped) part
+// is centered on it, and scales/tilts around that same point.
 void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
 {
+    Crop k = CropFor(c, p.thumb);
+    float2 mid = k.offset + k.size / 2.f;
     v.holder.Offset({ p.center.x, p.center.y, 0.f });
+    v.sprite.Offset({ -mid.x, -mid.y, 0.f });
+    v.sprite.CenterPoint({ mid.x, mid.y, 0.f });
     v.sprite.Scale({ p.scale, p.scale, 1.f });
     v.sprite.RotationAngleInDegrees(p.angle);
+    v.clip.Offset(k.offset);
+    v.clip.Size(k.size);
     v.clip.CornerRadius({ S(kRadius) / p.scale, S(kRadius) / p.scale });
     if (v.badge)
     {
-        float dw = c.w * p.scale, dh = c.h * p.scale;
-        v.badge.Offset({ -dw / 2.f - S(6), dh / 2.f - S(kBadge) * 0.65f, 0.f });
+        float2 d = k.size * p.scale;
+        v.badge.Offset({ -p.center.x + S(4), d.y / 2.f - S(kBadge) * 0.65f, 0.f });
     }
 }
 
 void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose const& to, int ms)
 {
     std::chrono::milliseconds dur(ms);
+    Crop k0 = CropFor(c, from.thumb), k1 = CropFor(c, to.thumb);
+    float2 mid0 = k0.offset + k0.size / 2.f, mid1 = k1.offset + k1.size / 2.f;
 
-    auto off = m_compositor.CreateVector3KeyFrameAnimation();
-    off.InsertKeyFrame(0.f, { from.center.x, from.center.y, 0.f });
-    off.InsertKeyFrame(1.f, { to.center.x, to.center.y, 0.f }, m_ease);
-    off.Duration(dur);
-    v.holder.StartAnimation(L"Offset", off);
+    auto vec3 = [&](auto const& target, wchar_t const* prop, float3 a, float3 b) {
+        auto anim = m_compositor.CreateVector3KeyFrameAnimation();
+        anim.InsertKeyFrame(0.f, a);
+        anim.InsertKeyFrame(1.f, b, m_ease);
+        anim.Duration(dur);
+        target.StartAnimation(prop, anim);
+    };
+    auto vec2 = [&](auto const& target, wchar_t const* prop, float2 a, float2 b) {
+        auto anim = m_compositor.CreateVector2KeyFrameAnimation();
+        anim.InsertKeyFrame(0.f, a);
+        anim.InsertKeyFrame(1.f, b, m_ease);
+        anim.Duration(dur);
+        target.StartAnimation(prop, anim);
+    };
 
-    auto scale = m_compositor.CreateVector3KeyFrameAnimation();
-    scale.InsertKeyFrame(0.f, { from.scale, from.scale, 1.f });
-    scale.InsertKeyFrame(1.f, { to.scale, to.scale, 1.f }, m_ease);
-    scale.Duration(dur);
-    v.sprite.StartAnimation(L"Scale", scale);
+    vec3(v.holder, L"Offset", { from.center.x, from.center.y, 0.f }, { to.center.x, to.center.y, 0.f });
+    vec3(v.sprite, L"Offset", { -mid0.x, -mid0.y, 0.f }, { -mid1.x, -mid1.y, 0.f });
+    vec3(v.sprite, L"CenterPoint", { mid0.x, mid0.y, 0.f }, { mid1.x, mid1.y, 0.f });
+    vec3(v.sprite, L"Scale", { from.scale, from.scale, 1.f }, { to.scale, to.scale, 1.f });
+    vec2(v.clip, L"Offset", k0.offset, k1.offset);
+    vec2(v.clip, L"Size", k0.size, k1.size);
+    vec2(v.clip, L"CornerRadius", { S(kRadius) / from.scale, S(kRadius) / from.scale },
+        { S(kRadius) / to.scale, S(kRadius) / to.scale });
 
     auto angle = m_compositor.CreateScalarKeyFrameAnimation();
     angle.InsertKeyFrame(0.f, from.angle);
@@ -381,17 +484,11 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
     angle.Duration(dur);
     v.sprite.StartAnimation(L"RotationAngleInDegrees", angle);
 
-    auto radius = m_compositor.CreateVector2KeyFrameAnimation();
-    radius.InsertKeyFrame(0.f, { S(kRadius) / from.scale, S(kRadius) / from.scale });
-    radius.InsertKeyFrame(1.f, { S(kRadius) / to.scale, S(kRadius) / to.scale }, m_ease);
-    radius.Duration(dur);
-    v.clip.StartAnimation(L"CornerRadius", radius);
-
     if (v.badge)
     {
-        float dw = c.w * to.scale, dh = c.h * to.scale;
+        float2 d = k1.size * to.scale;
         auto badge = m_compositor.CreateVector3KeyFrameAnimation();
-        badge.InsertKeyFrame(1.f, { -dw / 2.f - S(6), dh / 2.f - S(kBadge) * 0.65f, 0.f }, m_ease);
+        badge.InsertKeyFrame(1.f, { -to.center.x + S(4), d.y / 2.f - S(kBadge) * 0.65f, 0.f }, m_ease);
         badge.Duration(dur);
         v.badge.StartAnimation(L"Offset", badge);
     }
@@ -399,15 +496,29 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
 
 void Stage::Relayout(bool animate)
 {
-    for (size_t i = 0; i < m_cards.size(); ++i)
+    m_visible.clear();
+    for (auto& c : m_cards)
     {
-        auto& c = *m_cards[i];
-        if (i >= kMaxCards)
+        bool here = OnCurrentDesktop(c->hwnd);
+        if (here && m_visible.size() < kMaxCards)
         {
-            if (c.side.holder)
-                c.side.holder.IsVisible(false);
+            m_visible.push_back(c);
             continue;
         }
+        if (c->side.holder)
+            c->side.holder.IsVisible(false);
+        // Pushed out of this desktop's sidebar: its snapshot would only hold memory.
+        if (here && c->hasSnapshot)
+        {
+            c->snapshot.Surface(nullptr);
+            c->hasSnapshot = false;
+            if (c->side.holder)
+                ApplySize(c->side, *c);
+        }
+    }
+    for (size_t i = 0; i < m_visible.size(); ++i)
+    {
+        auto& c = *m_visible[i];
         Pose target = SlotPose(c, i);
         if (!c.side.holder)
         {
@@ -419,7 +530,7 @@ void Stage::Relayout(bool animate)
         c.side.holder.IsVisible(true);
         float2 now{ c.side.holder.Offset().x, c.side.holder.Offset().y };
         if (animate && (now.x != target.center.x || now.y != target.center.y))
-            AnimatePose(c.side, c, { now, target.scale, target.angle }, target, kSlideMs);
+            AnimatePose(c.side, c, { now, target.scale, target.angle, true }, target, kSlideMs);
         else
             ApplyPose(c.side, c, target);
     }
@@ -427,13 +538,10 @@ void Stage::Relayout(bool animate)
 
 int Stage::HitTest(POINT pt) const
 {
-    size_t n = std::min(m_cards.size(), kMaxCards);
-    for (size_t i = 0; i < n; ++i)
+    for (size_t i = 0; i < m_visible.size(); ++i)
     {
-        auto& c = *m_cards[i];
         float2 ctr = SlotCenter(i);
-        float s = ThumbScale(c);
-        if (std::abs(pt.x - ctr.x) <= c.w * s / 2.f && std::abs(pt.y - ctr.y) <= c.h * s / 2.f)
+        if (std::abs(pt.x - ctr.x) <= S(kThumbW) / 2.f && std::abs(pt.y - ctr.y) <= S(kThumbH) / 2.f)
             return static_cast<int>(i);
     }
     return -1;
@@ -444,9 +552,9 @@ void Stage::SetHover(int index)
     if (index == m_hover)
         return;
     auto grow = [&](int i, float factor) {
-        if (i < 0 || i >= static_cast<int>(std::min(m_cards.size(), kMaxCards)))
+        if (i < 0 || i >= static_cast<int>(m_visible.size()))
             return;
-        auto& c = *m_cards[i];
+        auto& c = *m_visible[i];
         float s = ThumbScale(c) * factor;
         auto a = m_compositor.CreateVector3KeyFrameAnimation();
         a.InsertKeyFrame(1.f, { s, s, 1.f }, m_ease);
@@ -468,7 +576,7 @@ float2 Stage::SideToAnim(float2 p) const
 Pose PoseForRect(RECT const& r, RECT const& monitor, float spriteW)
 {
     return { { (r.left + r.right) / 2.f - monitor.left, (r.top + r.bottom) / 2.f - monitor.top },
-             (r.right - r.left) / spriteW, 0.f };
+             (r.right - r.left) / spriteW, 0.f, false };
 }
 
 Pose Stage::FramePose(Card const& c) const
@@ -494,14 +602,14 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
 
 void Stage::SwitchTo(size_t index)
 {
-    auto next = m_cards[index];
+    auto next = m_visible[index];
     Pose from = SlotPose(*next, index);
     from.center = SideToAnim(from.center);
     if (m_hover == static_cast<int>(index))
         from.scale *= kHoverGrow;
     m_hover = -1;
 
-    m_cards.erase(m_cards.begin() + index);
+    m_cards.erase(std::find(m_cards.begin(), m_cards.end(), next));
     if (next->side.holder)
         m_sideContent.Children().Remove(next->side.holder);
     next->side = {};
@@ -528,7 +636,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     m_inCard = nextCard;
     m_pending = 0;
 
-    if (prev && prev != next && IsWindow(prev) && IsWindowVisible(prev) && !IsIconic(prev))
+    if (prev && prev != next && IsWindow(prev) && IsWindowVisible(prev) && !IsIconic(prev) && OnCurrentDesktop(prev))
     {
         m_outCard = TakeCard(prev);
         m_cards.insert(m_cards.begin(), m_outCard);
@@ -679,7 +787,22 @@ void Stage::ForceForeground(HWND hwnd)
 LRESULT CALLBACK Stage::SidebarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (g_stage && g_stage->m_sidebar == hwnd)
-        return g_stage->OnSidebarMessage(msg, wp, lp);
+    {
+        // Exceptions must not unwind through user32; Windows would swallow them and leave us half-updated.
+        try
+        {
+            return g_stage->OnSidebarMessage(msg, wp, lp);
+        }
+        catch (winrt::hresult_error const& e)
+        {
+            LogError(msg, e.code(), e.message().c_str());
+        }
+        catch (...)
+        {
+            LogError(msg, E_FAIL, L"unknown exception");
+        }
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -692,6 +815,12 @@ LRESULT CALLBACK Stage::AnimProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == m_shellMsg && m_shellMsg)
+    {
+        if ((wp & 0x7FFF) == HSHELL_WINDOWDESTROYED)
+            OnGone(reinterpret_cast<HWND>(lp));
+        return 0;
+    }
     switch (msg)
     {
     case WM_MOUSEACTIVATE:
@@ -742,13 +871,16 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         if (wp == kTimerPopulate)
         {
             Populate();
+            m_desktopId = CurrentDesktopId();
             m_ready = true;
             m_quietUntil = GetTickCount64() + kQuietMs;
             DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
             m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, flags));
             m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, nullptr, WinEventProc, 0, 0, flags));
-            m_hooks.push_back(SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, nullptr, WinEventProc, 0, 0, flags));
-            m_hooks.push_back(SetWinEventHook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE, nullptr, WinEventProc, 0, 0, flags));
+            // Object-level destroy/hide WinEvents would wake us for every caret, tooltip and menu in the
+            // system; the shell hook only reports top-level app windows.
+            m_shellMsg = RegisterWindowMessageW(L"SHELLHOOK");
+            RegisterShellHookWindow(m_sidebar);
         }
         else if (wp == kTimerMinAnimate)
             SetMinAnimate(true);

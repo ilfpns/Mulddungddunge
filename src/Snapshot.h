@@ -18,7 +18,7 @@ public:
     wuc::CompositionDrawingSurface Icon(HWND hwnd, int px);
 
 private:
-    static constexpr float kMaxWidth = 800.f;
+    static constexpr float kMaxWidth = 560.f;   // sidebar shows ~260px; enough for the fly-in too
 
     struct Job;
     std::shared_ptr<Job> Start(HWND hwnd, RECT const& frame);
