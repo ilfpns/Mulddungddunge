@@ -1,10 +1,8 @@
 #include "Stage.h"
-#include "AppBar.h"
 #include "WindowTracker.h"
 
 namespace
 {
-    constexpr UINT WM_APPBAR_CB = WM_APP + 1;
     constexpr UINT WM_TRAY = WM_APP + 2;
     constexpr UINT ID_EXIT = 1;
     constexpr UINT ID_PIN = 2;
@@ -28,6 +26,9 @@ namespace
     constexpr UINT_PTR kTimerFade = 4;
     constexpr UINT_PTR kTimerShrink = 5;
     constexpr UINT_PTR kTimerTrim = 6;
+    constexpr UINT_PTR kTimerTuck = 7;
+    constexpr UINT_PTR kTimerRecheck = 8;
+    constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
 
     constexpr float kSidebarW = 210.f;
     constexpr float kThumbW = 210.f;     // card size before the tilt foreshortens it; every card has this shape
@@ -38,6 +39,9 @@ namespace
     constexpr float kRadius = 8.f;
     constexpr float kBadge = 34.f;
     constexpr float kHoverGrow = 1.07f;
+    // Placeholders are drawn at twice their on-screen size: the tilt magnifies the near edge, and the
+    // far edge gets a clean 2:1 average instead of skipped pixels.
+    constexpr float kPlaceholderScale = 2.f;
     constexpr size_t kMaxCards = 4;
     constexpr int kSlideMs = 260;
     constexpr int kFlyMs = 420;
@@ -166,12 +170,9 @@ bool Stage::Init(HINSTANCE inst)
     LoadPins();
     m_desktops = winrt::try_create_instance<IVirtualDesktopManager>(CLSID_VirtualDesktopManager);
 
-    appbar::Register(m_sidebar, WM_APPBAR_CB);
     Dock();
     ShrinkView();
     AddTrayIcon();
-
-    // Give maximized windows a moment to shrink out of the newly reserved strip before capturing them.
     SetTimer(m_sidebar, kTimerPopulate, 400, nullptr);
     return true;
 }
@@ -181,12 +182,13 @@ void Stage::Shutdown()
     SetHotkeys(false);
     for (auto hook : m_hooks)
         UnhookWinEvent(hook);
+    for (auto& [pid, hook] : m_moveHooks)
+        UnhookWinEvent(hook);
     DeregisterShellHookWindow(m_sidebar);
     NOTIFYICONDATAW nid{ sizeof(nid) };
     nid.hWnd = m_sidebar;
     nid.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
-    appbar::Remove(m_sidebar);
     SetMinAnimate(true);
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate");
     DestroyWindow(m_view);
@@ -195,7 +197,12 @@ void Stage::Shutdown()
 
 void Stage::Dock()
 {
-    m_bar = appbar::Dock(m_sidebar, m_monitor, static_cast<int>(S(kSidebarW)));
+    // A strip along the left of the work area. Nothing is reserved: maximized windows use the whole
+    // screen, and the sidebar gets out of their way instead (see UpdateDock).
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(m_mon, &mi);
+    m_monitor = mi.rcMonitor;
+    m_bar = { mi.rcWork.left, mi.rcWork.top, mi.rcWork.left + static_cast<LONG>(S(kSidebarW)), mi.rcWork.bottom };
 
     float2 barSize{ static_cast<float>(m_bar.right - m_bar.left), static_cast<float>(m_bar.bottom - m_bar.top) };
     float2 barOrigin = SideToAnim({ 0.f, 0.f });
@@ -598,6 +605,10 @@ void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id
     case EVENT_SYSTEM_MINIMIZESTART:
         g_stage->OnMinimizeStart(hwnd);
         break;
+    case EVENT_OBJECT_LOCATIONCHANGE:
+        if (g_stage->OnStage(hwnd))
+            g_stage->UpdateDock();
+        break;
     }
 }
 
@@ -615,17 +626,24 @@ void Stage::OnForeground(HWND hwnd)
         return;
     }
     if (hwnd == m_active || GetTickCount64() < m_quietUntil)
+    {
+        UpdateDock();
         return;
+    }
     if (OnStage(hwnd))
     {
         m_stage.erase(std::find(m_stage.begin(), m_stage.end(), hwnd));
         m_stage.push_back(hwnd);
         m_active = hwnd;
         SnapActiveSoon();
+        UpdateDock();
         return;
     }
     if (!wt::IsManageable(hwnd, m_mon))
+    {
+        UpdateDock();                               // e.g. a fullscreen game came to the front
         return;
+    }
     // Already on screen (Alt+Tab, taskbar, a new window): only the previous one needs to leave.
     RemoveCard(hwnd);
     BeginTransition(hwnd, nullptr, {});
@@ -633,19 +651,38 @@ void Stage::OnForeground(HWND hwnd)
 
 void Stage::OnMinimizeStart(HWND hwnd)
 {
-    Trace(m_activeSnap && m_activeSnapHwnd == hwnd ? L"minimize (has snap)" : L"minimize (no snap)", hwnd);
-    if (!m_ready || m_busy || !OnStage(hwnd))
+    if (!m_ready || !OnStage(hwnd))
         return;
-    // Minimized by the user (button, Win+D, four-finger swipe): it flies into the sidebar from where
-    // it was, using the picture taken when it became the focused stage window.
+    // Minimized by the user (button, Win+D, four-finger swipe). It can't be photographed any more, so
+    // use the picture taken when it became the focused stage window, or the one from a sidebar hover.
+    wuc::CompositionDrawingSurface picture{ nullptr };
+    RECT frame{};
+    if (m_activeSnap && m_activeSnapHwnd == hwnd)
+    {
+        picture = m_activeSnap;
+        frame = m_activeSnapFrame;
+        m_activeSnap = nullptr;
+    }
+    else if (m_prefetch && m_prefetchHwnd == hwnd)
+    {
+        picture = m_prefetch;
+        frame = m_prefetchFrame;
+        m_prefetch = nullptr;
+    }
+    Trace(picture ? L"minimize (has snap)" : L"minimize (no snap)", hwnd);
+
     LeaveStage(hwnd);
     auto card = TakeCard(hwnd);
     if (!card->pinned)
         m_cards.insert(m_cards.begin(), card);
+    if (picture)
+        SetSnapshot(*card, frame, picture);
     Relayout(true);
-    // No flight without a picture to fly, or without a visible sidebar card to land on (the card can
-    // be out of view, e.g. while Windows is still moving the window between desktops).
-    if (!m_activeSnap || m_activeSnapHwnd != hwnd || !card->side.holder)
+    StageChanged();
+
+    // It flies into its slot from where it was, unless something else is animating, or its card is
+    // out of view (e.g. while Windows is still moving the window between desktops).
+    if (!picture || m_busy || !card->side.holder)
         return;
     m_busy = true;
     m_inCard = nullptr;
@@ -655,9 +692,7 @@ void Stage::OnMinimizeStart(HWND hwnd)
     m_pending = 1;
     card->side.holder.Opacity(0.f);
     GrowView();
-    auto surface = m_activeSnap;
-    m_activeSnap = nullptr;
-    OnOutCaptured(flight, m_activeSnapFrame, surface);
+    OnOutCaptured(flight, frame, picture);
 }
 
 void Stage::SnapActiveSoon()
@@ -730,6 +765,7 @@ void Stage::SyncDesktop()
     m_hover = -1;
     Relayout(false);
     SnapActiveSoon();
+    StageChanged();
 }
 
 // A window seen for the first time on this desktop joins the sidebar like at startup.
@@ -775,7 +811,7 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->snapshot = m_compositor.CreateSurfaceBrush();
     c->snapshot.Stretch(wuc::CompositionStretch::Fill);
     c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
-    c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, S(kThumbW) * c->w / CropFor(*c, true).size.x));
+    c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, kPlaceholderScale * S(kThumbW) * c->w / CropFor(*c, true).size.x));
     c->hasPicture = true;
     return c;
 }
@@ -969,7 +1005,7 @@ void Stage::Relayout(bool animate)
         if (!c.hasPicture)
         {
             // Back in view after its picture was released.
-            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, S(kThumbW) * c.w / CropFor(c, true).size.x));
+            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, kPlaceholderScale * S(kThumbW) * c.w / CropFor(c, true).size.x));
             c.hasPicture = true;
             if (c.side.holder)
                 ApplySize(c.side, c);
@@ -1101,8 +1137,17 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     std::vector<HWND> leaving;
     for (HWND h : m_stage)
     {
-        if (h != next && IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && OnCurrentDesktop(h))
+        if (h == next || !IsWindow(h) || !OnCurrentDesktop(h))
+            continue;
+        if (IsWindowVisible(h) && !IsIconic(h))
             leaving.push_back(h);
+        else if (IsWindowVisible(h))
+        {
+            // Minimized without us noticing in time: no flight, but it must not lose its card.
+            auto card = TakeCard(h);
+            if (!card->pinned)
+                m_cards.insert(m_cards.begin(), card);
+        }
     }
     m_stage = { next };
     m_active = next;
@@ -1168,6 +1213,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         return;
     }
     GrowView();
+    SetDock(DockState::Shown);                      // the cards fly to and from the sidebar
 }
 
 // The view's origin stays at the monitor's top-left, so resizing never moves any content.
@@ -1182,40 +1228,110 @@ void Stage::GrowView()
 
 void Stage::ShrinkView()
 {
-    // Covering only the bar keeps us off other apps' pixels, so their overlay/flip optimizations stay intact.
-    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, m_bar.right - m_monitor.left,
-        m_bar.bottom - m_monitor.top, SWP_NOACTIVATE | (m_tucked ? 0 : SWP_SHOWWINDOW));
+    // Covering only the bar (or just a thin strip at the edge while tucked) keeps us off other apps'
+    // pixels, so their overlay/flip optimizations stay intact.
+    if (m_dock == DockState::Hidden)
+    {
+        ShowWindow(m_view, SW_HIDE);
+        return;
+    }
+    LONG width = m_dock == DockState::Tucked ? static_cast<LONG>(S(kEdgeStrip)) + (m_bar.left - m_monitor.left)
+                                             : m_bar.right - m_monitor.left;
+    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, width, m_bar.bottom - m_monitor.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
-// Slides the cards off the left edge and then hides the window entirely, so nothing of ours sits
-// above a fullscreen game or video; slides back in when it exits.
-void Stage::SlideSidebar(bool out)
+// Slides the cards out to the left (tucked or hidden) or back in, then sizes the view to match.
+void Stage::SetDock(DockState state)
 {
-    if (out == m_tucked)
+    if (state == m_dock)
         return;
-    m_tucked = out;
+    bool wasOut = m_dock != DockState::Shown, out = state != DockState::Shown;
+    Trace(state == DockState::Shown ? L"dock shown" : state == DockState::Tucked ? L"dock tucked" : L"dock hidden");
+    m_dock = state;
     // While a fullscreen app runs, Alt+number belongs to it (VS Code tabs, JetBrains tool windows...).
-    SetHotkeys(!out);
-    float hidden = -static_cast<float>(m_bar.right - m_bar.left);
+    SetHotkeys(state != DockState::Hidden);
+    if (wasOut == out)
+    {
+        if (!m_busy && !m_dragging && !m_menu.open)
+            ShrinkView();
+        return;
+    }
+    float base = SideToAnim({ 0.f, 0.f }).x, hidden = base - static_cast<float>(m_bar.right - m_monitor.left);
+    if (!out && !m_busy && !m_dragging && !m_menu.open)
+        ShrinkView();                               // full bar size first, so the slide-in is visible
     auto anim = m_compositor.CreateScalarKeyFrameAnimation();
+    anim.InsertKeyFrame(1.f, out ? hidden : base, m_ease);
     anim.Duration(std::chrono::milliseconds(kSlideMs));
-    if (!out)
-        ShowWindow(m_view, SW_SHOWNOACTIVATE);
-    float base = SideToAnim({ 0.f, 0.f }).x;
-    anim.InsertKeyFrame(0.f, base + (out ? 0.f : hidden));
-    anim.InsertKeyFrame(1.f, base + (out ? hidden : 0.f), m_ease);
     m_slideBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     m_sideContent.StartAnimation(L"Offset.X", anim);
     m_slideBatch.End();
     m_slideBatch.Completed([this](auto&&, auto&&) {
         m_slideBatch = nullptr;
-        if (m_tucked)
-            ShowWindow(m_view, SW_HIDE);
+        if (m_dock != DockState::Shown && !m_busy && !m_dragging && !m_menu.open)
+            ShrinkView();                           // down to the edge strip, or gone
     });
+}
+
+bool Stage::CoversBar(HWND hwnd) const
+{
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !OnCurrentDesktop(hwnd))
+        return false;
+    RECT frame = wt::FrameRect(hwnd), overlap;
+    return IntersectRect(&overlap, &frame, &m_bar) && overlap.right - overlap.left > S(4);
+}
+
+// Fullscreen app in front -> hidden. A stage window over the bar -> tucked (unless the pointer pulled
+// it out). Otherwise shown. Nothing changes while something is animating; it is re-checked after.
+void Stage::UpdateDock()
+{
+    if (!m_ready || m_busy || m_dragging || m_menu.open)
+        return;
+    HWND top = wt::TopWindow(m_mon);
+    bool fullscreen = wt::IsFullscreen(top);
+    // The front window counts too, in case it reached the front without us seeing the focus change.
+    bool covered = (top && CoversBar(top)) || std::any_of(m_stage.begin(), m_stage.end(), [&](HWND h) { return CoversBar(h); });
+    SetDock(fullscreen ? DockState::Hidden : covered && !m_revealed ? DockState::Tucked : DockState::Shown);
+}
+
+// Moving or maximizing a window only raises EVENT_OBJECT_LOCATIONCHANGE, which fires constantly
+// system-wide (every cursor and caret move). So we listen only to the threads that own stage windows;
+// busy apps (a playing music app, a browser) keep their other threads' events away from us.
+void Stage::StageChanged()
+{
+    std::vector<DWORD> threads;
+    for (HWND h : m_stage)
+    {
+        DWORD tid = GetWindowThreadProcessId(h, nullptr);
+        if (tid && std::find(threads.begin(), threads.end(), tid) == threads.end())
+            threads.push_back(tid);
+    }
+    std::erase_if(m_moveHooks, [&](auto& entry) {
+        if (std::find(threads.begin(), threads.end(), entry.first) != threads.end())
+            return false;
+        UnhookWinEvent(entry.second);
+        return true;
+    });
+    for (DWORD tid : threads)
+    {
+        if (std::none_of(m_moveHooks.begin(), m_moveHooks.end(), [&](auto& e) { return e.first == tid; }))
+        {
+            DWORD pid = 0;
+            for (HWND h : m_stage)
+                if (GetWindowThreadProcessId(h, &pid) == tid)
+                    break;
+            m_moveHooks.emplace_back(tid, SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+                nullptr, WinEventProc, pid, tid, WINEVENT_OUTOFCONTEXT));
+        }
+    }
+    UpdateDock();
 }
 
 void Stage::SetHotkeys(bool on)
 {
+    if (on == m_hotkeysOn)
+        return;
+    m_hotkeysOn = on;
     for (int i = 0; i < static_cast<int>(kMaxCards); ++i)
     {
         if (on && !RegisterHotKey(m_sidebar, kHotkeyBase + i, MOD_ALT | MOD_NOREPEAT, '1' + i))
@@ -1335,7 +1451,11 @@ void Stage::FinishTransition()
     SetTimer(m_sidebar, kTimerShrink, 50, nullptr);
     m_quietUntil = GetTickCount64() + kQuietMs / 2;
     SnapActiveSoon();
+    m_revealed = false;
     m_busy = false;
+    StageChanged();                                 // after m_busy is cleared, or the dock won't update
+    // Focus changes that arrived while animating were ignored; catch up once things have settled.
+    SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
     SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
 }
 
@@ -1549,6 +1669,12 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
     case WM_MOUSEMOVE:
+        KillTimer(m_sidebar, kTimerTuck);
+        if (m_dock == DockState::Tucked && !m_busy)
+        {
+            m_revealed = true;
+            SetDock(DockState::Shown);
+        }
         if (!m_tracking)
         {
             TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, m_view, 0 };
@@ -1605,6 +1731,8 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSELEAVE:
         m_tracking = false;
+        if (m_revealed)
+            SetTimer(m_sidebar, kTimerTuck, 350, nullptr);     // brief grace period before tucking back
         if (!m_busy)
             m_prefetch = nullptr;       // don't hold the memory once the pointer leaves
         SetHover(-1);
@@ -1627,26 +1755,13 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     {
         size_t index = static_cast<size_t>(wp - kHotkeyBase);
         CloseCardMenu();
-        if (!m_busy && !m_tucked && index < m_visible.size())
+        if (!m_busy && m_dock != DockState::Hidden && index < m_visible.size())
         {
             Prefetch();     // no hover happened; the outgoing window is captured on the way
             SwitchTo(index);
         }
         return 0;
     }
-    case WM_APPBAR_CB:
-        if (wp == ABN_POSCHANGED)
-            Dock();
-        else if (wp == ABN_FULLSCREENAPP)
-        {
-            // Trust it only when the foreground window really is a fullscreen app (not us).
-            HWND fg = GetForegroundWindow();
-            DWORD pid = 0;
-            GetWindowThreadProcessId(fg, &pid);
-            bool real = lp && pid != GetCurrentProcessId() && wt::IsFullscreen(fg);
-            SlideSidebar(real);
-        }
-        return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP)
             ShowTrayMenu();
@@ -1661,6 +1776,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             Populate();
             SnapActiveSoon();
+            m_ready = true;
+            StageChanged();
             SetTimer(m_sidebar, kTimerTrim, 3000, nullptr);     // after the startup captures have landed
             m_desktopId = CurrentDesktopId();
             m_ready = true;
@@ -1672,7 +1789,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             // system; the shell hook only reports top-level app windows.
             m_shellMsg = RegisterWindowMessageW(L"SHELLHOOK");
             RegisterShellHookWindow(m_sidebar);
-            SetHotkeys(true);
+            SetHotkeys(m_dock != DockState::Hidden);
         }
         else if (wp == kTimerActiveSnap)
         {
@@ -1699,10 +1816,28 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == kTimerFade)
             FadeOutFlyIn();
         else if (wp == kTimerShrink && !m_busy && !m_dragging && !m_menu.open)
+        {
             ShrinkView();
+            UpdateDock();
+        }
         else if (wp == kTimerTrim)
             SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+        else if (wp == kTimerRecheck)
+        {
+            HWND fg = GetForegroundWindow();
+            if (fg && fg != m_active)
+                OnForeground(fg);
+        }
+        else if (wp == kTimerTuck)
+        {
+            m_revealed = false;
+            UpdateDock();
+        }
         return 0;
+    case WM_SETTINGCHANGE:
+        if (wp != SPI_SETWORKAREA)
+            break;
+        [[fallthrough]];
     case WM_DISPLAYCHANGE:
         Dock();
         Relayout(false);

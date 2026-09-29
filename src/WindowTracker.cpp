@@ -45,7 +45,7 @@ namespace wt
 
     bool IsFullscreen(HWND hwnd)
     {
-        if (IsIconic(hwnd) || (GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
+        if (!hwnd || IsIconic(hwnd) || (GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
             return false;
         RECT r;
         GetWindowRect(hwnd, &r);
@@ -53,6 +53,25 @@ namespace wt
         GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
         return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top &&
                r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
+    }
+
+    HWND TopWindow(HMONITOR monitor)
+    {
+        DWORD self = GetCurrentProcessId();
+        for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT))
+        {
+            if (!IsWindowVisible(h) || IsIconic(h) || IsCloaked(h))
+                continue;
+            LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
+            if (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE))
+                continue;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid == self || MonitorFromWindow(h, MONITOR_DEFAULTTONULL) != monitor)
+                continue;
+            return h;
+        }
+        return nullptr;
     }
 
     std::vector<HWND> EnumManageable(HMONITOR monitor)

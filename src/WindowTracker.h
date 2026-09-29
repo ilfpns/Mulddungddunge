@@ -6,6 +6,9 @@ namespace wt
 {
     bool IsManageable(HWND hwnd, HMONITOR monitor);
     bool IsFullscreen(HWND hwnd);
+    // The top-most ordinary window on the monitor: skips always-on-top windows (pets, PiP players),
+    // tool windows and our own, which may hold focus without being what the user is looking at.
+    HWND TopWindow(HMONITOR monitor);
     std::vector<HWND> EnumManageable(HMONITOR monitor);   // top of z-order first
     RECT FrameRect(HWND hwnd);                              // visible frame, without invisible resize borders
     RECT RestoreRect(HWND hwnd, bool* maximized = nullptr); // window rect a minimized window comes back to

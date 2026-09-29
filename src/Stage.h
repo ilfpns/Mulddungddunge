@@ -144,7 +144,13 @@ private:
     void ShrinkView();                              // back to just the bar
     void Prefetch();
     void SnapActiveSoon();                          // keep a recent picture of the stage window for minimize
-    void SlideSidebar(bool out);                    // fullscreen apps: tuck the sidebar away to the left
+    // Where the sidebar is. Shown normally; Tucked (slid out, a thin strip at the screen edge brings it
+    // back) while a stage window covers it; Hidden (window gone, hotkeys released) for fullscreen apps.
+    enum class DockState { Shown, Tucked, Hidden };
+    void SetDock(DockState state);
+    void UpdateDock();                              // re-evaluate after anything that moves stage windows
+    void StageChanged();                            // m_stage changed: follow its windows, then UpdateDock
+    bool CoversBar(HWND hwnd) const;
     void SetHotkeys(bool on);                       // Alt+1..4 jump to sidebar cards                                // snapshot the stage window before a click needs it
 
     HMONITOR m_mon{};
@@ -152,7 +158,7 @@ private:
     std::vector<HWND> m_stage;      // every window on stage, most recently focused last
     int m_savedMinAnimate = 0;
     Snapshot m_snap;
-    // m_sidebar is a hidden message window (AppBar, tray icon, hotkeys, timers, shell hook).
+    // m_sidebar is a hidden message window (tray icon, hotkeys, timers, shell hook).
     // m_view draws everything and takes the clicks. It covers just the bar at rest and grows to the
     // whole monitor during a transition. It is deliberately not a layered window: DWM drops
     // composition frames of layered windows, which showed up as heavy flicker.
@@ -183,7 +189,10 @@ private:
     ULONGLONG m_quietUntil = 0;                     // ignore focus churn caused by our own minimize/restore
     std::vector<HWINEVENTHOOK> m_hooks;
     UINT m_shellMsg = 0;
-    bool m_tucked = false;
+    DockState m_dock = DockState::Shown;
+    bool m_revealed = false;                        // pulled out from the edge by the pointer
+    bool m_hotkeysOn = false;
+    std::vector<std::pair<DWORD, HWINEVENTHOOK>> m_moveHooks;   // location-change hooks, per stage window thread
     wuc::CompositionScopedBatch m_slideBatch{ nullptr };                            // shell hook: fires only for app windows, unlike object WinEvents
     CardVis m_flyIn;
     std::shared_ptr<Card> m_inCard;
