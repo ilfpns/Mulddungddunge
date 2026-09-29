@@ -653,6 +653,10 @@ void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id
         if (g_stage->OnStage(hwnd))
             g_stage->UpdateDock();
         break;
+    case EVENT_OBJECT_HIDE:
+        if (g_stage->OnStage(hwnd))
+            g_stage->OnMinimizeStart(hwnd);        // put away like a minimize: into the sidebar
+        break;
     }
 }
 
@@ -749,16 +753,22 @@ void Stage::SnapActiveSoon()
         SetTimer(m_sidebar, kTimerActiveSnap, kActiveSnapDelayMs, nullptr);
 }
 
+// The shell reports a window "destroyed" when it leaves the taskbar, which also happens when an app
+// merely hides it (closing to the tray). Only a window that really no longer exists loses its card.
 void Stage::OnGone(HWND hwnd)
 {
-    Trace(L"gone", hwnd);
+    Trace(IsWindow(hwnd) ? L"gone (hidden)" : L"gone (destroyed)", hwnd);
     // A fullscreen app closing may bring no focus change with it (e.g. focus already on a pet window).
     SetTimer(m_sidebar, kTimerDock, 100, nullptr);
-    if (!IsWindowVisible(hwnd))
-        LeaveStage(hwnd);
-    if (m_busy || IsWindowVisible(hwnd))
+    if (IsWindow(hwnd))
+    {
+        if (!IsWindowVisible(hwnd) && OnStage(hwnd))
+            OnMinimizeStart(hwnd);                  // put away like a minimize: into the sidebar
         return;
-    RemoveCard(hwnd, true);
+    }
+    LeaveStage(hwnd);
+    if (!m_busy)
+        RemoveCard(hwnd, true);
 }
 
 bool Stage::OnStage(HWND hwnd) const
@@ -968,7 +978,7 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
     // Only a window that can't be photographed right now (minimized, or on another desktop) needs a
     // stand-in; a visible one is photographed right away.
-    if (IsIconic(hwnd) || wt::IsCloaked(hwnd))
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd) || wt::IsCloaked(hwnd))
     {
         c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, kPlaceholderScale * S(kThumbW) * c->w / CropFor(*c, true).size.x));
         c->hasPicture = true;
@@ -1317,8 +1327,7 @@ void Stage::SwitchTo(size_t index)
         // On another desktop: activating it makes Windows switch there (with its own animation);
         // SyncDesktop takes over once the switch is seen.
         m_hover = -1;
-        if (IsIconic(next->hwnd))
-            ShowWindowAsync(next->hwnd, SW_RESTORE);
+        BringBack(next->hwnd);
         ForceForeground(next->hwnd);
         return;
     }
@@ -1354,9 +1363,9 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
             continue;
         if (IsWindowVisible(h) && !IsIconic(h))
             leaving.push_back(h);
-        else if (IsWindowVisible(h))
+        else
         {
-            // Minimized without us noticing in time: no flight, but it must not lose its card.
+            // Minimized or hidden without us noticing in time: no flight, but it keeps its card.
             auto card = TakeCard(h);
             if (!card->pinned)
                 m_cards.insert(m_cards.begin(), card);
@@ -1544,6 +1553,9 @@ void Stage::StageChanged()
                     break;
             m_moveHooks.emplace_back(tid, SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
                 nullptr, WinEventProc, pid, tid, WINEVENT_OUTOFCONTEXT));
+            // Apps that "close" to the tray (KakaoTalk, Discord...) only hide their window.
+            m_moveHooks.emplace_back(tid, SetWinEventHook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE,
+                nullptr, WinEventProc, pid, tid, WINEVENT_OUTOFCONTEXT));
         }
     }
     UpdateDock();
@@ -1626,8 +1638,7 @@ void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, 
 void Stage::OnFlyInDone()
 {
     m_inBatch = nullptr;
-    if (IsIconic(m_inCard->hwnd))
-        ShowWindowAsync(m_inCard->hwnd, SW_RESTORE);
+    BringBack(m_inCard->hwnd);
     ForceForeground(m_inCard->hwnd);
     // Give the real window a moment to paint before the flying copy fades away.
     SetTimer(m_sidebar, kTimerFade, kPaintWaitMs, nullptr);
@@ -1681,6 +1692,20 @@ void Stage::FinishTransition()
     // Focus changes that arrived while animating were ignored; catch up once things have settled.
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
     TrimMemory();
+}
+
+// Makes a window visible again however it was put away: hidden to the tray (KakaoTalk, Discord...
+// close to a hidden window), or minimized, including apps that handle minimizing themselves and
+// only react to the taskbar's restore command.
+void Stage::BringBack(HWND hwnd)
+{
+    if (!IsWindowVisible(hwnd))
+        ShowWindowAsync(hwnd, SW_SHOW);
+    if (IsIconic(hwnd))
+    {
+        ShowWindowAsync(hwnd, SW_RESTORE);
+        PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+    }
 }
 
 void Stage::ForceForeground(HWND hwnd)
@@ -2035,7 +2060,12 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == kTimerMinimizeOut)
         {
             for (HWND h : m_toMinimize)
-                ShowWindowAsync(h, SW_MINIMIZE);
+            {
+                // A window the app hid itself (closed to the tray) stays hidden; minimizing it would
+                // bring it back onto the taskbar.
+                if (IsWindowVisible(h) && !IsIconic(h))
+                    ShowWindowAsync(h, SW_MINIMIZE);
+            }
             m_toMinimize.clear();
         }
         else if (wp == kTimerFade)

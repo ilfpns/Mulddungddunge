@@ -148,6 +148,7 @@ private:
     Pose FramePose(Card const& c) const;
     Pose TargetPose(Card const& c) const;
     static void ForceForeground(HWND hwnd);
+    static void BringBack(HWND hwnd);
     void GrowView();                                // whole monitor, for a transition
     void ShrinkView();                              // back to just the bar
     void Prefetch();
