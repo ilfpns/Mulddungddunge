@@ -93,6 +93,10 @@ namespace wt
             GetWindowThreadProcessId(h, &pid);
             if (pid == self || MonitorFromWindow(h, MONITOR_DEFAULTTONULL) != monitor)
                 continue;
+            // Shell surfaces (the emoji panel, Start, search, the desktop itself) cover the whole screen
+            // without being fullscreen apps; taking them for one hid the sidebar until the next focus change.
+            if (IsShellClass(h))
+                continue;
             return h;
         }
         return nullptr;

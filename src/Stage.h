@@ -132,7 +132,7 @@ private:
     bool FitsBeside(HWND hwnd) const;
     void FitBeside();
     bool SideBySide(HWND hwnd) const;
-    void PlaceView(LONG left, LONG right, LONG height);     // monitor coordinates
+    void PlaceView(LONG left, LONG right, LONG height, bool grown = false);   // monitor coordinates
     float2 SlotCenter(size_t i) const;          // sidebar coords
     float ThumbScale(Card const& c) const;
     float4x4 Perspective(float2 eye) const;

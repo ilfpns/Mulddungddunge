@@ -1697,14 +1697,21 @@ void Stage::GrowView()
     KillTimer(m_sidebar, kTimerShrink);
     // One pixel short of the monitor: a borderless topmost window covering it exactly is taken by the
     // shell for a fullscreen app, which made us tuck our own sidebar away mid-transition (the flicker).
-    PlaceView(0, m_monitor.right - m_monitor.left, m_monitor.bottom - m_monitor.top - 1);
+    PlaceView(0, m_monitor.right - m_monitor.left, m_monitor.bottom - m_monitor.top - 1, true);
 }
 
 // The view in monitor coordinates. Its content is laid out from the monitor's top-left, so when the
 // view does not start there (sidebar on the right) the root visual is shifted to match.
-void Stage::PlaceView(LONG left, LONG right, LONG height)
+void Stage::PlaceView(LONG left, LONG right, LONG height, bool grown)
 {
-    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left + left, m_monitor.top, right - left, height,
+    // Always-on-top only when it has to be: while animating or showing a menu/panel over other
+    // windows, and while tucked (the edge strip must stay reachable over a maximized window). A shown
+    // sidebar at rest has nothing over it anyway (a window covering it makes it tuck away), and as an
+    // ordinary window it lets later popups that never take focus, like the emoji panel (Win+.) or the
+    // touch keyboard, appear over it instead of underneath.
+    bool topmost = grown || m_busy || m_dragging || m_menu.open || m_settings.open ||
+                   m_dock != DockState::Shown || m_revealed || !m_cfg.autoTuck;
+    SetWindowPos(m_view, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, m_monitor.left + left, m_monitor.top, right - left, height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (left != m_viewX)
     {
