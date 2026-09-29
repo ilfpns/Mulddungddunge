@@ -11,6 +11,13 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 if (-not $InstallDir) { $InstallDir = $DefaultDir }
 
+# Windows.UI.Composition features used by the app need Windows 10 1903 (build 18362) or later.
+$build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+if ($build -lt 18362) {
+    if (-not $Quiet) { Show-Message "Windows 10 1903 (빌드 18362) 이상이 필요해요.`n지금 버전: 빌드 $build`n`nWindows 업데이트 후 다시 설치해 주세요." 'OK' 'Warning' | Out-Null }
+    exit 2
+}
+
 try {
     Stop-StageManager
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
