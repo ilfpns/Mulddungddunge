@@ -9,6 +9,7 @@ struct CardVis
     wuc::SpriteVisual sprite{ nullptr };
     wuc::CompositionRoundedRectangleGeometry clip{ nullptr };
     wuc::SpriteVisual badge{ nullptr };
+    wuc::SpriteVisual pin{ nullptr };
 };
 
 struct Card
@@ -17,6 +18,7 @@ struct Card
     RECT frame{};           // last known on-screen frame (physical px)
     RECT border{};          // invisible resize borders: window rect minus visible frame, per side
     bool hasSnapshot = false;
+    bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
     float w = 0, h = 0;     // sprite size = frame size
     wuc::CompositionSurfaceBrush snapshot{ nullptr };
     wuc::CompositionSurfaceBrush icon{ nullptr };
@@ -56,7 +58,10 @@ private:
     void OnForeground(HWND hwnd);
     void OnMinimizeStart(HWND hwnd);
     void OnGone(HWND hwnd);
-    void RemoveCard(HWND hwnd);
+    void RemoveCard(HWND hwnd, bool evenIfPinned = false);
+    void ShowCardMenu(size_t index);
+    void SetPinned(Card& c, bool pinned);
+    void ShowMenu(HMENU menu, UINT* command);
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     bool OnCurrentDesktop(HWND hwnd) const;
     static GUID CurrentDesktopId();

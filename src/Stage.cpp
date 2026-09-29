@@ -7,6 +7,8 @@ namespace
     constexpr UINT WM_APPBAR_CB = WM_APP + 1;
     constexpr UINT WM_TRAY = WM_APP + 2;
     constexpr UINT ID_EXIT = 1;
+    constexpr UINT ID_PIN = 2;
+    constexpr UINT ID_UNPIN = 3;
     constexpr int kHotkeyBase = 100;     // hotkey ids 100..103 = Alt+1..4
     constexpr UINT_PTR kTimerPopulate = 1;
     constexpr UINT_PTR kTimerActiveSnap = 2;
@@ -197,12 +199,44 @@ void Stage::ShowTrayMenu()
 {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"종료");
+    UINT command = 0;
+    ShowMenu(menu, &command);
+    if (command == ID_EXIT)
+        PostQuitMessage(0);
+}
+
+// Popup menus only dismiss properly when their owner is the foreground window; afterwards focus
+// goes back to the window on stage.
+void Stage::ShowMenu(HMENU menu, UINT* command)
+{
     POINT pt;
     GetCursorPos(&pt);
-    SetForegroundWindow(m_sidebar);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_sidebar, nullptr);
-    PostMessageW(m_sidebar, WM_NULL, 0, 0);
+    SetForegroundWindow(m_view);
+    *command = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, m_view, nullptr);
+    PostMessageW(m_view, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    if (m_active && IsWindow(m_active))
+        SetForegroundWindow(m_active);
+}
+
+void Stage::ShowCardMenu(size_t index)
+{
+    auto card = m_visible[index];
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, card->pinned ? ID_UNPIN : ID_PIN, card->pinned ? L"고정 해제" : L"탭 고정");
+    UINT command = 0;
+    ShowMenu(menu, &command);
+    if (command == ID_PIN || command == ID_UNPIN)
+        SetPinned(*card, command == ID_PIN);
+}
+
+void Stage::SetPinned(Card& c, bool pinned)
+{
+    c.pinned = pinned;
+    if (c.side.pin)
+        c.side.pin.IsVisible(pinned);
+    m_hover = -1;
+    Relayout(true);
 }
 
 // ---- layout ---------------------------------------------------------------
@@ -339,7 +373,8 @@ void Stage::OnMinimizeStart(HWND hwnd)
     // Minimized by the user (button, Win+D, four-finger swipe): it flies into the sidebar from where
     // it was, using the picture taken when it came on stage.
     auto card = TakeCard(hwnd);
-    m_cards.insert(m_cards.begin(), card);
+    if (!card->pinned)
+        m_cards.insert(m_cards.begin(), card);
     m_active = nullptr;
     Relayout(true);
     if (!m_activeSnap || m_activeSnapHwnd != hwnd)
@@ -370,7 +405,7 @@ void Stage::OnGone(HWND hwnd)
         m_active = nullptr;
     if (m_busy || IsWindowVisible(hwnd))
         return;
-    RemoveCard(hwnd);
+    RemoveCard(hwnd, true);
 }
 
 bool Stage::OnCurrentDesktop(HWND hwnd) const
@@ -424,10 +459,10 @@ void Stage::Adopt(HWND hwnd)
     });
 }
 
-void Stage::RemoveCard(HWND hwnd)
+void Stage::RemoveCard(HWND hwnd, bool evenIfPinned)
 {
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
-    if (it == m_cards.end())
+    if (it == m_cards.end() || ((*it)->pinned && !evenIfPinned))
         return;
     if ((*it)->side.holder)
         m_sideContent.Children().Remove((*it)->side.holder);
@@ -506,6 +541,18 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
     ApplySize(v, c);
     v.holder.Children().InsertAtTop(v.sprite);
 
+    if (withBadge)
+    {
+        v.pin = m_compositor.CreateSpriteVisual();
+        v.pin.Size({ S(8), S(8) });
+        v.pin.Brush(m_compositor.CreateColorBrush({ 230, 255, 255, 255 }));
+        auto dot = m_compositor.CreateEllipseGeometry();
+        dot.Center({ S(4), S(4) });
+        dot.Radius({ S(4), S(4) });
+        v.pin.Clip(m_compositor.CreateGeometricClip(dot));
+        v.pin.IsVisible(c.pinned);
+        v.holder.Children().InsertAtTop(v.pin);
+    }
     if (withBadge && c.icon)
     {
         v.badge = m_compositor.CreateSpriteVisual();
@@ -534,6 +581,12 @@ void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
     {
         float2 b = BadgeOffset(c, p);
         v.badge.Offset({ b.x, b.y, 0.f });
+    }
+    if (v.pin)
+    {
+        // Top-right corner of the card, which the tilt pushes away from the viewer.
+        Crop kk = CropFor(c, p.thumb);
+        v.pin.Offset({ kk.size.x * p.scale * 0.30f, -kk.size.y * p.scale * 0.42f, 0.f });
     }
 }
 
@@ -585,6 +638,7 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
 
 void Stage::Relayout(bool animate)
 {
+    std::stable_partition(m_cards.begin(), m_cards.end(), [](auto& c) { return c->pinned; });
     m_visible.clear();
     for (auto& c : m_cards)
     {
@@ -689,13 +743,16 @@ Pose Stage::TargetPose(Card const& c) const
     return PoseForRect(r, m_monitor, c.w);
 }
 
+// Removes the window's card from the list (callers put it back on top), or makes a new one.
+// A pinned card stays where it is; callers must not insert it again.
 std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
 {
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
     if (it == m_cards.end())
         return MakeCard(hwnd);
     auto card = *it;
-    m_cards.erase(it);
+    if (!card->pinned)
+        m_cards.erase(it);
     return card;
 }
 
@@ -708,10 +765,15 @@ void Stage::SwitchTo(size_t index)
         from.scale *= kHoverGrow;
     m_hover = -1;
 
-    m_cards.erase(std::find(m_cards.begin(), m_cards.end(), next));
-    if (next->side.holder)
-        m_sideContent.Children().Remove(next->side.holder);
-    next->side = {};
+    if (next->hwnd == m_active)
+        return;
+    if (!next->pinned)
+    {
+        m_cards.erase(std::find(m_cards.begin(), m_cards.end(), next));
+        if (next->side.holder)
+            m_sideContent.Children().Remove(next->side.holder);
+        next->side = {};
+    }
 
     if (!IsWindow(next->hwnd))
     {
@@ -736,7 +798,8 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     if (prev && prev != next && IsWindow(prev) && IsWindowVisible(prev) && !IsIconic(prev) && OnCurrentDesktop(prev))
     {
         m_outCard = TakeCard(prev);
-        m_cards.insert(m_cards.begin(), m_outCard);
+        if (!m_outCard->pinned)
+            m_cards.insert(m_cards.begin(), m_outCard);
     }
     Relayout(true);
 
@@ -870,7 +933,8 @@ void Stage::OnOutCaptured(std::shared_ptr<Card> card, RECT const& frame, wuc::Co
     m_flyOut = MakeVis(*card, false);
     m_animStage.Children().InsertAtBottom(m_flyOut.holder);
     Pose from = PoseForRect(frame, m_monitor, card->w);
-    Pose to = SlotPose(*card, 0);
+    size_t slot = static_cast<size_t>(std::find(m_visible.begin(), m_visible.end(), card) - m_visible.begin());
+    Pose to = SlotPose(*card, std::min(slot, m_visible.empty() ? 0 : m_visible.size() - 1));
     to.center = SideToAnim(to.center);
     ApplyPose(m_flyOut, *card, from);
     m_outBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
@@ -1030,6 +1094,14 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             int index = HitTest(ViewToSide(lp));
             if (index >= 0)
                 SwitchTo(static_cast<size_t>(index));
+        }
+        return 0;
+    case WM_RBUTTONUP:
+        if (!m_busy)
+        {
+            int index = HitTest(ViewToSide(lp));
+            if (index >= 0)
+                ShowCardMenu(static_cast<size_t>(index));
         }
         return 0;
     case WM_MOUSELEAVE:
