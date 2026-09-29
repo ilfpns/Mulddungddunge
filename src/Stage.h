@@ -72,6 +72,7 @@ private:
     void OnMinimizeStart(HWND hwnd);
     void OnGone(HWND hwnd);
     void RemoveCard(HWND hwnd, bool evenIfPinned = false);
+    void Park(std::shared_ptr<Card> card);
     void SetPinned(Card& c, bool pinned);
     void LoadPins();
     void SavePins() const;
@@ -182,6 +183,9 @@ private:
     // Pinned apps, one entry per pinned window, saved in the registry. Survives restarts and apps that
     // destroy and recreate their window (close-to-tray apps).
     std::vector<std::wstring> m_pinnedApps;
+    // Cards of windows that went on stage. Kept (without sidebar visuals) so a window minimized before
+    // it could be photographed again still comes back with its last picture instead of a placeholder.
+    std::vector<std::shared_ptr<Card>> m_offstage;
     winrt::com_ptr<IVirtualDesktopManager> m_desktops;
     GUID m_desktopId{};
     bool m_busy = false;

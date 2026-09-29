@@ -783,16 +783,37 @@ void Stage::Adopt(HWND hwnd)
     });
 }
 
+// Takes the window's card out of the sidebar: parked if the window went on stage, dropped if it is
+// gone for good (`evenIfPinned`: destroyed windows lose their pinned card too).
 void Stage::RemoveCard(HWND hwnd, bool evenIfPinned)
 {
+    if (evenIfPinned)
+        std::erase_if(m_offstage, [&](auto& c) { return c->hwnd == hwnd; });
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
     if (it == m_cards.end() || ((*it)->pinned && !evenIfPinned))
         return;
-    if ((*it)->side.holder)
-        m_sideContent.Children().Remove((*it)->side.holder);
+    auto card = *it;
     m_cards.erase(it);
+    if (evenIfPinned)
+    {
+        if (card->side.holder)
+            m_sideContent.Children().Remove(card->side.holder);
+    }
+    else
+        Park(card);
     m_hover = -1;
     Relayout(true);
+}
+
+void Stage::Park(std::shared_ptr<Card> card)
+{
+    if (card->side.holder)
+        m_sideContent.Children().Remove(card->side.holder);
+    card->side = {};
+    std::erase_if(m_offstage, [&](auto& c) { return c->hwnd == card->hwnd; });
+    m_offstage.push_back(card);
+    if (m_offstage.size() > 8)                      // only windows currently on stage need one
+        m_offstage.erase(m_offstage.begin());
 }
 
 std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
@@ -1097,7 +1118,14 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
 {
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
     if (it == m_cards.end())
-        return MakeCard(hwnd);
+    {
+        auto parked = std::find_if(m_offstage.begin(), m_offstage.end(), [&](auto& c) { return c->hwnd == hwnd; });
+        if (parked == m_offstage.end())
+            return MakeCard(hwnd);
+        auto card = *parked;
+        m_offstage.erase(parked);
+        return card;
+    }
     auto card = *it;
     if (!card->pinned)
         m_cards.erase(it);
@@ -1118,9 +1146,7 @@ void Stage::SwitchTo(size_t index)
     if (!next->pinned)
     {
         m_cards.erase(std::find(m_cards.begin(), m_cards.end(), next));
-        if (next->side.holder)
-            m_sideContent.Children().Remove(next->side.holder);
-        next->side = {};
+        Park(next);
     }
 
     if (!IsWindow(next->hwnd))
@@ -1567,9 +1593,7 @@ void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
     if (!card->pinned)
     {
         m_cards.erase(std::find(m_cards.begin(), m_cards.end(), card));
-        if (card->side.holder)
-            m_sideContent.Children().Remove(card->side.holder);
-        card->side = {};
+        Park(card);
     }
     Relayout(true);
 
