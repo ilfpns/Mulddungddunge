@@ -67,6 +67,7 @@ private:
     LRESULT OnViewMessage(UINT msg, WPARAM wp, LPARAM lp);
     POINT ViewToSide(LPARAM lp) const;
     static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD);
+    void OnWinEvent(DWORD event, HWND hwnd);
 
     // Changes made outside the sidebar: Alt+Tab, taskbar, new windows, minimize, close.
     void OnForeground(HWND hwnd);

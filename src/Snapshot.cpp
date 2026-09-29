@@ -185,6 +185,9 @@ void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
             job->session.StartCapture();
             if (WaitForSingleObject(ev, 400) == WAIT_OBJECT_0)
                 captured = job->pool.TryGetNextFrame();
+            // `ev` is closed when this block ends; a late frame must not signal it afterwards.
+            job->pool.FrameArrived(job->arrivedToken);
+            job->arrivedToken = {};
         }
         queue.TryEnqueue([this, job, captured, done = std::move(done)] {
             wuc::CompositionDrawingSurface surface{ nullptr };

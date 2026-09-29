@@ -31,7 +31,9 @@ namespace
     constexpr UINT_PTR kTimerTrim = 6;
     constexpr UINT_PTR kTimerTuck = 7;
     constexpr UINT_PTR kTimerRecheck = 8;
-    constexpr UINT_PTR kTimerDock = 9;         // re-evaluate the dock once a closing/minimizing window is gone
+    constexpr UINT_PTR kTimerDock = 9;
+    constexpr UINT_PTR kTimerWatchdog = 10;    // a transition still running after this long is forced to end
+    constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
 
     constexpr float kSidebarW = 210.f;
@@ -217,6 +219,11 @@ void Stage::Dock()
 {
     // A strip along the left of the work area. Nothing is reserved: maximized windows use the whole
     // screen, and the sidebar gets out of their way instead (see UpdateDock).
+    // Monitor handles can go stale after a display change: look the primary monitor up again.
+    m_mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    UINT dpiX = 96, dpiY = 96;
+    if (SUCCEEDED(GetDpiForMonitor(m_mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+        m_scale = dpiX / 96.f;
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(m_mon, &mi);
     m_monitor = mi.rcMonitor;
@@ -225,7 +232,7 @@ void Stage::Dock()
     float2 barSize{ static_cast<float>(m_bar.right - m_bar.left), static_cast<float>(m_bar.bottom - m_bar.top) };
     float2 barOrigin = SideToAnim({ 0.f, 0.f });
     m_sideContent.Offset({ barOrigin.x, barOrigin.y, 0.f });
-    if (!m_busy)
+    if (!m_busy && !m_dragging && !m_menu.open && !m_settings.open)
         ShrinkView();
 
     float2 eye{ S(kSidebarW) / 2.f, barSize.y / 2.f };
@@ -656,20 +663,29 @@ void Stage::SetPinned(Card& c, bool pinned)
     c.pinned = pinned;
     if (!c.app.empty())
     {
-        c.desktop = DesktopOf(c.hwnd);
         if (pinned)
+        {
+            c.desktop = DesktopOf(c.hwnd);
             m_pinnedApps.push_back(PinKey(c));
+        }
         else
         {
+            // Look the entry up with the desktop it was pinned on, before refreshing it.
             auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto const& e) { return PinMatches(e, c); });
             if (it != m_pinnedApps.end())
                 m_pinnedApps.erase(it);
+            c.desktop = DesktopOf(c.hwnd);
         }
         SavePins();
     }
     if (c.side.pin)
         c.side.pin.IsVisible(pinned);
     m_hover = -1;
+    if (!pinned && OnStage(c.hwnd))
+    {
+        RemoveCard(c.hwnd);                         // an unpinned window on stage has no sidebar card
+        return;
+    }
     Relayout(true);
 }
 
@@ -769,10 +785,27 @@ void Stage::Populate()
 
 // ---- outside changes -------------------------------------------------------
 
-void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD)
+void CALLBACK Stage::WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD a, DWORD b)
 {
     if (!g_stage || idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd)
         return;
+    try
+    {
+        g_stage->OnWinEvent(event, hwnd);
+    }
+    catch (winrt::hresult_error const& e)
+    {
+        LogError(event, e.code(), e.message().c_str());
+    }
+    catch (...)
+    {
+        LogError(event, E_FAIL, L"unknown exception");
+    }
+}
+
+void Stage::OnWinEvent(DWORD event, HWND hwnd)
+{
+    auto g_stage = this;
     switch (event)
     {
     case EVENT_SYSTEM_FOREGROUND:
@@ -867,6 +900,7 @@ void Stage::OnMinimizeStart(HWND hwnd)
     if (!picture || m_busy || !card->side.holder)
         return;
     m_busy = true;
+    SetTimer(m_sidebar, kTimerWatchdog, kWatchdogMs, nullptr);
     m_inCard = nullptr;
     auto flight = std::make_shared<OutFlight>();
     flight->card = card;
@@ -910,9 +944,7 @@ bool Stage::OnStage(HWND hwnd) const
 
 void Stage::LeaveStage(HWND hwnd)
 {
-    auto it = std::find(m_stage.begin(), m_stage.end(), hwnd);
-    if (it != m_stage.end())
-        m_stage.erase(it);
+    std::erase(m_stage, hwnd);
     if (hwnd == m_active)
         m_active = m_stage.empty() ? nullptr : m_stage.back();
 }
@@ -1125,8 +1157,8 @@ void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurfa
     if (!IsZoomed(c.hwnd) && !IsIconic(c.hwnd))
     {
         RECT wr;
-        GetWindowRect(c.hwnd, &wr);
-        c.border = { frame.left - wr.left, frame.top - wr.top, wr.right - frame.right, wr.bottom - frame.bottom };
+        if (GetWindowRect(c.hwnd, &wr))
+            c.border = { frame.left - wr.left, frame.top - wr.top, wr.right - frame.right, wr.bottom - frame.bottom };
     }
     c.frame = frame;
     c.w = static_cast<float>(frame.right - frame.left);
@@ -1514,6 +1546,7 @@ void Stage::SwitchTo(size_t index)
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
     m_busy = true;
+    SetTimer(m_sidebar, kTimerWatchdog, kWatchdogMs, nullptr);
     std::vector<HWND> leaving;
     for (HWND h : m_stage)
     {
@@ -1747,7 +1780,8 @@ void Stage::Prefetch()
     m_prefetchFrame = wt::FrameRect(h);
     m_snap.CaptureAsync(h, m_prefetchFrame, [this, h](auto const& surface) {
         m_prefetching = false;
-        m_prefetch = surface;
+        bool wanted = m_tracking || std::any_of(m_outs.begin(), m_outs.end(), [](auto& f) { return f->waitsForPrefetch; });
+        m_prefetch = wanted ? surface : nullptr;    // the pointer already left: don't hold it at idle
         m_prefetchAt = GetTickCount64();
         for (auto& flight : m_outs)
         {
@@ -1825,6 +1859,7 @@ void Stage::StepDone()
 
 void Stage::FinishTransition()
 {
+    KillTimer(m_sidebar, kTimerWatchdog);
     m_inBatch = nullptr;
     for (auto& flight : m_outs)
     {
@@ -1846,6 +1881,21 @@ void Stage::FinishTransition()
     SnapActiveSoon();
     m_revealed = false;
     m_busy = false;
+    // Windows destroyed while we were animating were skipped by OnGone; drop them now.
+    std::erase_if(m_offstage, [](auto& c) { return !IsWindow(c->hwnd); });
+    bool stale = false;
+    for (auto& c : m_cards)
+        stale |= !IsWindow(c->hwnd);
+    if (stale)
+    {
+        std::vector<HWND> dead;
+        for (auto& c : m_cards)
+            if (!IsWindow(c->hwnd))
+                dead.push_back(c->hwnd);
+        for (HWND h : dead)
+            RemoveCard(h, true);
+    }
+    std::erase_if(m_stage, [](HWND h) { return !IsWindow(h); });
     StageChanged();                                 // after m_busy is cleared, or the dock won't update
     // Focus changes that arrived while animating were ignored; catch up once things have settled.
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
@@ -1917,7 +1967,9 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
     m_pressIndex = -1;
     auto card = m_dragCard;
     m_dragCard = nullptr;
-    bool onStage = !cancel && viewPt.x > m_bar.right - m_monitor.left && IsWindow(card->hwnd);
+    // The card may have been taken away mid-drag (its window came to the front, a hotkey...).
+    bool stillOurs = std::find(m_cards.begin(), m_cards.end(), card) != m_cards.end();
+    bool onStage = !cancel && stillOurs && viewPt.x > m_bar.right - m_monitor.left && IsWindow(card->hwnd);
     if (onStage && !m_busy)
     {
         JoinStage(card, viewPt);
@@ -1945,6 +1997,7 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
 void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
 {
     m_busy = true;
+    SetTimer(m_sidebar, kTimerWatchdog, kWatchdogMs, nullptr);
     HWND h = card->hwnd;
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(m_mon, &mi);
@@ -1982,6 +2035,7 @@ void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
 
     RECT frame{ target.left + card->border.left, target.top + card->border.top,
                 target.right - card->border.right, target.bottom - card->border.bottom };
+    std::erase(m_stage, h);                         // e.g. a pinned card of a window already on stage
     m_stage.push_back(h);
     m_active = h;
     m_inCard = card;
@@ -2176,7 +2230,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     {
         size_t index = static_cast<size_t>(wp - kHotkeyBase);
         CloseCardMenu();
-        if (!m_busy && m_dock != DockState::Hidden && index < m_visible.size())
+        if (!m_busy && !m_dragging && !m_settings.open && m_dock != DockState::Hidden && index < m_visible.size())
         {
             Prefetch();     // no hover happened; the outgoing window is captured on the way
             SwitchTo(index);
@@ -2251,6 +2305,16 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             TrimMemory();
         else if (wp == kTimerDock)
             UpdateDock();
+        else if (wp == kTimerWatchdog && m_busy)
+        {
+            // Something went wrong mid-transition (an exception, a lost device, a batch that never
+            // completed). Never leave input blocked or the view covering the screen.
+            LogError(WM_TIMER, E_FAIL, L"transition watchdog fired");
+            if (m_inCard && !IsWindowVisible(m_inCard->hwnd))
+                BringBack(m_inCard->hwnd);
+            FinishTransition();
+            ShrinkView();
+        }
         else if (wp == kTimerRecheck)
         {
             HWND fg = GetForegroundWindow();
