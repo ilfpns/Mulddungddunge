@@ -1,11 +1,14 @@
 #include "Stage.h"
 #include "AppBar.h"
+#include "WindowTracker.h"
 
 namespace
 {
     constexpr UINT WM_APPBAR_CB = WM_APP + 1;
     constexpr UINT WM_TRAY = WM_APP + 2;
     constexpr UINT ID_EXIT = 1;
+    constexpr UINT_PTR kTimerPopulate = 1;
+    constexpr UINT_PTR kTimerMinAnimate = 2;
 
     constexpr float kSidebarW = 190.f;
     constexpr float kThumbW = 150.f;
@@ -33,12 +36,16 @@ bool Stage::Init(HINSTANCE inst)
     g_stage = this;
     m_inst = inst;
 
-    HMONITOR mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    m_mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{ sizeof(mi) };
-    GetMonitorInfoW(mon, &mi);
+    GetMonitorInfoW(m_mon, &mi);
     m_monitor = mi.rcMonitor;
     UINT dpiX = 96, dpiY = 96;
-    GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+    GetDpiForMonitor(m_mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+
+    ANIMATIONINFO ai{ sizeof(ai) };
+    SystemParametersInfoW(SPI_GETANIMATION, sizeof(ai), &ai, 0);
+    m_savedMinAnimate = ai.iMinAnimate;
     m_scale = dpiX / 96.f;
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -80,15 +87,15 @@ bool Stage::Init(HINSTANCE inst)
     m_animTarget.Root(m_animRoot);
     m_placeholderBrush = m_compositor.CreateColorBrush({ 255, 58, 58, 64 });
     m_ease = MakeEase(m_compositor);
+    m_snap.Init(m_compositor);
 
     appbar::Register(m_sidebar, WM_APPBAR_CB);
     Dock();
     ShowWindow(m_sidebar, SW_SHOWNOACTIVATE);
     AddTrayIcon();
 
-    for (int i = 0; i < 4; ++i)
-        m_cards.push_back(NewPlaceholder(S(1280), S(800)));
-    Relayout(false);
+    // Give maximized windows a moment to shrink out of the newly reserved strip before capturing them.
+    SetTimer(m_sidebar, kTimerPopulate, 400, nullptr);
     return true;
 }
 
@@ -99,6 +106,7 @@ void Stage::Shutdown()
     nid.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
     appbar::Remove(m_sidebar);
+    SetMinAnimate(true);
     DestroyWindow(m_anim);
     DestroyWindow(m_sidebar);
 }
@@ -151,12 +159,83 @@ Pose Stage::SlotPose(Card const& c, size_t i) const
     return { SlotCenter(i), ThumbScale(c), kTilt };
 }
 
-std::shared_ptr<Card> Stage::NewPlaceholder(float w, float h)
+// ---- cards ----------------------------------------------------------------
+
+void Stage::Populate()
+{
+    auto windows = wt::EnumManageable(m_mon);
+    if (windows.empty())
+        return;
+    HWND fg = GetForegroundWindow();
+    m_active = std::find(windows.begin(), windows.end(), fg) != windows.end() ? fg : windows.front();
+
+    for (HWND h : windows)
+    {
+        if (h == m_active)
+            continue;
+        auto card = MakeCard(h);
+        if (!IsIconic(h))
+        {
+            Refresh(*card);
+            MinimizeQuiet(h);
+        }
+        m_cards.push_back(card);
+    }
+    Relayout(false);
+    SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+}
+
+std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
 {
     auto c = std::make_shared<Card>();
-    c->w = w;
-    c->h = h;
+    c->hwnd = hwnd;
+    c->frame = IsIconic(hwnd) ? wt::RestoreRect(hwnd) : wt::FrameRect(hwnd);
+    c->w = static_cast<float>(std::max(1L, c->frame.right - c->frame.left));
+    c->h = static_cast<float>(std::max(1L, c->frame.bottom - c->frame.top));
+    c->snapshot = m_compositor.CreateSurfaceBrush();
+    c->snapshot.Stretch(wuc::CompositionStretch::Fill);
+    c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(S(kBadge) * 1.5f)));
     return c;
+}
+
+void Stage::Refresh(Card& c)
+{
+    RECT frame = wt::FrameRect(c.hwnd);
+    auto surface = m_snap.Capture(c.hwnd, frame);
+    if (!surface)
+        return;
+    c.frame = frame;
+    c.w = static_cast<float>(frame.right - frame.left);
+    c.h = static_cast<float>(frame.bottom - frame.top);
+    c.snapshot.Surface(surface);
+    c.hasSnapshot = true;
+    if (c.side.holder)
+        ApplySize(c.side, c);
+}
+
+void Stage::ApplySize(CardVis const& v, Card const& c)
+{
+    v.sprite.Size({ c.w, c.h });
+    v.sprite.Offset({ -c.w / 2.f, -c.h / 2.f, 0.f });
+    v.sprite.CenterPoint({ c.w / 2.f, c.h / 2.f, 0.f });
+    v.sprite.Brush(c.hasSnapshot ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
+    v.clip.Size({ c.w, c.h });
+}
+
+void Stage::SetMinAnimate(bool on)
+{
+    if (!m_savedMinAnimate)
+        return;
+    ANIMATIONINFO ai{ sizeof(ai), on ? m_savedMinAnimate : 0 };
+    SystemParametersInfoW(SPI_SETANIMATION, sizeof(ai), &ai, 0);
+}
+
+// Minimizes without the system's shrink-to-taskbar animation.
+void Stage::MinimizeQuiet(HWND hwnd)
+{
+    SetMinAnimate(false);
+    ShowWindowAsync(hwnd, SW_MINIMIZE);
+    SetTimer(m_sidebar, kTimerMinAnimate, 600, nullptr);
 }
 
 CardVis Stage::MakeVis(Card const& c, bool withBadge)
@@ -168,17 +247,10 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
     v.holder.TransformMatrix(persp);
 
     v.sprite = m_compositor.CreateSpriteVisual();
-    v.sprite.Size({ c.w, c.h });
-    v.sprite.Offset({ -c.w / 2.f, -c.h / 2.f, 0.f });
-    v.sprite.CenterPoint({ c.w / 2.f, c.h / 2.f, 0.f });
     v.sprite.RotationAxis({ 0.f, 1.f, 0.f });
-    if (c.hasSnapshot)
-        v.sprite.Brush(c.snapshot);
-    else
-        v.sprite.Brush(m_placeholderBrush);
     v.clip = m_compositor.CreateRoundedRectangleGeometry();
-    v.clip.Size({ c.w, c.h });
     v.sprite.Clip(m_compositor.CreateGeometricClip(v.clip));
+    ApplySize(v, c);
     v.holder.Children().InsertAtTop(v.sprite);
 
     if (withBadge && c.icon)
@@ -356,6 +428,13 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if (LOWORD(wp) == ID_EXIT)
             PostQuitMessage(0);
+        return 0;
+    case WM_TIMER:
+        KillTimer(m_sidebar, wp);
+        if (wp == kTimerPopulate)
+            Populate();
+        else if (wp == kTimerMinAnimate)
+            SetMinAnimate(true);
         return 0;
     case WM_DISPLAYCHANGE:
         Dock();

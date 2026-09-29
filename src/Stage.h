@@ -1,5 +1,6 @@
 #pragma once
 #include "pch.h"
+#include "Snapshot.h"
 
 // Visual tree for one card: holder (perspective, position) -> sprite (image, tilt, scale) + badge.
 struct CardVis
@@ -56,9 +57,18 @@ private:
     int HitTest(POINT pt) const;
     void SetHover(int index);
 
-    std::shared_ptr<Card> NewPlaceholder(float w, float h);
+    void Populate();
+    std::shared_ptr<Card> MakeCard(HWND hwnd);
+    void Refresh(Card& c);                       // re-capture the snapshot while the window is visible
+    void ApplySize(CardVis const& v, Card const& c);
+    void SetMinAnimate(bool on);
+    void MinimizeQuiet(HWND hwnd);
 
     HINSTANCE m_inst{};
+    HMONITOR m_mon{};
+    HWND m_active{};                // the window on stage (not in the sidebar)
+    int m_savedMinAnimate = 0;
+    Snapshot m_snap;
     HWND m_sidebar{};
     HWND m_anim{};
     RECT m_monitor{};

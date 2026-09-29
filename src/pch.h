@@ -6,6 +6,7 @@
 #include <unknwn.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <d3d11_4.h>
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace wuc = winrt::Windows::UI::Composition;
