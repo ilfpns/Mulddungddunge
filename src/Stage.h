@@ -55,6 +55,7 @@ private:
     float S(float v) const { return v * m_scale; }
     float2 SlotCenter(size_t i) const;          // sidebar coords
     float ThumbScale(Card const& c) const;
+    float4x4 Perspective(Card const& c) const;
     Pose SlotPose(Card const& c, size_t i) const;
 
     CardVis MakeVis(Card const& c, bool withBadge);

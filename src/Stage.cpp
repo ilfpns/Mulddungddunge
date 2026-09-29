@@ -12,13 +12,12 @@ namespace
     constexpr UINT_PTR kTimerMinimizeOut = 3;
     constexpr UINT_PTR kTimerFade = 4;
 
-    constexpr float kSidebarW = 190.f;
-    constexpr float kThumbW = 150.f;
-    constexpr float kThumbH = 100.f;
-    constexpr float kPitch = 128.f;
-    constexpr float kTop = 60.f;
-    constexpr float kTilt = 28.f;        // degrees
-    constexpr float kDepth = 520.f;      // perspective distance
+    constexpr float kSidebarW = 210.f;
+    constexpr float kThumbW = 210.f;     // card width before the tilt foreshortens it
+    constexpr float kThumbMaxH = 170.f;
+    constexpr float kPitch = 175.f;
+    constexpr float kTilt = 42.f;        // degrees
+    constexpr float kDepthRatio = 2.2f;  // perspective distance relative to card width, so every card bends alike
     constexpr float kRadius = 8.f;
     constexpr float kBadge = 34.f;
     constexpr float kHoverGrow = 1.07f;
@@ -154,12 +153,22 @@ void Stage::ShowTrayMenu()
 
 float2 Stage::SlotCenter(size_t i) const
 {
-    return { S(kSidebarW) / 2.f, S(kTop) + i * S(kPitch) + S(kThumbH) / 2.f };
+    // The stack is centered vertically in the bar.
+    float n = static_cast<float>(std::min(m_cards.size(), kMaxCards));
+    float barH = static_cast<float>(m_bar.bottom - m_bar.top);
+    return { S(kSidebarW) / 2.f, barH / 2.f + (i - (n - 1.f) / 2.f) * S(kPitch) };
 }
 
 float Stage::ThumbScale(Card const& c) const
 {
-    return std::min(S(kThumbW) / c.w, S(kThumbH) / c.h);
+    return std::min(S(kThumbW) / c.w, S(kThumbMaxH) / c.h);
+}
+
+float4x4 Stage::Perspective(Card const& c) const
+{
+    auto m = float4x4::identity();
+    m.m34 = -1.f / (kDepthRatio * c.w * ThumbScale(c));
+    return m;
 }
 
 Pose Stage::SlotPose(Card const& c, size_t i) const
@@ -296,6 +305,7 @@ void Stage::ApplySize(CardVis const& v, Card const& c)
     v.sprite.CenterPoint({ c.w / 2.f, c.h / 2.f, 0.f });
     v.sprite.Brush(c.hasSnapshot ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
     v.clip.Size({ c.w, c.h });
+    v.holder.TransformMatrix(Perspective(c));
 }
 
 void Stage::SetMinAnimate(bool on)
@@ -318,9 +328,6 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
 {
     CardVis v;
     v.holder = m_compositor.CreateContainerVisual();
-    auto persp = float4x4::identity();
-    persp.m34 = -1.f / S(kDepth);
-    v.holder.TransformMatrix(persp);
 
     v.sprite = m_compositor.CreateSpriteVisual();
     v.sprite.RotationAxis({ 0.f, 1.f, 0.f });
