@@ -35,6 +35,27 @@ namespace
     Stage* g_stage = nullptr;
 
 
+    // Opt-in event trace for diagnosing window-manager interactions: create %TEMP%\stage-manager.trace
+    // before starting and events are appended to it. Off (one check at startup) otherwise.
+    bool g_trace = false;
+
+    void Trace(wchar_t const* what, HWND hwnd = nullptr)
+    {
+        if (!g_trace)
+            return;
+        wchar_t path[MAX_PATH], title[64]{};
+        GetTempPathW(MAX_PATH, path);
+        wcscat_s(path, L"stage-manager.trace");
+        if (hwnd)
+            GetWindowTextW(hwnd, title, ARRAYSIZE(title));
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f)
+        {
+            fwprintf(f, L"%llu %s %p '%s'\n", GetTickCount64(), what, hwnd, title);
+            fclose(f);
+        }
+    }
+
     // Appends to %TEMP%\stage-manager.log; only written when something goes wrong.
     void LogError(UINT msg, HRESULT hr, wchar_t const* text)
     {
@@ -60,6 +81,12 @@ bool Stage::Init(HINSTANCE inst)
 {
     g_stage = this;
     m_inst = inst;
+    {
+        wchar_t path[MAX_PATH];
+        GetTempPathW(MAX_PATH, path);
+        wcscat_s(path, L"stage-manager.trace");
+        g_trace = GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+    }
 
     m_mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{ sizeof(mi) };
@@ -209,6 +236,24 @@ Crop Stage::CropFor(Card const& c, bool thumb) const
 
 // One camera for the whole sidebar, looking at its center (like macOS): the cards' edges then run
 // parallel instead of each card fanning out around its own center.
+// Where the app icon goes, relative to the card's center: on the card's bottom-left corner as it
+// actually appears after the tilt and the shared camera, so every slot gets the same look.
+float2 Stage::BadgeOffset(Card const& c, Pose const& p) const
+{
+    Crop k = CropFor(c, p.thumb);
+    float halfW = k.size.x * p.scale / 2.f, halfH = k.size.y * p.scale / 2.f;
+    float rad = p.angle * 3.14159265f / 180.f;
+    float x = -halfW * std::cos(rad), z = halfW * std::sin(rad);    // left edge swings toward the viewer
+    float depth = kDepthRatio * S(kThumbW);
+    float2 eye{ S(kSidebarW) / 2.f, (m_bar.bottom - m_bar.top) / 2.f };
+    float2 corner{ p.center.x + x, p.center.y + halfH };
+    float2 seen = eye + (corner - eye) / (1.f - z / depth);
+    float2 badgeCenter = seen - p.center + float2{ S(12), -S(8) };
+    float2 offset = badgeCenter - float2{ S(kBadge), S(kBadge) } / 2.f;
+    offset.x = std::max(offset.x, -p.center.x + S(2));               // never past the bar's left edge
+    return offset;
+}
+
 float4x4 Stage::Perspective(float2 eye) const
 {
     using namespace winrt::Windows::Foundation::Numerics;
@@ -267,6 +312,7 @@ void CALLBACK Stage::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG id
 
 void Stage::OnForeground(HWND hwnd)
 {
+    Trace(L"foreground", hwnd);
     if (!m_ready || m_busy)
         return;
     GUID desktop = CurrentDesktopId();
@@ -287,6 +333,7 @@ void Stage::OnForeground(HWND hwnd)
 
 void Stage::OnMinimizeStart(HWND hwnd)
 {
+    Trace(m_activeSnap && m_activeSnapHwnd == hwnd ? L"minimize (has snap)" : L"minimize (no snap)", hwnd);
     if (!m_ready || m_busy || hwnd != m_active)
         return;
     // Minimized by the user (button, Win+D, four-finger swipe): it flies into the sidebar from where
@@ -318,6 +365,7 @@ void Stage::SnapActiveSoon()
 
 void Stage::OnGone(HWND hwnd)
 {
+    Trace(L"gone", hwnd);
     if (hwnd == m_active && !IsWindowVisible(hwnd))
         m_active = nullptr;
     if (m_busy || IsWindowVisible(hwnd))
@@ -346,6 +394,7 @@ GUID Stage::CurrentDesktopId()
 // windows take over the sidebar, and ones never seen before are adopted.
 void Stage::SyncDesktop()
 {
+    Trace(L"desktop switched");
     HWND fg = GetForegroundWindow();
     m_active = wt::IsManageable(fg, m_mon) ? fg : nullptr;
     if (m_active)
@@ -483,8 +532,8 @@ void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
     v.clip.CornerRadius({ S(kRadius) / p.scale, S(kRadius) / p.scale });
     if (v.badge)
     {
-        float2 d = k.size * p.scale;
-        v.badge.Offset({ -p.center.x + S(4), d.y / 2.f - S(kBadge) * 0.65f, 0.f });
+        float2 b = BadgeOffset(c, p);
+        v.badge.Offset({ b.x, b.y, 0.f });
     }
 }
 
@@ -526,9 +575,9 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
 
     if (v.badge)
     {
-        float2 d = k1.size * to.scale;
+        float2 b = BadgeOffset(c, to);
         auto badge = m_compositor.CreateVector3KeyFrameAnimation();
-        badge.InsertKeyFrame(1.f, { -to.center.x + S(4), d.y / 2.f - S(kBadge) * 0.65f, 0.f }, m_ease);
+        badge.InsertKeyFrame(1.f, { b.x, b.y, 0.f }, m_ease);
         badge.Duration(dur);
         v.badge.StartAnimation(L"Offset", badge);
     }
@@ -1061,6 +1110,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 m_snap.CaptureAsync(h, frame, [this, h, frame](auto const& surface) {
                     if (!surface || h != m_active)
                         return;
+                    Trace(L"stage window photographed", h);
                     m_activeSnap = surface;
                     m_activeSnapHwnd = h;
                     m_activeSnapFrame = frame;

@@ -73,6 +73,7 @@ private:
     float ThumbScale(Card const& c) const;
     float4x4 Perspective(float2 eye) const;
     Crop CropFor(Card const& c, bool thumb) const;
+    float2 BadgeOffset(Card const& c, Pose const& p) const;
     Pose SlotPose(Card const& c, size_t i) const;
 
     CardVis MakeVis(Card const& c, bool withBadge);
