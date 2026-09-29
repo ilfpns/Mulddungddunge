@@ -9,8 +9,6 @@ namespace
     constexpr UINT ID_UNPIN = 3;
     constexpr UINT ID_CLOSE = 4;
     constexpr UINT ID_SETTINGS = 6;
-    constexpr float kSettingsW = 520.f;
-    constexpr float kSettingsH = 360.f;
     constexpr UINT ID_AUTOSTART = 5;
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValue[] = L"StageManager";
@@ -52,7 +50,8 @@ namespace
     // Placeholders are drawn at twice their on-screen size: the tilt magnifies the near edge, and the
     // far edge gets a clean 2:1 average instead of skipped pixels.
     constexpr float kPlaceholderScale = 2.f;
-    constexpr size_t kMaxCards = 4;
+    constexpr int kMaxHotkeys = 6;       // as many as the most cards the sidebar can show
+    constexpr UINT_PTR kTimerFit = 13;   // a stage window moved: snapped next to the sidebar?
     constexpr int kSlideMs = 260;
     constexpr int kFlyMs = 420;
     constexpr int kFadeMs = 150;
@@ -98,22 +97,22 @@ namespace
         }
     }
 
-    // Keeps Task Manager's "Memory" (private working set) under ~8MB. Trimming has a cost of its own
-    // (and pages are faulted back in right after), so it only happens when above that.
-    void TrimMemory()
-    {
-        PROCESS_MEMORY_COUNTERS_EX2 pmc{ sizeof(pmc) };
-        if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) &&
-            pmc.PrivateWorkingSetSize < 8u * 1024 * 1024)
-            return;
-        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
-    }
-
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
     {
         // Smooth ease-out: quick departure, long gentle landing.
         return c.CreateCubicBezierEasingFunction({ 0.22f, 0.8f }, { 0.28f, 1.f });
     }
+}
+
+// Keeps Task Manager's "Memory" (private working set) under ~8MB. Trimming has a cost of its own
+// (and pages are faulted back in right after), so it only happens when above that.
+void TrimMemory()
+{
+    PROCESS_MEMORY_COUNTERS_EX2 pmc{ sizeof(pmc) };
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) &&
+        pmc.PrivateWorkingSetSize < 8u * 1024 * 1024)
+        return;
+    SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
 }
 
 bool Stage::Init(HINSTANCE inst)
@@ -127,7 +126,9 @@ bool Stage::Init(HINSTANCE inst)
             g_trace = _wfsopen(path, L"a, ccs=UTF-8", _SH_DENYNO);   // others can read it while we run
     }
 
-    m_mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    m_cfg.Load();
+    wt::SetExcluded(m_cfg.excluded);
+    m_mon = ChosenMonitor();
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(m_mon, &mi);
     m_monitor = mi.rcMonitor;
@@ -188,6 +189,7 @@ bool Stage::Init(HINSTANCE inst)
     m_placeholderBrush = m_compositor.CreateColorBrush({ 255, 58, 58, 64 });
     m_ease = MakeEase(m_compositor);
     m_snap.Init(m_compositor);
+    m_snap.SetQuality(m_cfg.quality);
     LoadPins();
     m_desktops = winrt::try_create_instance<IVirtualDesktopManager>(CLSID_VirtualDesktopManager);
 
@@ -220,17 +222,19 @@ void Stage::Shutdown()
 
 void Stage::Dock()
 {
-    // A strip along the left of the work area. Nothing is reserved: maximized windows use the whole
-    // screen, and the sidebar gets out of their way instead (see UpdateDock).
-    // Monitor handles can go stale after a display change: look the primary monitor up again.
-    m_mon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    // A strip along the left (or right) of the work area. Nothing is reserved: maximized windows use the
+    // whole screen, and the sidebar gets out of their way instead (see UpdateDock).
+    // Monitor handles can go stale after a display change: look the monitor up again.
+    m_mon = ChosenMonitor();
     UINT dpiX = 96, dpiY = 96;
     if (SUCCEEDED(GetDpiForMonitor(m_mon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
         m_scale = dpiX / 96.f;
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(m_mon, &mi);
     m_monitor = mi.rcMonitor;
-    m_bar = { mi.rcWork.left, mi.rcWork.top, mi.rcWork.left + static_cast<LONG>(S(kSidebarW)), mi.rcWork.bottom };
+    LONG barW = static_cast<LONG>(BarW());
+    m_bar = Right() ? RECT{ mi.rcWork.right - barW, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom }
+                    : RECT{ mi.rcWork.left, mi.rcWork.top, mi.rcWork.left + barW, mi.rcWork.bottom };
 
     float2 barSize{ static_cast<float>(m_bar.right - m_bar.left), static_cast<float>(m_bar.bottom - m_bar.top) };
     float2 barOrigin = SideToAnim({ 0.f, 0.f });
@@ -238,7 +242,7 @@ void Stage::Dock()
     if (!m_busy && !m_dragging && !m_menu.open && !m_settings.open)
         ShrinkView();
 
-    float2 eye{ S(kSidebarW) / 2.f, barSize.y / 2.f };
+    float2 eye{ BarW() / 2.f, barSize.y / 2.f };
     m_sideContent.TransformMatrix(Perspective(eye));
     m_animStage.TransformMatrix(Perspective(SideToAnim(eye)));
 }
@@ -259,6 +263,7 @@ void Stage::AddTrayIcon()
 void Stage::ShowTrayMenu()
 {
     HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"설정");
     AppendMenuW(menu, MF_STRING | (StartsWithWindows() ? MF_CHECKED : 0), ID_AUTOSTART, L"Windows 시작 시 실행");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"종료");
@@ -266,6 +271,11 @@ void Stage::ShowTrayMenu()
     ShowMenu(menu, &command);
     if (command == ID_AUTOSTART)
         SetStartsWithWindows(!StartsWithWindows());
+    else if (command == ID_SETTINGS && !m_busy && !m_dragging)
+    {
+        CloseCardMenu();
+        OpenSettings();
+    }
     else if (command == ID_EXIT)
         PostQuitMessage(0);
 }
@@ -418,7 +428,8 @@ void Stage::OpenCardMenu(int index, int anchorY)
 
     // Next to the card, kept on screen.
     float2 cardCenter{ 0.f, card ? SideToAnim(SlotCenter(index)).y : static_cast<float>(anchorY) };
-    float x = static_cast<float>(m_bar.right - m_monitor.left) + S(6);
+    float x = Right() ? static_cast<float>(m_bar.left - m_monitor.left) - S(6) - w
+                      : static_cast<float>(m_bar.right - m_monitor.left) + S(6);
     float y = std::clamp(cardCenter.y - h / 2.f, S(8), static_cast<float>(m_monitor.bottom - m_monitor.top) - h - S(8));
     m_menu.origin = { x, y };
     m_menu.root.Offset({ x, y, 0.f });
@@ -438,131 +449,6 @@ void Stage::OpenCardMenu(int index, int anchorY)
 
     SetHover(-1);
     GrowView();         // the menu sits outside the bar, and a click anywhere else closes it
-}
-
-void Stage::OpenSettings()
-{
-    if (m_settings.open)
-        return;
-    m_settings = {};
-    m_settings.open = true;
-    float2 screen{ static_cast<float>(m_monitor.right - m_monitor.left), static_cast<float>(m_monitor.bottom - m_monitor.top) };
-    float w = S(kSettingsW), h = S(kSettingsH);
-    m_settings.size = { w, h };
-    m_settings.origin = { std::round((screen.x - w) / 2.f), std::round((screen.y - h) / 2.f) };
-
-    auto dwrite = m_snap.Text();
-    winrt::com_ptr<IDWriteTextFormat> title, body, icon;
-    dwrite->CreateTextFormat(L"Segoe UI Variable Display", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, S(20.f), L"ko-kr", title.put());
-    dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, S(13.5f), L"ko-kr", body.put());
-    if (FAILED(dwrite->CreateTextFormat(L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, S(14.f), L"", icon.put())))
-        dwrite->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, S(14.f), L"", icon.put());
-    icon->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    for (auto* f : { title.get(), body.get(), icon.get() })
-        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-    auto content = m_snap.Paint(w, h, [&](ID2D1DeviceContext* dc) {
-        winrt::com_ptr<ID2D1SolidColorBrush> ink, dim, line;
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.95f), ink.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.55f), dim.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.10f), line.put());
-        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        wchar_t const* heading = L"설정";
-        dc->DrawTextW(heading, static_cast<UINT32>(wcslen(heading)), title.get(), { S(24), S(12), w - S(60), S(60) }, ink.get());
-        dc->DrawTextW(L"\xE8BB", 1, icon.get(), { w - S(52), S(16), w - S(16), S(52) }, dim.get());   // close
-        dc->FillRectangle({ S(24), S(66), w - S(24), S(67) }, line.get());
-        wchar_t const* note = L"여기에 설정 항목이 추가됩니다.";
-        dc->DrawTextW(note, static_cast<UINT32>(wcslen(note)), body.get(), { S(24), S(80), w - S(24), S(120) }, dim.get());
-    });
-
-    auto rounded = [&](float2 size, float radius) {
-        auto g = m_compositor.CreateRoundedRectangleGeometry();
-        g.Size(size);
-        g.CornerRadius({ radius, radius });
-        return m_compositor.CreateGeometricClip(g);
-    };
-    m_settings.root = m_compositor.CreateContainerVisual();
-    m_settings.root.Size(screen);
-
-    auto backdrop = m_compositor.CreateSpriteVisual();              // dims everything behind the panel
-    backdrop.Size(screen);
-    backdrop.Brush(m_compositor.CreateColorBrush({ 90, 0, 0, 0 }));
-    m_settings.root.Children().InsertAtTop(backdrop);
-
-    auto panel = m_compositor.CreateContainerVisual();
-    panel.Size({ w, h });
-    panel.Offset({ m_settings.origin.x, m_settings.origin.y, 0.f });
-    panel.CenterPoint({ w / 2.f, h / 2.f, 0.f });
-    auto shadow = m_compositor.CreateDropShadow();
-    shadow.BlurRadius(S(40));
-    shadow.Opacity(0.5f);
-    shadow.Offset({ 0.f, S(10), 0.f });
-    auto shadowHost = m_compositor.CreateSpriteVisual();
-    shadowHost.Size({ w - S(16), h - S(16) });
-    shadowHost.Offset({ S(8), S(8), 0.f });
-    shadowHost.Shadow(shadow);
-    panel.Children().InsertAtTop(shadowHost);
-    auto border = m_compositor.CreateSpriteVisual();
-    border.Size({ w, h });
-    border.Brush(m_compositor.CreateColorBrush({ 40, 255, 255, 255 }));
-    border.Clip(rounded({ w, h }, S(14)));
-    panel.Children().InsertAtTop(border);
-    auto fill = m_compositor.CreateSpriteVisual();
-    fill.Size({ w - 2.f, h - 2.f });
-    fill.Offset({ 1.f, 1.f, 0.f });
-    fill.Brush(m_compositor.CreateColorBrush({ 250, 32, 32, 36 }));
-    fill.Clip(rounded({ w - 2.f, h - 2.f }, S(14) - 1.f));
-    panel.Children().InsertAtTop(fill);
-    auto text = m_compositor.CreateSpriteVisual();
-    text.Size({ w, h });
-    text.Brush(m_compositor.CreateSurfaceBrush(content));
-    panel.Children().InsertAtTop(text);
-    m_settings.root.Children().InsertAtTop(panel);
-    m_root.Children().InsertAtTop(m_settings.root);
-
-    auto fade = m_compositor.CreateScalarKeyFrameAnimation();
-    fade.InsertKeyFrame(0.f, 0.f);
-    fade.InsertKeyFrame(1.f, 1.f, m_ease);
-    fade.Duration(std::chrono::milliseconds(160));
-    m_settings.root.StartAnimation(L"Opacity", fade);
-    auto grow = m_compositor.CreateVector3KeyFrameAnimation();
-    grow.InsertKeyFrame(0.f, { 0.96f, 0.96f, 1.f });
-    grow.InsertKeyFrame(1.f, { 1.f, 1.f, 1.f }, m_ease);
-    grow.Duration(std::chrono::milliseconds(200));
-    panel.StartAnimation(L"Scale", grow);
-
-    SetHover(-1);
-    GrowView();
-}
-
-void Stage::CloseSettings()
-{
-    if (!m_settings.open)
-        return;
-    auto root = m_settings.root;
-    m_settings = {};
-    auto fade = m_compositor.CreateScalarKeyFrameAnimation();
-    fade.InsertKeyFrame(1.f, 0.f);
-    fade.Duration(std::chrono::milliseconds(120));
-    auto batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    root.StartAnimation(L"Opacity", fade);
-    batch.End();
-    batch.Completed([this, root](auto&&, auto&&) {
-        m_root.Children().Remove(root);         // releases the drawn contents
-        TrimMemory();
-        if (!m_busy && !m_dragging && !m_menu.open && !m_settings.open)
-            ShrinkView();
-    });
-}
-
-bool Stage::InSettingsClose(POINT pt) const
-{
-    float x = pt.x - m_settings.origin.x, y = pt.y - m_settings.origin.y;
-    return x >= m_settings.size.x - S(56) && x <= m_settings.size.x - S(12) && y >= S(12) && y <= S(56);
 }
 
 void Stage::CloseCardMenu()
@@ -694,17 +580,112 @@ void Stage::SetPinned(Card& c, bool pinned)
 
 // ---- layout ---------------------------------------------------------------
 
+float Stage::BarW() const { return S(kSidebarW) * m_cfg.SizeFactor(); }
+float Stage::ThumbW() const { return S(kThumbW) * m_cfg.SizeFactor(); }
+float Stage::ThumbH() const { return S(kThumbH) * m_cfg.SizeFactor(); }
+// Cards turn to face the stage: away from the left edge, or from the right one.
+float Stage::TiltAngle() const { return Right() ? -static_cast<float>(m_cfg.tilt) : static_cast<float>(m_cfg.tilt); }
+// Stand-ins are drawn at twice their size for quality, except in icons-only mode, which is about
+// using as little memory as possible.
+float Stage::PlaceholderScale() const { return m_cfg.iconsOnly ? 1.f : kPlaceholderScale; }
+
+// The monitor chosen in the settings (by device name), or the primary one.
+HMONITOR Stage::ChosenMonitor() const
+{
+    if (!m_cfg.monitor.empty())
+    {
+        struct Ctx { std::wstring const* name; HMONITOR found; } ctx{ &m_cfg.monitor, nullptr };
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+            auto c = reinterpret_cast<Ctx*>(lp);
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(mon, &mi) && _wcsicmp(mi.szDevice, c->name->c_str()) == 0)
+            {
+                c->found = mon;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        if (ctx.found)
+            return ctx.found;
+    }
+    return MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+}
+
+// A window snapped (or placed) against the screen edge the sidebar is on: Win+Left, a snap layout's
+// left column... It is moved next to the bar instead of being covered by it. Maximized windows are
+// left alone; the sidebar slides away from them.
+bool Stage::FitsBeside(HWND hwnd) const
+{
+    if (!m_cfg.fitSnapped || m_dock == DockState::Hidden || IsZoomed(hwnd) || IsIconic(hwnd) ||
+        !IsWindowVisible(hwnd) || wt::IsCloaked(hwnd))
+        return false;
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(m_mon, &mi);
+    RECT f = wt::FrameRect(hwnd), work = mi.rcWork;
+    LONG workW = work.right - work.left, tol = static_cast<LONG>(S(10));
+    bool atEdge = Right() ? std::abs(f.right - work.right) <= tol && f.left < m_bar.left - tol
+                          : std::abs(f.left - work.left) <= tol && f.right > m_bar.right + tol;
+    // Narrower than 3/4 of the screen (a half or a third), and room left for it next to the bar.
+    return atEdge && f.right - f.left <= workW * 3 / 4 && f.right - f.left > static_cast<LONG>(BarW()) + S(240);
+}
+
+void Stage::FitBeside()
+{
+    for (HWND h : m_stage)
+    {
+        if (!FitsBeside(h))
+            continue;
+        RECT wr, f = wt::FrameRect(h);
+        GetWindowRect(h, &wr);
+        // Only the edge against the sidebar moves; the other stays where the snap put it.
+        if (Right())
+            wr.right -= f.right - m_bar.left;
+        else
+            wr.left += m_bar.right - f.left;
+        Trace(L"fit next to the sidebar", h);
+        SetWindowPos(h, nullptr, wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    }
+    UpdateDock();
+}
+
+// Whether a window coming to the front sits beside everything already on stage (overlapping little),
+// as two snapped windows do. Then it joins the stage instead of sending the others away.
+bool Stage::SideBySide(HWND hwnd) const
+{
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd))
+        return false;
+    RECT a = wt::FrameRect(hwnd);
+    LONG areaA = (a.right - a.left) * (a.bottom - a.top);
+    bool any = false;
+    for (HWND h : m_stage)
+    {
+        if (h == hwnd || !IsWindowVisible(h) || IsIconic(h) || wt::IsCloaked(h))
+            continue;
+        RECT b = wt::FrameRect(h), overlap;
+        LONG areaB = (b.right - b.left) * (b.bottom - b.top);
+        LONG shared = IntersectRect(&overlap, &a, &b) ? (overlap.right - overlap.left) * (overlap.bottom - overlap.top) : 0;
+        if (shared * 10 > std::min(areaA, areaB))  // more than 10% covered: one is in front of the other
+            return false;
+        any = true;
+    }
+    return any;
+}
+
 float2 Stage::SlotCenter(size_t i) const
 {
     // The stack is centered vertically in the bar.
     float n = static_cast<float>(m_visible.size());
     float barH = static_cast<float>(m_bar.bottom - m_bar.top);
-    return { S(kSidebarW) / 2.f, barH / 2.f + (i - (n - 1.f) / 2.f) * S(kPitch) };
+    // Tighter when many large cards would not fit the bar's height.
+    float pitch = std::min(S(kPitch) * m_cfg.SizeFactor(), (barH - S(24)) / std::max(n, 1.f));
+    return { BarW() / 2.f, barH / 2.f + (i - (n - 1.f) / 2.f) * pitch };
 }
 
 float Stage::ThumbScale(Card const& c) const
 {
-    return S(kThumbW) / CropFor(c, true).size.x;
+    return ThumbW() / CropFor(c, true).size.x;
 }
 
 // Sidebar cards all share one shape; a window with another aspect ratio is cropped (top-anchored).
@@ -727,9 +708,9 @@ Crop Stage::CropFor(Card const& c, bool thumb) const
 // actually appears after the tilt and the shared camera, so every slot gets the same look.
 float2 Stage::Project(Pose const& p, float2 local, float z) const
 {
-    float2 eye{ S(kSidebarW) / 2.f, (m_bar.bottom - m_bar.top) / 2.f };
+    float2 eye{ BarW() / 2.f, (m_bar.bottom - m_bar.top) / 2.f };
     float2 point = p.center + local;
-    return eye + (point - eye) / (1.f - z / (kDepthRatio * S(kThumbW))) - p.center;
+    return eye + (point - eye) / (1.f - z / (kDepthRatio * ThumbW())) - p.center;
 }
 
 float2 Stage::BadgeOffset(Card const& c, Pose const& p) const
@@ -741,6 +722,8 @@ float2 Stage::BadgeOffset(Card const& c, Pose const& p) const
     float2 corner = Project(p, { -halfW * std::cos(rad), halfH }, halfW * std::sin(rad));
     float2 offset = corner + float2{ S(12), -S(8) } - float2{ S(kBadge), S(kBadge) } / 2.f;
     offset.x = std::max(offset.x, -p.center.x + S(2));               // never past the bar's left edge
+    if (Right())
+        offset.x = std::min(offset.x, BarW() - p.center.x - S(kBadge) - S(2));
     return offset;
 }
 
@@ -757,13 +740,13 @@ float4x4 Stage::Perspective(float2 eye) const
 {
     using namespace winrt::Windows::Foundation::Numerics;
     auto p = float4x4::identity();
-    p.m34 = -1.f / (kDepthRatio * S(kThumbW));
+    p.m34 = -1.f / (kDepthRatio * ThumbW());
     return make_float4x4_translation(-eye.x, -eye.y, 0.f) * p * make_float4x4_translation(eye.x, eye.y, 0.f);
 }
 
 Pose Stage::SlotPose(Card const& c, size_t i) const
 {
-    return { SlotCenter(i), ThumbScale(c), kTilt, true };
+    return { SlotCenter(i), ThumbScale(c), TiltAngle(), true };
 }
 
 // ---- cards ----------------------------------------------------------------
@@ -819,7 +802,11 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
         break;
     case EVENT_OBJECT_LOCATIONCHANGE:
         if (g_stage->OnStage(hwnd))
+        {
             g_stage->UpdateDock();
+            if (m_cfg.fitSnapped && FitsBeside(hwnd))
+                SetTimer(m_sidebar, kTimerFit, 250, nullptr);    // once the snap has settled
+        }
         break;
     case EVENT_OBJECT_HIDE:
         if (g_stage->OnStage(hwnd))
@@ -835,6 +822,10 @@ void Stage::OnForeground(HWND hwnd)
     if (HWND owner = wt::ModalOwner(hwnd); owner && (OnStage(owner) || !IsIconic(owner)))
         hwnd = owner;
     CloseCardMenu();
+    // Another window took focus (Alt+Tab...): the settings panel steps aside, like a menu.
+    // (Focus handed back to the stage window, as after the tray menu, doesn't count.)
+    if (m_settings.open && hwnd != m_active)
+        CloseSettings();
     if (!m_ready || m_busy)
         return;
     GUID desktop = CurrentDesktopId();
@@ -861,6 +852,19 @@ void Stage::OnForeground(HWND hwnd)
     if (!wt::IsManageable(hwnd, m_mon))
     {
         UpdateDock();                               // e.g. a fullscreen game came to the front
+        return;
+    }
+    if (SideBySide(hwnd))
+    {
+        // Next to what is on stage (two windows snapped side by side): both stay.
+        Trace(L"joins stage side by side", hwnd);
+        RemoveCard(hwnd);
+        m_stage.push_back(hwnd);
+        m_active = hwnd;
+        SnapActiveSoon();
+        StageChanged();
+        if (m_cfg.fitSnapped && FitsBeside(hwnd))
+            SetTimer(m_sidebar, kTimerFit, 250, nullptr);
         return;
     }
     // Already on screen (Alt+Tab, taskbar, a new window): only the previous one needs to leave.
@@ -896,6 +900,12 @@ void Stage::OnMinimizeStart(HWND hwnd)
     auto card = TakeCard(hwnd);
     if (!card->pinned)
         m_cards.insert(m_cards.begin(), card);
+    if (!picture && m_cfg.iconsOnly)
+    {
+        // No pictures: its icon card flies in instead.
+        frame = card->frame;
+        picture = m_snap.Placeholder(hwnd, card->w, card->h, PlaceholderScale() * ThumbW() * card->w / CropFor(*card, true).size.x);
+    }
     if (picture)
         SetSnapshot(*card, frame, picture);
     Relayout(true);
@@ -1021,6 +1031,8 @@ void Stage::AdoptPinnedElsewhere()
         if (!card->pinned)
             continue;                               // not pinned on its desktop, or taken by another window
         m_cards.push_back(card);
+        if (m_cfg.iconsOnly)
+            continue;
         m_snap.CaptureMinimized(h, [this, card](auto const& surface) {
             if (surface)
                 SetSnapshot(*card, card->frame, surface);
@@ -1079,6 +1091,12 @@ void Stage::Adopt(HWND hwnd)
 {
     auto card = MakeCard(hwnd);
     m_cards.push_back(card);
+    if (m_cfg.iconsOnly)
+    {
+        if (!IsIconic(hwnd))
+            Minimize(hwnd);                         // its icon card is ready already
+        return;
+    }
     if (IsIconic(hwnd))
     {
         m_snap.CaptureMinimized(hwnd, [this, card](auto const& surface) {
@@ -1163,9 +1181,9 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
     // Only a window that can't be photographed right now (minimized, or on another desktop) needs a
     // stand-in; a visible one is photographed right away.
-    if (IsIconic(hwnd) || !IsWindowVisible(hwnd) || wt::IsCloaked(hwnd))
+    if (m_cfg.iconsOnly || IsIconic(hwnd) || !IsWindowVisible(hwnd) || wt::IsCloaked(hwnd))
     {
-        c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, kPlaceholderScale * S(kThumbW) * c->w / CropFor(*c, true).size.x));
+        c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, PlaceholderScale() * ThumbW() * c->w / CropFor(*c, true).size.x));
         c->hasPicture = true;
     }
     return c;
@@ -1325,7 +1343,7 @@ void Stage::Relayout(bool animate)
     for (auto& c : m_cards)
     {
         bool here = Here(*c);
-        if (here && m_visible.size() < kMaxCards)
+        if (here && m_visible.size() < static_cast<size_t>(m_cfg.cards))
         {
             m_visible.push_back(c);
             continue;
@@ -1338,7 +1356,7 @@ void Stage::Relayout(bool animate)
             auto it = std::find_if(perDesktop.begin(), perDesktop.end(), [&](auto& d) { return d.first == c->desktop; });
             if (it == perDesktop.end())
                 it = perDesktop.insert(perDesktop.end(), { c->desktop, 0 });
-            shown = it->second++ < kMaxCards;
+            shown = it->second++ < static_cast<size_t>(m_cfg.cards);
         }
         if (!shown && c->hasPicture)
         {
@@ -1352,10 +1370,10 @@ void Stage::Relayout(bool animate)
     for (size_t i = 0; i < m_visible.size(); ++i)
     {
         auto& c = *m_visible[i];
-        if (!c.hasPicture && IsIconic(c.hwnd))
+        if (!c.hasPicture && (IsIconic(c.hwnd) || m_cfg.iconsOnly))
         {
             // Back in view after its picture was released.
-            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, kPlaceholderScale * S(kThumbW) * c.w / CropFor(c, true).size.x));
+            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, PlaceholderScale() * ThumbW() * c.w / CropFor(c, true).size.x));
             c.hasPicture = true;
             if (c.side.holder)
                 ApplySize(c.side, c);
@@ -1371,7 +1389,7 @@ void Stage::Relayout(bool animate)
         c.side.holder.IsVisible(true);
         float2 now{ c.side.holder.Offset().x, c.side.holder.Offset().y };
         if (animate && (now.x != target.center.x || now.y != target.center.y))
-            AnimatePose(c.side, c, { now, target.scale, target.angle, true }, target, kSlideMs);
+            AnimatePose(c.side, c, { now, target.scale, target.angle, true }, target, m_cfg.Ms(kSlideMs));
         else
             ApplyPose(c.side, c, target);
     }
@@ -1383,14 +1401,14 @@ int Stage::HitTest(POINT pt) const
     if (m_hover >= 0 && m_hover < static_cast<int>(m_visible.size()))
     {
         Pose p = HoverPose(*m_visible[m_hover], m_hover, true);
-        float halfW = S(kThumbW) * kHoverGrow / 2.f, halfH = S(kThumbH) * kHoverGrow / 2.f;
+        float halfW = ThumbW() * kHoverGrow / 2.f, halfH = ThumbH() * kHoverGrow / 2.f;
         if (std::abs(pt.x - p.center.x) <= halfW && std::abs(pt.y - p.center.y) <= halfH)
             return m_hover;
     }
     for (size_t i = 0; i < m_visible.size(); ++i)
     {
         float2 ctr = SlotCenter(i);
-        if (std::abs(pt.x - ctr.x) <= S(kThumbW) / 2.f && std::abs(pt.y - ctr.y) <= S(kThumbH) / 2.f)
+        if (std::abs(pt.x - ctr.x) <= ThumbW() / 2.f && std::abs(pt.y - ctr.y) <= ThumbH() / 2.f)
             return static_cast<int>(i);
     }
     return -1;
@@ -1405,9 +1423,9 @@ Pose Stage::HoverPose(Card const& c, size_t i, bool hovered) const
     {
         p.scale *= kHoverGrow;
         p.angle = 0.f;
-        // Facing front it is wider than the bar: keep its left edge on screen.
+        // Facing front it is wider than the bar: keep its outer edge on screen.
         float half = CropFor(c, true).size.x * p.scale / 2.f;
-        p.center.x = std::max(p.center.x, half + S(8));
+        p.center.x = Right() ? std::min(p.center.x, BarW() - half - S(8)) : std::max(p.center.x, half + S(8));
     }
     return p;
 }
@@ -1422,7 +1440,7 @@ void Stage::SetHover(int index)
         auto& c = *m_visible[i];
         auto& v = c.side;
         Pose p = HoverPose(c, i, hovered);
-        std::chrono::milliseconds dur(hovered ? 200 : 170);
+        std::chrono::milliseconds dur(m_cfg.Ms(hovered ? 200 : 170));
         auto vec = [&](auto const& target, wchar_t const* prop, float3 to) {
             auto anim = m_compositor.CreateVector3KeyFrameAnimation();
             anim.InsertKeyFrame(1.f, to, m_ease);
@@ -1457,16 +1475,26 @@ void Stage::SetHover(int index)
     };
     if (index >= 0 && index < static_cast<int>(m_visible.size()) && !m_busy && m_dock == DockState::Shown)
     {
-        // The enlarged card sticks out past the bar on the right; widen the view for as long as it does.
+        // The enlarged card sticks out past the bar toward the stage; widen the view for as long as it does.
         auto& c = *m_visible[index];
         Pose p = HoverPose(c, index, true);
-        LONG right = static_cast<LONG>(SideToAnim({ p.center.x + CropFor(c, true).size.x * p.scale / 2.f + S(8), 0.f }).x);
+        float half = CropFor(c, true).size.x * p.scale / 2.f + S(8);
         KillTimer(m_sidebar, kTimerShrink);
         RECT r;
         GetWindowRect(m_view, &r);
-        if (right > r.right - r.left)
-            SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, right, m_bar.bottom - m_monitor.top,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        OffsetRect(&r, -m_monitor.left, -m_monitor.top);
+        if (Right())
+        {
+            LONG left = static_cast<LONG>(SideToAnim({ p.center.x - half, 0.f }).x);
+            if (left < r.left)
+                PlaceView(left, r.right, m_bar.bottom - m_monitor.top);
+        }
+        else
+        {
+            LONG right = static_cast<LONG>(SideToAnim({ p.center.x + half, 0.f }).x);
+            if (right > r.right)
+                PlaceView(r.left, right, m_bar.bottom - m_monitor.top);
+        }
     }
     else if (index < 0 && !m_busy && !m_dragging && !m_menu.open)
         SetTimer(m_sidebar, kTimerShrink, 200, nullptr);   // back to the bar once the card has settled
@@ -1620,7 +1648,12 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
                      EqualRect(&frame, &m_prefetchFrame);
         bool recent = m_activeSnap && m_activeSnapHwnd == h && GetTickCount64() - m_activeSnapAt < kReuseMaxAge &&
                       EqualRect(&frame, &m_activeSnapFrame);
-        if (fresh)
+        if (m_cfg.iconsOnly)
+        {
+            auto& c = *flight->card;
+            OnOutCaptured(flight, frame, m_snap.Placeholder(h, c.w, c.h, PlaceholderScale() * ThumbW() * c.w / CropFor(c, true).size.x));
+        }
+        else if (fresh)
         {
             auto surface = m_prefetch;
             m_prefetch = nullptr;
@@ -1645,7 +1678,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         Pose to = TargetPose(*m_inCard);
         ApplyPose(m_flyIn, *m_inCard, nextFrom);
         m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-        AnimatePose(m_flyIn, *m_inCard, nextFrom, to, kFlyMs);
+        AnimatePose(m_flyIn, *m_inCard, nextFrom, to, m_cfg.Ms(kFlyMs));
         m_inBatch.End();
         m_inBatch.Completed([this](auto&&, auto&&) { OnFlyInDone(); });
     }
@@ -1664,23 +1697,40 @@ void Stage::GrowView()
     KillTimer(m_sidebar, kTimerShrink);
     // One pixel short of the monitor: a borderless topmost window covering it exactly is taken by the
     // shell for a fullscreen app, which made us tuck our own sidebar away mid-transition (the flicker).
-    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, m_monitor.right - m_monitor.left,
-        m_monitor.bottom - m_monitor.top - 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    PlaceView(0, m_monitor.right - m_monitor.left, m_monitor.bottom - m_monitor.top - 1);
+}
+
+// The view in monitor coordinates. Its content is laid out from the monitor's top-left, so when the
+// view does not start there (sidebar on the right) the root visual is shifted to match.
+void Stage::PlaceView(LONG left, LONG right, LONG height)
+{
+    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left + left, m_monitor.top, right - left, height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (left != m_viewX)
+    {
+        m_viewX = left;
+        m_root.Offset({ -static_cast<float>(left), 0.f, 0.f });
+    }
 }
 
 void Stage::ShrinkView()
 {
     // Covering only the bar (or just a thin strip at the edge while tucked) keeps us off other apps'
     // pixels, so their overlay/flip optimizations stay intact.
-    if (m_dock == DockState::Hidden)
+    // An open menu or settings panel lies outside the bar and needs the whole monitor.
+    if (m_settings.open || m_menu.open)
+        return;
+    if (m_dock == DockState::Hidden || (m_dock == DockState::Tucked && !m_cfg.edgeReveal))
     {
         ShowWindow(m_view, SW_HIDE);
         return;
     }
-    LONG width = m_dock == DockState::Tucked ? static_cast<LONG>(S(kEdgeStrip)) + (m_bar.left - m_monitor.left)
-                                             : m_bar.right - m_monitor.left;
-    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, width, m_bar.bottom - m_monitor.top,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    LONG strip = static_cast<LONG>(S(kEdgeStrip)), height = m_bar.bottom - m_monitor.top;
+    LONG barLeft = m_bar.left - m_monitor.left, barRight = m_bar.right - m_monitor.left;
+    if (Right())
+        PlaceView(m_dock == DockState::Tucked ? barRight - strip : barLeft, barRight, height);
+    else
+        PlaceView(0, m_dock == DockState::Tucked ? barLeft + strip : barRight, height);
 }
 
 // Slides the cards out to the left (tucked or hidden) or back in, then sizes the view to match.
@@ -1699,12 +1749,14 @@ void Stage::SetDock(DockState state)
             ShrinkView();
         return;
     }
-    float base = SideToAnim({ 0.f, 0.f }).x, hidden = base - static_cast<float>(m_bar.right - m_monitor.left);
+    float base = SideToAnim({ 0.f, 0.f }).x;
+    float hidden = Right() ? base + static_cast<float>(m_monitor.right - m_bar.left)
+                           : base - static_cast<float>(m_bar.right - m_monitor.left);
     if (!out && !m_busy && !m_dragging && !m_menu.open)
         ShrinkView();                               // full bar size first, so the slide-in is visible
     auto anim = m_compositor.CreateScalarKeyFrameAnimation();
     anim.InsertKeyFrame(1.f, out ? hidden : base, m_ease);
-    anim.Duration(std::chrono::milliseconds(kSlideMs));
+    anim.Duration(std::chrono::milliseconds(m_cfg.Ms(kSlideMs)));
     m_slideBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     m_sideContent.StartAnimation(L"Offset.X", anim);
     m_slideBatch.End();
@@ -1721,6 +1773,8 @@ bool Stage::CoversBar(HWND hwnd) const
     if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || wt::IsCloaked(hwnd))
         return false;
     RECT frame = wt::FrameRect(hwnd), overlap;
+    if (FitsBeside(hwnd))
+        return false;                               // about to be moved next to the bar instead
     return IntersectRect(&overlap, &frame, &m_bar) && overlap.right - overlap.left > S(4);
 }
 
@@ -1734,7 +1788,7 @@ void Stage::UpdateDock()
     bool fullscreen = wt::IsFullscreen(top);
     // The front window counts too, in case it reached the front without us seeing the focus change.
     bool covered = (top && CoversBar(top)) || std::any_of(m_stage.begin(), m_stage.end(), [&](HWND h) { return CoversBar(h); });
-    SetDock(fullscreen ? DockState::Hidden : covered && !m_revealed ? DockState::Tucked : DockState::Shown);
+    SetDock(fullscreen ? DockState::Hidden : covered && !m_revealed && m_cfg.autoTuck ? DockState::Tucked : DockState::Shown);
 }
 
 // Moving or maximizing a window only raises EVENT_OBJECT_LOCATIONCHANGE, which fires constantly
@@ -1775,22 +1829,22 @@ void Stage::StageChanged()
 
 void Stage::SetHotkeys(bool on)
 {
+    on = on && m_cfg.hotkeys;
     if (on == m_hotkeysOn)
         return;
     m_hotkeysOn = on;
-    for (int i = 0; i < static_cast<int>(kMaxCards); ++i)
+    for (int i = 0; i < kMaxHotkeys; ++i)
     {
-        if (on && !RegisterHotKey(m_sidebar, kHotkeyBase + i, MOD_ALT | MOD_NOREPEAT, '1' + i))
-            LogError(WM_HOTKEY, HRESULT_FROM_WIN32(GetLastError()), L"Alt+number already registered by another app");
-        else if (!on)
-            UnregisterHotKey(m_sidebar, kHotkeyBase + i);
+        UnregisterHotKey(m_sidebar, kHotkeyBase + i);
+        if (on && i < m_cfg.cards && !RegisterHotKey(m_sidebar, kHotkeyBase + i, m_cfg.HotkeyModifiers() | MOD_NOREPEAT, '1' + i))
+            LogError(WM_HOTKEY, HRESULT_FROM_WIN32(GetLastError()), L"hotkey already registered by another app");
     }
 }
 
 void Stage::Prefetch()
 {
     HWND h = m_active;
-    if (m_busy || m_prefetching || !h || !IsWindowVisible(h) || IsIconic(h))
+    if (m_cfg.iconsOnly || m_busy || m_prefetching || !h || !IsWindowVisible(h) || IsIconic(h))
         return;
     if (h == m_prefetchHwnd && m_prefetch && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge / 2)
         return;
@@ -1832,7 +1886,7 @@ void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, 
     to.center = SideToAnim(to.center);
     ApplyPose(flight->vis, *card, from);
     flight->batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    AnimatePose(flight->vis, *card, from, to, kFlyMs);
+    AnimatePose(flight->vis, *card, from, to, m_cfg.Ms(kFlyMs));
     flight->batch.End();
     flight->batch.Completed([this, flight](auto&&, auto&&) {
         flight->batch = nullptr;
@@ -1862,7 +1916,7 @@ void Stage::FadeOutFlyIn()
     auto fade = m_compositor.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(0.f, 1.f);
     fade.InsertKeyFrame(1.f, 0.f);
-    fade.Duration(std::chrono::milliseconds(kFadeMs));
+    fade.Duration(std::chrono::milliseconds(m_cfg.Ms(kFadeMs)));
     m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
     m_flyIn.holder.StartAnimation(L"Opacity", fade);
     m_inBatch.End();
@@ -1986,7 +2040,7 @@ void Stage::BeginDrag(POINT viewPt)
     // Lifted: it straightens out and grows a little while following the pointer.
     m_dragPose = { { static_cast<float>(viewPt.x), static_cast<float>(viewPt.y) }, slotScale * 1.25f, 0.f, true };
     ApplyPose(m_dragVis, *m_dragCard, from);
-    AnimatePose(m_dragVis, *m_dragCard, from, m_dragPose, 180);
+    AnimatePose(m_dragVis, *m_dragCard, from, m_dragPose, m_cfg.Ms(180));
     GrowView();
 }
 
@@ -2005,7 +2059,8 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
     m_dragCard = nullptr;
     // The card may have been taken away mid-drag (its window came to the front, a hotkey...).
     bool stillOurs = std::find(m_cards.begin(), m_cards.end(), card) != m_cards.end();
-    bool onStage = !cancel && stillOurs && viewPt.x > m_bar.right - m_monitor.left && IsWindow(card->hwnd);
+    bool pastBar = Right() ? viewPt.x < m_bar.left - m_monitor.left : viewPt.x > m_bar.right - m_monitor.left;
+    bool onStage = !cancel && stillOurs && pastBar && IsWindow(card->hwnd);
     if (onStage && !m_busy)
     {
         JoinStage(card, viewPt);
@@ -2018,7 +2073,7 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
     auto vis = m_dragVis;
     m_dragVis = {};
     auto batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    AnimatePose(vis, *card, m_dragPose, home, kSlideMs);
+    AnimatePose(vis, *card, m_dragPose, home, m_cfg.Ms(kSlideMs));
     batch.End();
     batch.Completed([this, vis, card](auto&&, auto&&) {
         m_animStage.Children().Remove(vis.holder);
@@ -2080,7 +2135,7 @@ void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
     m_outs.clear();
     m_pending = 1;
     m_inBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    AnimatePose(m_flyIn, *card, m_dragPose, PoseForRect(frame, m_monitor, card->w), kFlyMs);
+    AnimatePose(m_flyIn, *card, m_dragPose, PoseForRect(frame, m_monitor, card->w), m_cfg.Ms(kFlyMs));
     m_inBatch.End();
     m_inBatch.Completed([this](auto&&, auto&&) { OnFlyInDone(); });
 }
@@ -2138,18 +2193,24 @@ POINT Stage::ViewToSide(LPARAM lp) const
 
 LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
 {
+    // Everything below works in monitor coordinates; the view may start further right.
+    if (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST && msg != WM_MOUSEWHEEL && msg != WM_MOUSEHWHEEL && m_viewX)
+        lp = MAKELPARAM(GET_X_LPARAM(lp) + m_viewX, GET_Y_LPARAM(lp));
     if (m_settings.open)
     {
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP)
+        if (msg == WM_MOUSEWHEEL)
         {
-            bool inside = pt.x >= m_settings.origin.x && pt.x <= m_settings.origin.x + m_settings.size.x &&
-                          pt.y >= m_settings.origin.y && pt.y <= m_settings.origin.y + m_settings.size.y;
-            if (!inside || InSettingsClose(pt))
-                CloseSettings();
+            SettingsWheel(GET_WHEEL_DELTA_WPARAM(wp));
             return 0;
         }
-        if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN)
+        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (msg == WM_MOUSEMOVE)
+            SettingsMove(pt);
+        else if (msg == WM_LBUTTONUP)
+            SettingsClick(pt);
+        else if (msg == WM_RBUTTONUP && !InSettingsPanel(pt))
+            CloseSettings();
+        if (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)
             return 0;
     }
     if (m_menu.open)
@@ -2280,6 +2341,11 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         if (LOWORD(wp) == ID_EXIT)
             PostQuitMessage(0);
+        else if (LOWORD(wp) == ID_SETTINGS && !m_busy && !m_dragging)
+        {
+            CloseCardMenu();
+            OpenSettings();                         // also reachable by other tools (and tests)
+        }
         return 0;
     case WM_TIMER:
         KillTimer(m_sidebar, wp);
@@ -2304,7 +2370,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == kTimerActiveSnap)
         {
             HWND h = m_active;
-            if (h && !m_busy && IsWindowVisible(h) && !IsIconic(h))
+            if (h && !m_busy && !m_cfg.iconsOnly && IsWindowVisible(h) && !IsIconic(h))
             {
                 RECT frame = wt::FrameRect(h);
                 m_snap.CaptureAsync(h, frame, [this, h, frame](auto const& surface) {
@@ -2354,6 +2420,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 {
                     if (!IsWindow(h))
                         OnGone(h);                  // closed: no card
+                    else if (!m_cfg.keepTray && !IsWindowVisible(h))
+                        continue;                   // closed to the tray, and the user wants no card for it
                     else if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [h](auto& c) { return c->hwnd == h; }))
                     {
                         m_stage.push_back(h);       // back where it was, then:
@@ -2400,6 +2468,13 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             m_revealed = false;
             UpdateDock();
+        }
+        else if (wp == kTimerFit)
+        {
+            if (m_busy || m_dragging)
+                SetTimer(m_sidebar, kTimerFit, 250, nullptr);
+            else
+                FitBeside();
         }
         return 0;
     case WM_SETTINGCHANGE:

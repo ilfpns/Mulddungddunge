@@ -9,7 +9,7 @@ public:
 
     using Done = std::function<void(wuc::CompositionDrawingSurface)>;
 
-    // One-shot Windows.Graphics.Capture of `hwnd`, cropped to `frame` and scaled down to <= kMaxWidth.
+    // One-shot Windows.Graphics.Capture of `hwnd`, cropped to `frame` and scaled down to <= m_maxWidth.
     // Returns immediately (a capture session takes ~100ms to start); `done` runs later on this thread,
     // with nullptr on failure or timeout.
     void CaptureAsync(HWND hwnd, RECT const& frame, Done done);
@@ -25,9 +25,18 @@ public:
     IDWriteFactory* Text();                         // created on first use
     // A transparent surface of the given size, drawn once by `draw`.
     wuc::CompositionDrawingSurface Paint(float w, float h, std::function<void(ID2D1DeviceContext*)> const& draw);
+    // Clears and draws an existing surface again (panels that change, like the settings).
+    void Repaint(wuc::CompositionDrawingSurface const& surface, std::function<void(ID2D1DeviceContext*)> const& draw);
+    // Draws the window's app icon (cached per app) inside `dst`.
+    void DrawAppIcon(ID2D1DeviceContext* dc, HWND hwnd, D2D1_RECT_F const& dst);
+    // Detail of window pictures: 0 low, 1 normal, 2 high. Applies to pictures taken from now on.
+    void SetQuality(int quality);
+    // GPU memory this process holds (its textures and surfaces), in bytes.
+    UINT64 GpuMemory() const;
 
 private:
-    static constexpr float kMaxWidth = 440.f;   // sidebar shows ~260px; the fly-in copy fades into the real window
+    // Width pictures are scaled down to. The sidebar shows ~260px; the fly-in copy fades into the real window.
+    float m_maxWidth = 440.f;
 
     struct Job;
     std::shared_ptr<Job> Start(HWND hwnd, RECT const& frame);

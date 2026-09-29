@@ -27,5 +27,5 @@ cl /nologo /std:c++20 /EHsc /O2 /Gy /MT /W3 /utf-8 /permissive- /DUNICODE /D_UNI
    /Fo:obj\ /Fe:bin\stage-manager.exe src\*.cpp obj\app.res ^
    /link /SUBSYSTEM:WINDOWS /MAP:obj\stage-manager.map /MANIFEST:NO /OPT:REF /OPT:ICF ^
    user32.lib gdi32.lib shell32.lib ole32.lib dwmapi.lib shcore.lib ^
-   d3d11.lib dxgi.lib d2d1.lib dwrite.lib windowscodecs.lib windowsapp.lib CoreMessaging.lib advapi32.lib
+   d3d11.lib dxgi.lib d2d1.lib dwrite.lib windowscodecs.lib windowsapp.lib CoreMessaging.lib advapi32.lib version.lib
 exit /b %errorlevel%

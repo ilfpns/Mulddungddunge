@@ -142,7 +142,7 @@ wuc::CompositionDrawingSurface Snapshot::Render(Job const& job, Direct3D11Captur
         auto content = captured.ContentSize();
         D2D1_RECT_F src{ ox, oy, std::min(ox + fw, static_cast<float>(content.Width)), std::min(oy + fh, static_cast<float>(content.Height)) };
 
-        float tw = std::min(kMaxWidth, fw);
+        float tw = std::min(m_maxWidth, fw);
         float th = tw * fh / fw;
         auto surface = m_graphics.CreateDrawingSurface({ tw, th }, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
 
@@ -343,6 +343,37 @@ wuc::CompositionDrawingSurface Snapshot::Paint(float w, float h, std::function<v
     auto surface = m_graphics.CreateDrawingSurface({ w, h }, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
     Draw(surface, draw);
     return surface;
+}
+
+void Snapshot::Repaint(wuc::CompositionDrawingSurface const& surface, std::function<void(ID2D1DeviceContext*)> const& draw)
+{
+    Draw(surface, draw);
+}
+
+void Snapshot::DrawAppIcon(ID2D1DeviceContext* dc, HWND hwnd, D2D1_RECT_F const& dst)
+{
+    auto source = CachedIcon(hwnd);
+    DrawIcon(dc, source.get(), dst);
+}
+
+void Snapshot::SetQuality(int quality)
+{
+    static constexpr float widths[] = { 300.f, 440.f, 640.f };
+    m_maxWidth = widths[std::clamp(quality, 0, 2)];
+}
+
+UINT64 Snapshot::GpuMemory() const
+{
+    winrt::com_ptr<IDXGIAdapter> adapter;
+    if (!m_d3d || FAILED(m_d3d.as<IDXGIDevice>()->GetAdapter(adapter.put())))
+        return 0;
+    auto adapter3 = adapter.try_as<IDXGIAdapter3>();
+    if (!adapter3)
+        return 0;
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+    adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
+    adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared);
+    return local.CurrentUsage + shared.CurrentUsage;
 }
 
 void Snapshot::CaptureMinimized(HWND hwnd, Done done)

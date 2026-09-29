@@ -22,7 +22,24 @@ namespace wt
         return false;
     }
 
+    static std::vector<std::wstring> g_excluded;
+
+    void SetExcluded(std::vector<std::wstring> const& apps)
+    {
+        g_excluded = apps;
+    }
+
     bool IsManageable(HWND hwnd, HMONITOR monitor, bool otherDesktops)
+    {
+        if (!IsAppWindow(hwnd, monitor, otherDesktops))
+            return false;
+        if (g_excluded.empty())
+            return true;
+        auto app = AppId(hwnd);
+        return std::none_of(g_excluded.begin(), g_excluded.end(), [&](auto& e) { return _wcsicmp(e.c_str(), app.c_str()) == 0; });
+    }
+
+    bool IsAppWindow(HWND hwnd, HMONITOR monitor, bool otherDesktops)
     {
         if (!hwnd || !IsWindowVisible(hwnd))
             return false;
@@ -43,7 +60,7 @@ namespace wt
             return false;
         if (GetWindowTextLengthW(hwnd) == 0 || IsShellClass(hwnd))
             return false;
-        if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != monitor)
+        if (monitor && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != monitor)
             return false;
         return !IsFullscreen(hwnd);
     }
@@ -272,5 +289,44 @@ namespace wt
         } while (found.empty() && FindNextFileW(profiles, &profile));
         FindClose(profiles);
         return found;
+    }
+
+    std::wstring AppLabel(std::wstring const& app, HWND sample)
+    {
+        auto hash = app.find(L'#');
+        std::wstring exe = app.substr(0, hash);
+        if (hash != std::wstring::npos && sample)
+        {
+            // A web app's windows are titled "<app> - <page>" or just "<app>".
+            wchar_t title[128]{};
+            GetWindowTextW(sample, title, ARRAYSIZE(title));
+            std::wstring t = title;
+            auto dash = t.find(L" - ");
+            if (dash != std::wstring::npos)
+                t.resize(dash);
+            if (!t.empty())
+                return t;
+        }
+        DWORD handle = 0, size = GetFileVersionInfoSizeW(exe.c_str(), &handle);
+        if (size)
+        {
+            std::vector<BYTE> data(size);
+            struct Lang { WORD lang, page; }* langs = nullptr;
+            UINT len = 0;
+            if (GetFileVersionInfoW(exe.c_str(), 0, size, data.data()) &&
+                VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void**>(&langs), &len) && len >= sizeof(Lang))
+            {
+                wchar_t key[64];
+                swprintf_s(key, L"\\StringFileInfo\\%04x%04x\\FileDescription", langs[0].lang, langs[0].page);
+                wchar_t* text = nullptr;
+                if (VerQueryValueW(data.data(), key, reinterpret_cast<void**>(&text), &len) && text && *text)
+                    return hash != std::wstring::npos ? std::wstring(text) + L" 웹앱" : std::wstring(text);
+            }
+        }
+        auto slash = exe.find_last_of(L"\\");
+        auto name = slash == std::wstring::npos ? exe : exe.substr(slash + 1);
+        if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
+            name.resize(name.size() - 4);
+        return name;
     }
 }

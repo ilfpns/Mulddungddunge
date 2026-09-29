@@ -1,6 +1,7 @@
 #pragma once
 #include "pch.h"
 #include "Snapshot.h"
+#include "Config.h"
 
 // Visual tree for one card: holder (perspective, position) -> sprite (image, tilt, scale) + badge.
 struct CardVis
@@ -55,6 +56,9 @@ struct Crop
     float2 size;
 };
 
+// Hands unused memory back when the private working set grows past ~8MB (Stage.cpp).
+void TrimMemory();
+
 class Stage
 {
 public:
@@ -83,10 +87,19 @@ private:
 
     // Card context menu, drawn with composition so it matches the sidebar.
     void OpenCardMenu(int index, int anchorY);      // index < 0: right-click on empty sidebar space
-    // Settings: a modal panel over a dimmed screen. Its contents are to be filled in later.
+    // Settings: a modal panel over a dimmed screen (Settings.cpp).
     void OpenSettings();
     void CloseSettings();
-    bool InSettingsClose(POINT viewPt) const;
+    bool InSettingsPanel(POINT viewPt) const;
+    void PaintSettings();
+    void SettingsMove(POINT viewPt);
+    void SettingsClick(POINT viewPt);
+    void SettingsWheel(int delta);
+    void LoadSettingsLists();
+    void ApplySetting(int what);
+    void SaveSettings();
+    void Rebuild();                                 // start over on another monitor
+    void UnpinEntry(std::wstring entry);
     void CloseCardMenu();
     int MenuItemAt(POINT viewPt) const;
     void SetMenuHover(int item);
@@ -109,6 +122,17 @@ private:
     static void SetStartsWithWindows(bool on);
 
     float S(float v) const { return v * m_scale; }
+    float BarW() const;
+    float ThumbW() const;
+    float ThumbH() const;
+    float TiltAngle() const;
+    float PlaceholderScale() const;
+    bool Right() const { return m_cfg.right; }
+    HMONITOR ChosenMonitor() const;
+    bool FitsBeside(HWND hwnd) const;
+    void FitBeside();
+    bool SideBySide(HWND hwnd) const;
+    void PlaceView(LONG left, LONG right, LONG height);     // monitor coordinates
     float2 SlotCenter(size_t i) const;          // sidebar coords
     float ThumbScale(Card const& c) const;
     float4x4 Perspective(float2 eye) const;
@@ -169,6 +193,8 @@ private:
     bool CoversBar(HWND hwnd) const;
     void SetHotkeys(bool on);                       // Alt+1..4 jump to sidebar cards                                // snapshot the stage window before a click needs it
 
+    Config m_cfg;
+    LONG m_viewX = 0;               // view's left edge, relative to the monitor
     HMONITOR m_mon{};
     HWND m_active{};                // the focused window on stage
     std::vector<HWND> m_stage;      // every window on stage, most recently focused last
@@ -253,11 +279,32 @@ private:
         float2 origin{};                            // view coordinates of the panel's top-left
         int hover = -1;
     } m_menu;
+    struct Hit
+    {
+        D2D1_RECT_F rect;                           // panel coordinates
+        int id;
+        int arg;
+    };
+    struct SettingsApp
+    {
+        std::wstring id, label;
+        HWND hwnd{};                                // one of its windows, for the icon (null: none open)
+    };
     struct SettingsModal
     {
         bool open = false;
         wuc::ContainerVisual root{ nullptr };
-        float2 origin{}, size{};                    // panel, view coordinates
+        wuc::CompositionDrawingSurface surface{ nullptr };
+        float2 origin{}, size{};                    // panel, monitor coordinates
+        int tab = 0;
+        int hover = -1, hoverArg = 0;               // the control under the pointer (Hit id, arg)
+        float scroll = 0.f;                         // list pages (apps, pins)
+        float scrollMax = 0.f;
+        std::vector<Hit> hits;
+        std::vector<SettingsApp> apps;
+        std::vector<std::wstring> monitors;         // device names, in the order shown
+        UINT64 ram = 0, gpu = 0;
+        winrt::com_ptr<IDWriteTextFormat> title, body, caption, icon, value;
     } m_settings;
 
     // Pointer state on the sidebar: a press becomes a drag once it moves far enough.

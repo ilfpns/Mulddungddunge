@@ -5,6 +5,12 @@
 namespace wt
 {
     bool IsManageable(HWND hwnd, HMONITOR monitor, bool otherDesktops = false);
+    // An ordinary app window, whether or not the user excluded its app (monitor null: any monitor).
+    bool IsAppWindow(HWND hwnd, HMONITOR monitor, bool otherDesktops = false);
+    void SetExcluded(std::vector<std::wstring> const& apps);    // apps IsManageable turns down
+    // A readable name for an app id: the executable's description ("KakaoTalk"), or for a browser web
+    // app the title of `sample`, one of its windows (may be null).
+    std::wstring AppLabel(std::wstring const& app, HWND sample);
     bool IsFullscreen(HWND hwnd);
     bool IsCloaked(HWND hwnd);                              // hidden by DWM, e.g. on another virtual desktop
     // The top-most ordinary window on the monitor: skips always-on-top windows (pets, PiP players),
