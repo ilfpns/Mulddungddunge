@@ -7,10 +7,12 @@ namespace
     constexpr UINT WM_APPBAR_CB = WM_APP + 1;
     constexpr UINT WM_TRAY = WM_APP + 2;
     constexpr UINT ID_EXIT = 1;
+    constexpr int kHotkeyBase = 100;     // hotkey ids 100..103 = Alt+1..4
     constexpr UINT_PTR kTimerPopulate = 1;
     constexpr UINT_PTR kTimerMinAnimate = 2;
     constexpr UINT_PTR kTimerMinimizeOut = 3;
     constexpr UINT_PTR kTimerFade = 4;
+    constexpr UINT_PTR kTimerShrink = 5;
 
     constexpr float kSidebarW = 210.f;
     constexpr float kThumbW = 210.f;     // card size before the tilt foreshortens it; every card has this shape
@@ -30,6 +32,7 @@ namespace
     constexpr ULONGLONG kQuietMs = 700;
 
     Stage* g_stage = nullptr;
+
 
     // Appends to %TEMP%\stage-manager.log; only written when something goes wrong.
     void LogError(UINT msg, HRESULT hr, wchar_t const* text)
@@ -75,21 +78,17 @@ bool Stage::Init(HINSTANCE inst)
     wc.lpfnWndProc = SidebarProc;
     wc.lpszClassName = L"StageManagerSidebar";
     RegisterClassExW(&wc);
-    wc.lpfnWndProc = AnimProc;
-    wc.lpszClassName = L"StageManagerAnim";
+    wc.lpfnWndProc = ViewProc;
+    wc.lpszClassName = L"StageManagerView";
     RegisterClassExW(&wc);
 
     m_sidebar = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
         L"StageManagerSidebar", L"Stage Manager", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
-    m_anim = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP |
-        WS_EX_LAYERED | WS_EX_TRANSPARENT,
-        L"StageManagerAnim", L"Stage Manager Animation", WS_POPUP,
-        m_monitor.left, m_monitor.top, m_monitor.right - m_monitor.left, m_monitor.bottom - m_monitor.top,
-        nullptr, nullptr, inst, nullptr);
-    if (!m_sidebar || !m_anim)
+    m_view = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+        L"StageManagerView", L"Stage Manager", WS_POPUP,
+        m_monitor.left, m_monitor.top, 1, 1, nullptr, nullptr, inst, nullptr);
+    if (!m_sidebar || !m_view)
         return false;
-    // The animation layer must let clicks through; layered + transparent does that.
-    SetLayeredWindowAttributes(m_anim, 0, 255, LWA_ALPHA);
 
     DispatcherQueueOptions opts{ sizeof(opts), DQTYPE_THREAD_CURRENT, DQTAT_COM_STA };
     winrt::check_hresult(CreateDispatcherQueueController(opts,
@@ -97,18 +96,14 @@ bool Stage::Init(HINSTANCE inst)
 
     m_compositor = wuc::Compositor();
     auto interop = m_compositor.as<ABI::Windows::UI::Composition::Desktop::ICompositorDesktopInterop>();
-    winrt::check_hresult(interop->CreateDesktopWindowTarget(m_sidebar, TRUE,
-        reinterpret_cast<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget**>(winrt::put_abi(m_sideTarget))));
-    winrt::check_hresult(interop->CreateDesktopWindowTarget(m_anim, TRUE,
-        reinterpret_cast<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget**>(winrt::put_abi(m_animTarget))));
-    m_sideRoot = m_compositor.CreateContainerVisual();
-    m_animRoot = m_compositor.CreateContainerVisual();
-    m_sideTarget.Root(m_sideRoot);
+    winrt::check_hresult(interop->CreateDesktopWindowTarget(m_view, TRUE,
+        reinterpret_cast<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget**>(winrt::put_abi(m_target))));
+    m_root = m_compositor.CreateContainerVisual();
+    m_target.Root(m_root);
     m_sideContent = m_compositor.CreateContainerVisual();
-    m_sideRoot.Children().InsertAtTop(m_sideContent);
-    m_animTarget.Root(m_animRoot);
+    m_root.Children().InsertAtTop(m_sideContent);
     m_animStage = m_compositor.CreateContainerVisual();
-    m_animRoot.Children().InsertAtTop(m_animStage);
+    m_root.Children().InsertAtTop(m_animStage);
     m_placeholderBrush = m_compositor.CreateColorBrush({ 255, 58, 58, 64 });
     m_ease = MakeEase(m_compositor);
     m_snap.Init(m_compositor);
@@ -116,7 +111,7 @@ bool Stage::Init(HINSTANCE inst)
 
     appbar::Register(m_sidebar, WM_APPBAR_CB);
     Dock();
-    ShowWindow(m_sidebar, SW_SHOWNOACTIVATE);
+    ShrinkView();
     AddTrayIcon();
 
     // Give maximized windows a moment to shrink out of the newly reserved strip before capturing them.
@@ -126,6 +121,7 @@ bool Stage::Init(HINSTANCE inst)
 
 void Stage::Shutdown()
 {
+    SetHotkeys(false);
     for (auto hook : m_hooks)
         UnhookWinEvent(hook);
     DeregisterShellHookWindow(m_sidebar);
@@ -135,31 +131,19 @@ void Stage::Shutdown()
     Shell_NotifyIconW(NIM_DELETE, &nid);
     appbar::Remove(m_sidebar);
     SetMinAnimate(true);
-    DestroyWindow(m_anim);
+    DestroyWindow(m_view);
     DestroyWindow(m_sidebar);
 }
 
 void Stage::Dock()
 {
     m_bar = appbar::Dock(m_sidebar, m_monitor, static_cast<int>(S(kSidebarW)));
-    SetWindowPos(m_sidebar, HWND_TOPMOST, m_bar.left, m_bar.top,
-        m_bar.right - m_bar.left, m_bar.bottom - m_bar.top, SWP_NOACTIVATE);
 
-    // A layered window on top hides the composition content of the sidebar below it, so while the
-    // animation layer is up it shows a live mirror of the sidebar. The mirror is only rendered while
-    // that window is visible, so it costs nothing at rest.
     float2 barSize{ static_cast<float>(m_bar.right - m_bar.left), static_cast<float>(m_bar.bottom - m_bar.top) };
-    auto mirrorSource = m_compositor.CreateVisualSurface();
-    mirrorSource.SourceVisual(m_sideRoot);
-    mirrorSource.SourceSize(barSize);
-    auto mirror = m_compositor.CreateSpriteVisual();
-    mirror.Size(barSize);
-    mirror.Offset({ static_cast<float>(m_bar.left - m_monitor.left), static_cast<float>(m_bar.top - m_monitor.top), 0.f });
-    mirror.Brush(m_compositor.CreateSurfaceBrush(mirrorSource));
-    if (m_mirror)
-        m_animRoot.Children().Remove(m_mirror);
-    m_mirror = mirror;
-    m_animRoot.Children().InsertAtBottom(m_mirror);
+    float2 barOrigin = SideToAnim({ 0.f, 0.f });
+    m_sideContent.Offset({ barOrigin.x, barOrigin.y, 0.f });
+    if (!m_busy)
+        ShrinkView();
 
     float2 eye{ S(kSidebarW) / 2.f, barSize.y / 2.f };
     m_sideContent.TransformMatrix(Perspective(eye));
@@ -725,21 +709,24 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         FinishTransition();
         return;
     }
-    ShowAnimLayer();
+    GrowView();
 }
 
-void Stage::ShowAnimLayer()
+// The view's origin stays at the monitor's top-left, so resizing never moves any content.
+void Stage::GrowView()
 {
-    SetWindowPos(m_anim, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    KillTimer(m_sidebar, kTimerShrink);
+    // One pixel short of the monitor: a borderless topmost window covering it exactly is taken by the
+    // shell for a fullscreen app, which made us tuck our own sidebar away mid-transition (the flicker).
+    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, m_monitor.right - m_monitor.left,
+        m_monitor.bottom - m_monitor.top - 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
-void Stage::HideAnimLayer()
+void Stage::ShrinkView()
 {
-    if (m_flyOut.holder)
-        m_animStage.Children().Remove(m_flyOut.holder);
-    if (m_flyIn.holder)
-        m_animStage.Children().Remove(m_flyIn.holder);
-    ShowWindow(m_anim, SW_HIDE);
+    // Covering only the bar keeps us off other apps' pixels, so their overlay/flip optimizations stay intact.
+    SetWindowPos(m_view, HWND_TOPMOST, m_monitor.left, m_monitor.top, m_bar.right - m_monitor.left,
+        m_bar.bottom - m_monitor.top, SWP_NOACTIVATE | (m_tucked ? 0 : SWP_SHOWWINDOW));
 }
 
 // Slides the cards off the left edge and then hides the window entirely, so nothing of ours sits
@@ -749,21 +736,35 @@ void Stage::SlideSidebar(bool out)
     if (out == m_tucked)
         return;
     m_tucked = out;
+    // While a fullscreen app runs, Alt+number belongs to it (VS Code tabs, JetBrains tool windows...).
+    SetHotkeys(!out);
     float hidden = -static_cast<float>(m_bar.right - m_bar.left);
     auto anim = m_compositor.CreateScalarKeyFrameAnimation();
-    anim.InsertKeyFrame(0.f, out ? 0.f : hidden);
-    anim.InsertKeyFrame(1.f, out ? hidden : 0.f, m_ease);
     anim.Duration(std::chrono::milliseconds(kSlideMs));
     if (!out)
-        ShowWindow(m_sidebar, SW_SHOWNOACTIVATE);
+        ShowWindow(m_view, SW_SHOWNOACTIVATE);
+    float base = SideToAnim({ 0.f, 0.f }).x;
+    anim.InsertKeyFrame(0.f, base + (out ? 0.f : hidden));
+    anim.InsertKeyFrame(1.f, base + (out ? hidden : 0.f), m_ease);
     m_slideBatch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
-    m_sideRoot.StartAnimation(L"Offset.X", anim);
+    m_sideContent.StartAnimation(L"Offset.X", anim);
     m_slideBatch.End();
     m_slideBatch.Completed([this](auto&&, auto&&) {
         m_slideBatch = nullptr;
         if (m_tucked)
-            ShowWindow(m_sidebar, SW_HIDE);
+            ShowWindow(m_view, SW_HIDE);
     });
+}
+
+void Stage::SetHotkeys(bool on)
+{
+    for (int i = 0; i < static_cast<int>(kMaxCards); ++i)
+    {
+        if (on && !RegisterHotKey(m_sidebar, kHotkeyBase + i, MOD_ALT | MOD_NOREPEAT, '1' + i))
+            LogError(WM_HOTKEY, HRESULT_FROM_WIN32(GetLastError()), L"Alt+number already registered by another app");
+        else if (!on)
+            UnregisterHotKey(m_sidebar, kHotkeyBase + i);
+    }
 }
 
 void Stage::Prefetch()
@@ -853,7 +854,10 @@ void Stage::FinishTransition()
 {
     m_inBatch = nullptr;
     m_outBatch = nullptr;
-    bool shown = IsWindowVisible(m_anim);
+    if (m_flyOut.holder)
+        m_animStage.Children().Remove(m_flyOut.holder);
+    if (m_flyIn.holder)
+        m_animStage.Children().Remove(m_flyIn.holder);
     m_flyOut = {};
     m_flyIn = {};
     m_outCard = nullptr;
@@ -861,8 +865,8 @@ void Stage::FinishTransition()
     m_pending = 0;
     m_outWaitsForPrefetch = false;
     m_prefetch = nullptr;
-    if (shown)
-        HideAnimLayer();
+    // Shrink only after the removal above has been composited, or the last frame could be cut.
+    SetTimer(m_sidebar, kTimerShrink, 50, nullptr);
     m_quietUntil = GetTickCount64() + kQuietMs / 2;
     SetMinAnimate(true);
     m_busy = false;
@@ -907,11 +911,65 @@ LRESULT CALLBACK Stage::SidebarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-LRESULT CALLBACK Stage::AnimProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+LRESULT CALLBACK Stage::ViewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (msg == WM_NCHITTEST)
-        return HTTRANSPARENT;
+    if (g_stage && g_stage->m_view == hwnd)
+    {
+        try
+        {
+            return g_stage->OnViewMessage(msg, wp, lp);
+        }
+        catch (winrt::hresult_error const& e)
+        {
+            LogError(msg, e.code(), e.message().c_str());
+        }
+        catch (...)
+        {
+            LogError(msg, E_FAIL, L"unknown exception");
+        }
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// The view's origin is the monitor's top-left; cards are laid out in bar coordinates.
+POINT Stage::ViewToSide(LPARAM lp) const
+{
+    return { GET_X_LPARAM(lp) - (m_bar.left - m_monitor.left), GET_Y_LPARAM(lp) - (m_bar.top - m_monitor.top) };
+}
+
+LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_MOUSEMOVE:
+        if (!m_tracking)
+        {
+            TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, m_view, 0 };
+            m_tracking = TrackMouseEvent(&tme);
+            Prefetch();
+        }
+        if (!m_busy)
+            SetHover(HitTest(ViewToSide(lp)));
+        return 0;
+    case WM_LBUTTONUP:
+        if (!m_busy)
+        {
+            int index = HitTest(ViewToSide(lp));
+            if (index >= 0)
+                SwitchTo(static_cast<size_t>(index));
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        m_tracking = false;
+        if (!m_busy)
+            m_prefetch = nullptr;       // don't hold the memory once the pointer leaves
+        SetHover(-1);
+        return 0;
+    }
+    return DefWindowProcW(m_view, msg, wp, lp);
 }
 
 LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
@@ -924,44 +982,29 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     }
     switch (msg)
     {
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-    case WM_MOUSEMOVE:
-        if (!m_tracking)
+    case WM_HOTKEY:
+    {
+        size_t index = static_cast<size_t>(wp - kHotkeyBase);
+        if (!m_busy && !m_tucked && index < m_visible.size())
         {
-            TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, m_sidebar, 0 };
-            m_tracking = TrackMouseEvent(&tme);
-            Prefetch();
-        }
-        if (!m_busy)
-            SetHover(HitTest({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }));
-        return 0;
-    case WM_LBUTTONUP:
-        if (!m_busy)
-        {
-            int index = HitTest({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
-            if (index >= 0)
-                SwitchTo(static_cast<size_t>(index));
+            Prefetch();     // no hover happened; the outgoing window is captured on the way
+            SwitchTo(index);
         }
         return 0;
-    case WM_MOUSELEAVE:
-        m_tracking = false;
-        if (!m_busy)
-            m_prefetch = nullptr;       // don't hold the memory once the pointer leaves
-        SetHover(-1);
-        return 0;
+    }
     case WM_APPBAR_CB:
         if (wp == ABN_POSCHANGED)
             Dock();
         else if (wp == ABN_FULLSCREENAPP)
-            SlideSidebar(lp != 0);
+        {
+            // Trust it only when the foreground window really is a fullscreen app (not us).
+            HWND fg = GetForegroundWindow();
+            DWORD pid = 0;
+            GetWindowThreadProcessId(fg, &pid);
+            bool real = lp && pid != GetCurrentProcessId() && wt::IsFullscreen(fg);
+            SlideSidebar(real);
+        }
         return 0;
-    case WM_ACTIVATE:
-        appbar::NotifyActivate(m_sidebar);
-        break;
-    case WM_WINDOWPOSCHANGED:
-        appbar::NotifyPosChanged(m_sidebar);
-        break;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP)
             ShowTrayMenu();
@@ -985,6 +1028,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             // system; the shell hook only reports top-level app windows.
             m_shellMsg = RegisterWindowMessageW(L"SHELLHOOK");
             RegisterShellHookWindow(m_sidebar);
+            SetHotkeys(true);
         }
         else if (wp == kTimerMinAnimate)
             SetMinAnimate(true);
@@ -992,6 +1036,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             ShowWindowAsync(m_outCard->hwnd, SW_MINIMIZE);
         else if (wp == kTimerFade)
             FadeOutFlyIn();
+        else if (wp == kTimerShrink && !m_busy)
+            ShrinkView();
         return 0;
     case WM_DISPLAYCHANGE:
         Dock();

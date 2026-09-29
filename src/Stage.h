@@ -47,7 +47,9 @@ public:
 
 private:
     static LRESULT CALLBACK SidebarProc(HWND, UINT, WPARAM, LPARAM);
-    static LRESULT CALLBACK AnimProc(HWND, UINT, WPARAM, LPARAM);
+    static LRESULT CALLBACK ViewProc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT OnViewMessage(UINT msg, WPARAM wp, LPARAM lp);
+    POINT ViewToSide(LPARAM lp) const;
     static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD);
 
     // Changes made outside the sidebar: Alt+Tab, taskbar, new windows, minimize, close.
@@ -101,32 +103,32 @@ private:
     Pose FramePose(Card const& c) const;
     Pose TargetPose(Card const& c) const;
     static void ForceForeground(HWND hwnd);
-    void ShowAnimLayer();
-    void HideAnimLayer();
+    void GrowView();                                // whole monitor, for a transition
+    void ShrinkView();                              // back to just the bar
     void Prefetch();
-    void SlideSidebar(bool out);                    // fullscreen apps: tuck the sidebar away to the left                                // snapshot the stage window before a click needs it
+    void SlideSidebar(bool out);                    // fullscreen apps: tuck the sidebar away to the left
+    void SetHotkeys(bool on);                       // Alt+1..4 jump to sidebar cards                                // snapshot the stage window before a click needs it
 
     HINSTANCE m_inst{};
     HMONITOR m_mon{};
     HWND m_active{};                // the window on stage (not in the sidebar)
     int m_savedMinAnimate = 0;
     Snapshot m_snap;
+    // m_sidebar is a hidden message window (AppBar, tray icon, hotkeys, timers, shell hook).
+    // m_view draws everything and takes the clicks. It covers just the bar at rest and grows to the
+    // whole monitor during a transition. It is deliberately not a layered window: DWM drops
+    // composition frames of layered windows, which showed up as heavy flicker.
     HWND m_sidebar{};
-    HWND m_anim{};
+    HWND m_view{};
     RECT m_monitor{};
     RECT m_bar{};
     float m_scale = 1.f;
 
     winrt::Windows::System::DispatcherQueueController m_queue{ nullptr };
     wuc::Compositor m_compositor{ nullptr };
-    wuc::Desktop::DesktopWindowTarget m_sideTarget{ nullptr };
-    wuc::Desktop::DesktopWindowTarget m_animTarget{ nullptr };
-    wuc::ContainerVisual m_sideRoot{ nullptr };
-    // All sidebar cards. Lives under m_sideRoot, but moves into the animation layer during a
-    // transition: a layered window on top hides the composition content of windows below it.
-    wuc::ContainerVisual m_sideContent{ nullptr };
-    wuc::SpriteVisual m_mirror{ nullptr };          // live copy of the sidebar inside the animation layer
-    wuc::ContainerVisual m_animRoot{ nullptr };
+    wuc::Desktop::DesktopWindowTarget m_target{ nullptr };
+    wuc::ContainerVisual m_root{ nullptr };
+    wuc::ContainerVisual m_sideContent{ nullptr };  // sidebar cards, positioned over the bar
     wuc::ContainerVisual m_animStage{ nullptr };    // flying cards; same camera as the sidebar
     wuc::CompositionColorBrush m_placeholderBrush{ nullptr };
     wuc::CompositionEasingFunction m_ease{ nullptr };
