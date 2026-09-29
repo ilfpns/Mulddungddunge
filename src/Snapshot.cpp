@@ -232,8 +232,34 @@ void Snapshot::CaptureAsync(HWND hwnd, RECT const& frame, Done done)
 namespace
 {
     // The window's app icon as a premultiplied WIC source D2D can draw.
+    bool IsFrameHost(std::wstring const& path)
+    {
+        return path.size() >= 24 && _wcsicmp(path.c_str() + path.size() - 24, L"ApplicationFrameHost.exe") == 0;
+    }
+
+    // The app icon as a premultiplied WIC source, as large as the app provides (up to `px`), so it can
+    // be scaled down crisply to whatever size it is shown at.
     winrt::com_ptr<IWICFormatConverter> IconSource(IWICImagingFactory* wic, HWND hwnd, int px)
     {
+        auto path = ProcessPath(hwnd);
+        if (!path.empty() && !IsFrameHost(path))
+        {
+            winrt::com_ptr<IShellItemImageFactory> images;
+            HBITMAP hbmp = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(images.put()))) &&
+                SUCCEEDED(images->GetImage({ px, px }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hbmp)))
+            {
+                winrt::com_ptr<IWICBitmap> bitmap;
+                winrt::com_ptr<IWICFormatConverter> converter;
+                bool ok = SUCCEEDED(wic->CreateBitmapFromHBITMAP(hbmp, nullptr, WICBitmapUsePremultipliedAlpha, bitmap.put())) &&
+                          SUCCEEDED(wic->CreateFormatConverter(converter.put())) &&
+                          SUCCEEDED(converter->Initialize(bitmap.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                              nullptr, 0.f, WICBitmapPaletteTypeCustom));
+                DeleteObject(hbmp);
+                if (ok)
+                    return converter;
+            }
+        }
         bool owned = false;
         HICON icon = LoadAppIcon(hwnd, px, owned);
         winrt::com_ptr<IWICBitmap> bitmap;
@@ -257,7 +283,7 @@ namespace
 
 wuc::CompositionDrawingSurface Snapshot::Icon(HWND hwnd, int px)
 {
-    auto source = IconSource(m_wic.get(), hwnd, px);
+    auto source = IconSource(m_wic.get(), hwnd, 256);
     float size = static_cast<float>(px);
     return Paint(size, size, [&](ID2D1DeviceContext* dc) { DrawIcon(dc, source.get(), { 0, 0, size, size }); });
 }
@@ -270,18 +296,19 @@ IDWriteFactory* Snapshot::Text()
     return m_dwrite.get();
 }
 
-wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h)
+wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h, float displayWidth)
 {
     // Only the top 3:2 part of a card is visible in the sidebar; center the content there.
-    float pw = 320.f, ph = pw * h / w;
+    float pw = std::round(displayWidth), ph = std::round(pw * h / w);
+    float u = pw / 320.f;                           // layout below was designed at 320px wide
     float visible = std::min(ph, pw / 1.5f);
-    auto source = IconSource(m_wic.get(), hwnd, 64);
+    auto source = IconSource(m_wic.get(), hwnd, 256);
 
     wchar_t title[128]{};
     GetWindowTextW(hwnd, title, ARRAYSIZE(title));
     winrt::com_ptr<IDWriteTextFormat> format;
     Text()->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 17.f, L"ko-kr", format.put());
+        DWRITE_FONT_STRETCH_NORMAL, 17.f * u, L"ko-kr", format.put());
     format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     DWRITE_TRIMMING trim{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
@@ -293,10 +320,14 @@ wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h
         winrt::com_ptr<ID2D1SolidColorBrush> fill, ink;
         dc->CreateSolidColorBrush(D2D1::ColorF(0.17f, 0.17f, 0.19f), fill.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.72f), ink.put());
+        // Grayscale text: the card is tilted and warped by perspective, which turns ClearType's
+        // colored subpixel edges into visible fringes.
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         dc->FillRectangle({ 0, 0, pw, ph }, fill.get());
-        float cy = visible / 2.f - 12.f;
-        DrawIcon(dc, source.get(), { pw / 2 - 32, cy - 32, pw / 2 + 32, cy + 32 });
-        dc->DrawTextW(title, static_cast<UINT32>(wcslen(title)), format.get(), { 20, cy + 44, pw - 20, cy + 70 }, ink.get());
+        float cy = std::round(visible / 2.f - 12.f * u), half = std::round(32.f * u);
+        DrawIcon(dc, source.get(), { pw / 2 - half, cy - half, pw / 2 + half, cy + half });
+        dc->DrawTextW(title, static_cast<UINT32>(wcslen(title)), format.get(),
+            { 20 * u, cy + 44 * u, pw - 20 * u, cy + 70 * u }, ink.get());
     });
 }
 

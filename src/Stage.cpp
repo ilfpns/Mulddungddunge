@@ -729,8 +729,8 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     c->h = static_cast<float>(std::max(1L, c->frame.bottom - c->frame.top));
     c->snapshot = m_compositor.CreateSurfaceBrush();
     c->snapshot.Stretch(wuc::CompositionStretch::Fill);
-    c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(S(kBadge) * 1.5f)));
-    c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h));
+    c->icon = m_compositor.CreateSurfaceBrush(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
+    c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, S(kThumbW) * c->w / CropFor(*c, true).size.x));
     c->hasPicture = true;
     return c;
 }
@@ -924,7 +924,7 @@ void Stage::Relayout(bool animate)
         if (!c.hasPicture)
         {
             // Back in view after its picture was released.
-            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h));
+            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, S(kThumbW) * c.w / CropFor(c, true).size.x));
             c.hasPicture = true;
             if (c.side.holder)
                 ApplySize(c.side, c);

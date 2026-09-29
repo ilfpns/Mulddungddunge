@@ -17,7 +17,8 @@ public:
     wuc::CompositionDrawingSurface Icon(HWND hwnd, int px);
     // Stand-in for a window we could not photograph (it was minimized): app icon and title on a dark
     // card, with the same aspect ratio as the window.
-    wuc::CompositionDrawingSurface Placeholder(HWND hwnd, float w, float h);
+    // `displayWidth` is the card's on-screen width in pixels, so it is drawn 1:1 and stays crisp.
+    wuc::CompositionDrawingSurface Placeholder(HWND hwnd, float w, float h, float displayWidth);
     IDWriteFactory* Text();                         // created on first use
     // A transparent surface of the given size, drawn once by `draw`.
     wuc::CompositionDrawingSurface Paint(float w, float h, std::function<void(ID2D1DeviceContext*)> const& draw);
