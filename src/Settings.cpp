@@ -146,10 +146,21 @@ void Stage::OpenSettings()
     fill.Brush(m_compositor.CreateColorBrush({ 250, 32, 32, 36 }));
     fill.Clip(rounded({ w - 2.f, h - 2.f }, S(14) - 1.f));
     panel.Children().InsertAtTop(fill);
+    auto layer = [&] {
+        auto v = m_compositor.CreateContainerVisual();
+        v.Size({ w, h });
+        panel.Children().InsertAtTop(v);
+        return v;
+    };
+    m_settings.under = layer();
+    m_settings.listUnder = layer();
     auto content = m_compositor.CreateSpriteVisual();
     content.Size({ w, h });
     content.Brush(m_compositor.CreateSurfaceBrush(m_settings.surface));
     panel.Children().InsertAtTop(content);
+    m_settings.over = layer();
+    m_settings.listOver = layer();
+    SyncSettingsVisuals();                          // the first paint ran before the layers existed
     m_settings.root.Children().InsertAtTop(panel);
     m_root.Children().InsertAtTop(m_settings.root);
 
@@ -240,11 +251,14 @@ void Stage::PaintSettings()
     if (!m.open || !m.surface)
         return;
     m.hits.clear();
+    m.toggleDescs.clear();
+    m.choiceDescs.clear();
+    m.listRect = {};
     float w = m.size.x, h = m.size.y;
     float x0 = S(kNavW + 20), x1 = w - S(28);       // content columns
 
     m_snap.Repaint(m.surface, [&](ID2D1DeviceContext* dc) {
-        winrt::com_ptr<ID2D1SolidColorBrush> ink, dim, faint, line, hover, control, selected, accent, dark;
+        winrt::com_ptr<ID2D1SolidColorBrush> ink, dim, faint, line, hover, control, selected, gold;
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.95f), ink.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.58f), dim.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.36f), faint.put());
@@ -252,8 +266,7 @@ void Stage::PaintSettings()
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.07f), hover.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.06f), control.put());
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.17f), selected.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.76f, 1.f), accent.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(0.07f, 0.07f, 0.09f), dark.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 0.87f, 0.58f), gold.put());       // text on gold marks
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
         auto text = [&](std::wstring const& s, D2D1_RECT_F r, IDWriteTextFormat* f, ID2D1Brush* b) {
@@ -280,13 +293,10 @@ void Stage::PaintSettings()
             D2D1_RECT_F r{ S(12), S(78) + S(44) * i, S(kNavW), S(78) + S(44) * i + S(38) };
             bool on = hit(r, HitTab, i);
             if (i == m.tab)
-            {
-                round(r, S(7), selected.get());
-                round({ r.left, r.top + S(10), r.left + S(3), r.bottom - S(10) }, S(1.5f), accent.get());
-            }
+                m.navRect = r;                      // the sliding marker sits here
             else if (on)
                 round(r, S(7), hover.get());
-            text(kTabGlyphs[i], { r.left + S(8), r.top, r.left + S(36), r.bottom }, m.icon.get(), i == m.tab ? ink.get() : dim.get());
+            text(kTabGlyphs[i], { r.left + S(8), r.top, r.left + S(36), r.bottom }, m.icon.get(), i == m.tab ? gold.get() : dim.get());
             text(kTabs[i], { r.left + S(44), r.top, r.right - S(8), r.bottom }, m.body.get(), i == m.tab ? ink.get() : dim.get());
         }
         dc->FillRectangle({ S(kNavW + 8), S(78), S(kNavW + 9), h - S(20) }, line.get());
@@ -302,22 +312,12 @@ void Stage::PaintSettings()
             y += S(kRowH);
             return cy;
         };
+        // Switches are composition visuals (see SyncSettingsVisuals); only their place is recorded here.
+        auto toggleRect = [&](float cy) { return D2D1_RECT_F{ x1 - S(46), cy - S(12), x1, cy + S(12) }; };
         auto toggle = [&](float cy, bool on, int what) {
-            D2D1_RECT_F r{ x1 - S(44), cy - S(11), x1, cy + S(11) };
+            D2D1_RECT_F r = toggleRect(cy);
             bool over = hit({ r.left - S(10), cy - S(18), x1 + S(4), cy + S(18) }, HitToggle, what);
-            if (on)
-            {
-                round(r, S(11), accent.get());
-                if (over)
-                    round(r, S(11), hover.get());
-                dc->FillEllipse({ { r.right - S(11), cy }, S(6.5f), S(6.5f) }, dark.get());
-            }
-            else
-            {
-                round(r, S(11), over ? selected.get() : control.get());
-                dc->DrawRoundedRectangle(D2D1::RoundedRect({ r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f }, S(11), S(11)), dim.get(), 1.f);
-                dc->FillEllipse({ { r.left + S(11), cy }, S(5.5f), S(5.5f) }, dim.get());
-            }
+            m.toggleDescs.push_back({ what, r, on, over, false });
         };
         auto choice = [&](float cy, std::vector<std::wstring> const& options, int current, int what, float segW) {
             float total = segW * options.size(), left = x1 - total;
@@ -327,10 +327,10 @@ void Stage::PaintSettings()
                 D2D1_RECT_F r{ left + segW * i + S(3), cy - S(13), left + segW * (i + 1) - S(3), cy + S(13) };
                 bool over = hit(r, HitChoice, what * 16 + static_cast<int>(i));
                 if (static_cast<int>(i) == current)
-                    round(r, S(6), selected.get());
+                    m.choiceDescs.push_back({ what, r });   // the sliding gold pill sits here
                 else if (over)
                     round(r, S(6), hover.get());
-                text(options[i], r, m.value.get(), static_cast<int>(i) == current ? ink.get() : dim.get());
+                text(options[i], r, m.value.get(), static_cast<int>(i) == current ? gold.get() : dim.get());
             }
         };
         auto stepper = [&](float cy, std::wstring const& value, int what, bool canDown, bool canUp) {
@@ -412,7 +412,8 @@ void Stage::PaintSettings()
             m.scroll = std::clamp(m.scroll, 0.f, m.scrollMax);
             if (count == 0)
                 text(apps ? L"열려 있는 앱이 없습니다." : L"고정한 탭이 없습니다.", { x0, top + S(8), x1, top + S(40) }, m.body.get(), dim.get());
-            dc->PushAxisAlignedClip({ x0 - S(8), top, x1 + S(8), bottom }, D2D1_ANTIALIAS_MODE_ALIASED);
+            m.listRect = { x0 - S(8), top, x1 + S(8), bottom };
+            dc->PushAxisAlignedClip(m.listRect, D2D1_ANTIALIAS_MODE_ALIASED);
             for (size_t i = 0; i < count; ++i)
             {
                 float ry = top + S(kListRowH) * i - m.scroll;
@@ -432,12 +433,11 @@ void Stage::PaintSettings()
                         text(L"\xE71D", iconRect, m.icon.get(), dim.get());
                     text(a.label, { x0 + S(42), cy - S(12), x1 - S(70), cy + S(12) }, m.body.get(), ink.get());
                     bool shown = std::none_of(m_cfg.excluded.begin(), m_cfg.excluded.end(), [&](auto& e) { return _wcsicmp(e.c_str(), a.id.c_str()) == 0; });
-                    // Toggle drawn in place; only fully visible rows take clicks.
-                    size_t before = m.hits.size();
-                    toggle(cy, shown, 0);
-                    m.hits.resize(before);
+                    // Only fully visible rows take clicks.
+                    bool over = visible && m.hover == HitApp && m.hoverArg == static_cast<int>(i);
                     if (visible)
-                        m.hits.push_back({ { x1 - S(54), cy - S(18), x1 + S(4), cy + S(18) }, HitApp, static_cast<int>(i) });
+                        m.hits.push_back({ { x1 - S(56), cy - S(18), x1 + S(4), cy + S(18) }, HitApp, static_cast<int>(i) });
+                    m.toggleDescs.push_back({ 1000 + static_cast<int>(i), toggleRect(cy), shown, over, true });
                 }
                 else
                 {
@@ -500,6 +500,222 @@ void Stage::PaintSettings()
         }
         }
     });
+    SyncSettingsVisuals();
+}
+
+// Champagne gold, lit from the top left.
+wuc::CompositionLinearGradientBrush Stage::GoldBrush()
+{
+    auto brush = m_compositor.CreateLinearGradientBrush();
+    brush.StartPoint({ 0.f, 0.f });
+    brush.EndPoint({ 1.f, 1.f });
+    brush.ColorStops().Append(m_compositor.CreateColorGradientStop(0.f, { 255, 255, 226, 140 }));
+    brush.ColorStops().Append(m_compositor.CreateColorGradientStop(0.5f, { 255, 244, 196, 86 }));
+    brush.ColorStops().Append(m_compositor.CreateColorGradientStop(1.f, { 255, 222, 156, 52 }));
+    return brush;
+}
+
+void Stage::SyncSettingsVisuals()
+{
+    auto& m = m_settings;
+    if (!m.open || !m.under)
+        return;
+    using ms = std::chrono::milliseconds;
+    // A little overshoot: things land with a soft bounce.
+    auto spring = m_compositor.CreateCubicBezierEasingFunction({ 0.34f, 1.45f }, { 0.64f, 1.f });
+    auto glide = m_compositor.CreateCubicBezierEasingFunction({ 0.3f, 1.22f }, { 0.5f, 1.f });
+    auto rounded = [&](float2 size, float radius) {
+        auto g = m_compositor.CreateRoundedRectangleGeometry();
+        g.Size(size);
+        g.CornerRadius({ radius, radius });
+        return m_compositor.CreateGeometricClip(g);
+    };
+    auto move = [&](auto const& visual, float3 to, int length, wuc::CompositionEasingFunction const& ease) {
+        auto a = m_compositor.CreateVector3KeyFrameAnimation();
+        a.InsertKeyFrame(1.f, to, ease);
+        a.Duration(ms(m_cfg.Ms(length)));
+        visual.StartAnimation(L"Offset", a);
+    };
+    auto scalar = [&](auto const& target, wchar_t const* prop, float to, int length) {
+        auto a = m_compositor.CreateScalarKeyFrameAnimation();
+        a.InsertKeyFrame(1.f, to, m_ease);
+        a.Duration(ms(m_cfg.Ms(length)));
+        target.StartAnimation(prop, a);
+    };
+    auto height = [](D2D1_RECT_F const& r) { return r.bottom - r.top; };
+
+    // Selected tab: a soft pill and a gold bar that glide to the new tab.
+    float3 navAt{ m.navRect.left, m.navRect.top, 0.f };
+    float3 barAt{ m.navRect.left, m.navRect.top + S(10), 0.f };
+    if (!m.navPill)
+    {
+        float2 size{ m.navRect.right - m.navRect.left, height(m.navRect) };
+        m.navPill = m_compositor.CreateSpriteVisual();
+        m.navPill.Size(size);
+        m.navPill.Brush(m_compositor.CreateColorBrush({ 30, 255, 255, 255 }));
+        m.navPill.Clip(rounded(size, S(8)));
+        m.navPill.Offset(navAt);
+        m.under.Children().InsertAtBottom(m.navPill);
+        m.navBar = m_compositor.CreateSpriteVisual();
+        m.navBar.Size({ S(3), size.y - S(20) });
+        m.navBar.Brush(GoldBrush());
+        m.navBar.Clip(rounded({ S(3), size.y - S(20) }, S(1.5f)));
+        m.navBar.CenterPoint({ S(1.5f), (size.y - S(20)) / 2.f, 0.f });
+        m.navBar.Offset(barAt);
+        m.under.Children().InsertAtTop(m.navBar);
+    }
+    else if (m.navPill.Offset().y != navAt.y)
+    {
+        move(m.navPill, navAt, 320, glide);
+        move(m.navBar, barAt, 380, spring);
+        // The bar stretches while it travels.
+        auto stretch = m_compositor.CreateVector3KeyFrameAnimation();
+        stretch.InsertKeyFrame(0.45f, { 1.f, 1.9f, 1.f });
+        stretch.InsertKeyFrame(1.f, { 1.f, 1.f, 1.f }, m_ease);
+        stretch.Duration(ms(m_cfg.Ms(380)));
+        m.navBar.StartAnimation(L"Scale", stretch);
+    }
+
+    // A new page brings its own switches and choices: built fresh, without animation.
+    if (m.builtTab != m.tab)
+    {
+        m.builtTab = m.tab;
+        for (auto& t : m.toggles)
+        {
+            auto from = t.list ? m.listUnder : m.under;
+            from.Children().Remove(t.track);
+            from.Children().Remove(t.gold);
+            (t.list ? m.listOver : m.over).Children().Remove(t.knob);
+        }
+        for (auto& c : m.choices)
+            m.under.Children().Remove(c.pill);
+        m.toggles.clear();
+        m.choices.clear();
+        float w = m.size.x, h = m.size.y;
+        auto clip = m_compositor.CreateInsetClip(m.listRect.left, m.listRect.top,
+            std::max(0.f, w - m.listRect.right), std::max(0.f, h - m.listRect.bottom));
+        m.listUnder.Clip(clip);
+        m.listOver.Clip(clip);
+    }
+
+    // Switches: a gold track fades in, the knob springs across (stretching on the way) and darkens.
+    winrt::Windows::UI::Color knobOn{ 255, 38, 30, 16 }, knobOff{ 255, 236, 236, 240 };
+    auto knobAt = [&](D2D1_RECT_F const& r, bool on) {
+        float k = height(r) - S(6);
+        return float3{ on ? r.right - S(3) - k : r.left + S(3), r.top + S(3), 0.f };
+    };
+    std::vector<int> keep;
+    for (auto const& d : m.toggleDescs)
+    {
+        keep.push_back(d.key);
+        float2 size{ d.rect.right - d.rect.left, height(d.rect) };
+        float k = size.y - S(6);
+        auto it = std::find_if(m.toggles.begin(), m.toggles.end(), [&](auto& t) { return t.key == d.key; });
+        if (it == m.toggles.end())
+        {
+            ToggleVis t;
+            t.key = d.key;
+            t.on = d.on;
+            t.hover = d.hover;
+            t.list = d.list;
+            t.track = m_compositor.CreateSpriteVisual();
+            t.track.Size(size);
+            t.track.Brush(m_compositor.CreateColorBrush({ 255, 62, 62, 68 }));
+            t.track.Clip(rounded(size, size.y / 2.f));
+            t.gold = m_compositor.CreateSpriteVisual();
+            t.gold.Size(size);
+            t.gold.Brush(GoldBrush());
+            t.gold.Clip(rounded(size, size.y / 2.f));
+            t.gold.CenterPoint({ size.x / 2.f, size.y / 2.f, 0.f });
+            t.gold.Opacity(d.on ? 1.f : 0.f);
+            t.knob = m_compositor.CreateSpriteVisual();
+            t.knob.Size({ k, k });
+            t.knobBrush = m_compositor.CreateColorBrush(d.on ? knobOn : knobOff);
+            t.knob.Brush(t.knobBrush);
+            auto circle = m_compositor.CreateEllipseGeometry();
+            circle.Center({ k / 2.f, k / 2.f });
+            circle.Radius({ k / 2.f, k / 2.f });
+            t.knob.Clip(m_compositor.CreateGeometricClip(circle));
+            t.knob.CenterPoint({ k / 2.f, k / 2.f, 0.f });
+            t.knob.Scale(d.hover ? float3{ 1.12f, 1.12f, 1.f } : float3{ 1.f, 1.f, 1.f });
+            auto under = d.list ? m.listUnder : m.under;
+            under.Children().InsertAtTop(t.track);
+            under.Children().InsertAtTop(t.gold);
+            (d.list ? m.listOver : m.over).Children().InsertAtTop(t.knob);
+            it = m.toggles.insert(m.toggles.end(), t);
+        }
+        auto& t = *it;
+        // Follows its row (list scrolling) without animating.
+        t.track.Offset({ d.rect.left, d.rect.top, 0.f });
+        t.gold.Offset({ d.rect.left, d.rect.top, 0.f });
+        if (t.on != d.on)
+        {
+            t.on = d.on;
+            move(t.knob, knobAt(d.rect, d.on), 360, spring);
+            auto squash = m_compositor.CreateVector3KeyFrameAnimation();
+            squash.InsertKeyFrame(0.35f, { 1.32f, 0.84f, 1.f });
+            squash.InsertKeyFrame(1.f, d.hover ? float3{ 1.12f, 1.12f, 1.f } : float3{ 1.f, 1.f, 1.f }, m_ease);
+            squash.Duration(ms(m_cfg.Ms(360)));
+            t.knob.StartAnimation(L"Scale", squash);
+            auto color = m_compositor.CreateColorKeyFrameAnimation();
+            color.InsertKeyFrame(1.f, d.on ? knobOn : knobOff, m_ease);
+            color.Duration(ms(m_cfg.Ms(240)));
+            t.knobBrush.StartAnimation(L"Color", color);
+            scalar(t.gold, L"Opacity", d.on ? 1.f : 0.f, 240);
+            auto swell = m_compositor.CreateVector3KeyFrameAnimation();
+            swell.InsertKeyFrame(0.f, d.on ? float3{ 0.86f, 0.86f, 1.f } : float3{ 1.f, 1.f, 1.f });
+            swell.InsertKeyFrame(1.f, { 1.f, 1.f, 1.f }, spring);
+            swell.Duration(ms(m_cfg.Ms(320)));
+            t.gold.StartAnimation(L"Scale", swell);
+        }
+        else
+            t.knob.Offset(knobAt(d.rect, d.on));
+        if (t.hover != d.hover)
+        {
+            t.hover = d.hover;
+            auto grow = m_compositor.CreateVector3KeyFrameAnimation();
+            grow.InsertKeyFrame(1.f, d.hover ? float3{ 1.12f, 1.12f, 1.f } : float3{ 1.f, 1.f, 1.f }, m_ease);
+            grow.Duration(ms(m_cfg.Ms(160)));
+            t.knob.StartAnimation(L"Scale", grow);
+        }
+    }
+    // Rows that left the list.
+    std::erase_if(m.toggles, [&](ToggleVis& t) {
+        if (std::find(keep.begin(), keep.end(), t.key) != keep.end())
+            return false;
+        auto under = t.list ? m.listUnder : m.under;
+        under.Children().Remove(t.track);
+        under.Children().Remove(t.gold);
+        (t.list ? m.listOver : m.over).Children().Remove(t.knob);
+        return true;
+    });
+
+    // Choices: a gold-tinted pill glides to the picked option.
+    for (auto const& d : m.choiceDescs)
+    {
+        float2 size{ d.rect.right - d.rect.left, height(d.rect) };
+        auto it = std::find_if(m.choices.begin(), m.choices.end(), [&](auto& c) { return c.what == d.what; });
+        if (it == m.choices.end())
+        {
+            ChoiceVis c;
+            c.what = d.what;
+            c.rect = d.rect;
+            c.pill = m_compositor.CreateSpriteVisual();
+            c.pill.Size(size);
+            c.pill.Brush(GoldBrush());
+            c.pill.Opacity(0.24f);
+            c.pill.Clip(rounded(size, S(6)));
+            c.pill.Offset({ d.rect.left, d.rect.top, 0.f });
+            m.under.Children().InsertAtTop(c.pill);
+            m.choices.push_back(c);
+            continue;
+        }
+        if (it->rect.left != d.rect.left || it->rect.top != d.rect.top)
+        {
+            it->rect = d.rect;
+            move(it->pill, { d.rect.left, d.rect.top, 0.f }, 340, glide);
+        }
+    }
 }
 
 void Stage::SettingsMove(POINT pt)

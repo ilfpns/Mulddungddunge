@@ -92,6 +92,8 @@ private:
     void CloseSettings();
     bool InSettingsPanel(POINT viewPt) const;
     void PaintSettings();
+    void SyncSettingsVisuals();                     // switches, choices, tab marker follow the last paint
+    wuc::CompositionLinearGradientBrush GoldBrush();
     void SettingsMove(POINT viewPt);
     void SettingsClick(POINT viewPt);
     void SettingsWheel(int delta);
@@ -290,11 +292,46 @@ private:
         std::wstring id, label;
         HWND hwnd{};                                // one of its windows, for the icon (null: none open)
     };
+    // Switches, the selected option of a choice and the selected tab are composition visuals over the
+    // drawn panel, so their movement is animated by DWM instead of redrawing frames ourselves.
+    struct ToggleDesc
+    {
+        int key;                                    // what it sets (list rows: 1000 + row)
+        D2D1_RECT_F rect;                           // track, panel coordinates
+        bool on, hover, list;
+    };
+    struct ChoiceDesc
+    {
+        int what;
+        D2D1_RECT_F rect;                           // the selected option
+    };
+    struct ToggleVis
+    {
+        int key = 0;
+        bool on = false, hover = false, list = false;
+        wuc::SpriteVisual track{ nullptr }, gold{ nullptr }, knob{ nullptr };
+        wuc::CompositionColorBrush knobBrush{ nullptr };
+    };
+    struct ChoiceVis
+    {
+        int what = 0;
+        D2D1_RECT_F rect{};
+        wuc::SpriteVisual pill{ nullptr };
+    };
     struct SettingsModal
     {
         bool open = false;
         wuc::ContainerVisual root{ nullptr };
         wuc::CompositionDrawingSurface surface{ nullptr };
+        // Layers: under the drawn text (tracks, pills), over it (knobs); list rows get clipped copies.
+        wuc::ContainerVisual under{ nullptr }, over{ nullptr }, listUnder{ nullptr }, listOver{ nullptr };
+        wuc::SpriteVisual navPill{ nullptr }, navBar{ nullptr };
+        D2D1_RECT_F navRect{}, listRect{};
+        int builtTab = -1;                          // the tab the switch/choice visuals belong to
+        std::vector<ToggleDesc> toggleDescs;        // what the last paint laid out
+        std::vector<ChoiceDesc> choiceDescs;
+        std::vector<ToggleVis> toggles;
+        std::vector<ChoiceVis> choices;
         float2 origin{}, size{};                    // panel, monitor coordinates
         int tab = 0;
         int hover = -1, hoverArg = 0;               // the control under the pointer (Hit id, arg)
