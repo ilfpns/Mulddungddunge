@@ -13,6 +13,9 @@ public:
     // Returns immediately (a capture session takes ~100ms to start); `done` runs later on this thread,
     // with nullptr on failure or timeout.
     void CaptureAsync(HWND hwnd, RECT const& frame, Done done);
+    // A minimized window draws nothing, but DWM still has its last picture (what taskbar previews show).
+    // Shows that picture in a hidden helper window through a DWM thumbnail and photographs the helper.
+    void CaptureMinimized(HWND hwnd, Done done);
     // The window's app icon rendered at `px` x `px`.
     wuc::CompositionDrawingSurface Icon(HWND hwnd, int px);
     // Stand-in for a window we could not photograph (it was minimized): app icon and title on a dark

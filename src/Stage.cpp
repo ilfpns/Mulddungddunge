@@ -774,7 +774,14 @@ void Stage::Adopt(HWND hwnd)
     auto card = MakeCard(hwnd);
     m_cards.push_back(card);
     if (IsIconic(hwnd))
+    {
+        m_snap.CaptureMinimized(hwnd, [this, card](auto const& surface) {
+            Trace(surface ? L"minimized window photographed via DWM" : L"minimized window: no DWM picture", card->hwnd);
+            if (surface)
+                SetSnapshot(*card, card->frame, surface);
+        });
         return;
+    }
     RECT frame = wt::FrameRect(hwnd);
     m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
         SetSnapshot(*card, frame, surface);
@@ -841,7 +848,7 @@ void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurfa
 {
     if (!surface)
         return;
-    if (!IsZoomed(c.hwnd))
+    if (!IsZoomed(c.hwnd) && !IsIconic(c.hwnd))
     {
         RECT wr;
         GetWindowRect(c.hwnd, &wr);

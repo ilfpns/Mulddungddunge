@@ -322,3 +322,57 @@ wuc::CompositionDrawingSurface Snapshot::Paint(float w, float h, std::function<v
     Draw(surface, draw);
     return surface;
 }
+
+void Snapshot::CaptureMinimized(HWND hwnd, Done done)
+{
+    static ATOM hostClass = [] {
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"StageManagerThumbnailHost";
+        wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+        return RegisterClassExW(&wc);
+    }();
+    auto queue = winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
+    auto fail = [queue, done] { queue.TryEnqueue([done] { done(nullptr); }); };
+    if (!hostClass)
+        return fail();
+
+    HWND host = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"StageManagerThumbnailHost",
+        L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HTHUMBNAIL thumb = nullptr;
+    SIZE size{};
+    if (!host || FAILED(DwmRegisterThumbnail(host, hwnd, &thumb)) || FAILED(DwmQueryThumbnailSourceSize(thumb, &size)) ||
+        size.cx < 32 || size.cy < 32)
+    {
+        if (thumb)
+            DwmUnregisterThumbnail(thumb);
+        if (host)
+            DestroyWindow(host);
+        return fail();
+    }
+    size.cx = std::min<LONG>(size.cx, 3840);
+    size.cy = std::min<LONG>(size.cy, 2400);
+
+    // Parked just outside the visible desktop: never seen, but still composed by DWM for the capture.
+    int x = GetSystemMetrics(SM_XVIRTUALSCREEN) - size.cx - 64;
+    int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    SetWindowPos(host, HWND_BOTTOM, x, y, size.cx, size.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    DWM_THUMBNAIL_PROPERTIES props{};
+    props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+    props.rcDestination = { 0, 0, size.cx, size.cy };
+    props.fVisible = TRUE;
+    props.opacity = 255;
+    props.fSourceClientAreaOnly = FALSE;
+    DwmUpdateThumbnailProperties(thumb, &props);
+    DwmFlush();
+
+    RECT frame;
+    GetWindowRect(host, &frame);
+    CaptureAsync(host, frame, [host, thumb, done](wuc::CompositionDrawingSurface const& surface) {
+        DwmUnregisterThumbnail(thumb);
+        DestroyWindow(host);
+        done(surface);
+    });
+}
