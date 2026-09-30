@@ -15,19 +15,33 @@ namespace
     constexpr UINT ID_AUTOSTART = 5;
     constexpr UINT ID_QUIT = 7;
     constexpr UINT ID_MOVE = 20;              // 20..28: send to desktop 1..9
-    wchar_t const* const kMoveLabels[] = {
-        L"데스크톱 1로 보내기", L"데스크톱 2로 보내기", L"데스크톱 3으로 보내기", L"데스크톱 4로 보내기",
-        L"데스크톱 5로 보내기", L"데스크톱 6으로 보내기", L"데스크톱 7로 보내기", L"데스크톱 8로 보내기",
-        L"데스크톱 9로 보내기",
-    };
+    constexpr size_t kMaxMoveTargets = 9;
+
+    // "<name>로 보내기" / "<name>으로 보내기": 으로 after a final consonant other than ㄹ (and after the
+    // digits read that way: 3 삼, 6 육, 0 영).
+    std::wstring SendLabel(std::wstring const& name)
+    {
+        wchar_t last = name.empty() ? L'1' : name.back();
+        bool euro = false;
+        if (last >= 0xAC00 && last <= 0xD7A3)
+        {
+            int final = (last - 0xAC00) % 28;
+            euro = final != 0 && final != 8;
+        }
+        else if (last == L'3' || last == L'6' || last == L'0')
+            euro = true;
+        return name + (euro ? L"으로 보내기" : L"로 보내기");
+    }
     constexpr float kAlertDot = 9.f;
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValue[] = L"StageManager";
     constexpr wchar_t kStateKey[] = L"Software\\StageManager";
 
     // Card menu metrics (at 96 dpi).
-    constexpr float kMenuW = 176.f;
+    constexpr float kMenuW = 200.f;
     constexpr float kMenuItemH = 34.f;
+    constexpr float kMenuSepH = 9.f;        // a separator line's row
+    constexpr float kMenuIcon = 24.f;
     constexpr float kMenuPad = 5.f;
     constexpr float kMenuRadius = 10.f;
     constexpr int kHotkeyBase = 100;     // hotkey ids 100..103 = Alt+1..4
@@ -149,6 +163,7 @@ namespace
     constexpr float kTraceTail = 0.42f;     // trail length, as a fraction of the path (half the outline)
     constexpr int kTraceHeadMs = 800;       // the head from the top edge's middle to the bottom edge's middle
     constexpr float kTraceWidth = 1.f;      // px: a hairline
+    constexpr int kAlertCycleMs = 2600;     // attention loop: one run, then a rest (DWM idles meanwhile)
 
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
     {
@@ -427,13 +442,28 @@ void Stage::OpenCardMenu(int index, int anchorY)
         };
         if (wt::QuitTarget(card->hwnd))
             m_menu.items.push_back(MenuItem{ ID_QUIT, L"\xE7E8", L"앱 종료" });
+        // The window's own actions, then where to send it, then settings, each group set apart.
+        m_menu.items.push_back(MenuItem{ 0, nullptr, nullptr });
         m_menuDesktops = vd::Desktops();            // empty where the move isn't supported
-        for (size_t d = 0; d < m_menuDesktops.size() && d < ARRAYSIZE(kMoveLabels); ++d)
-            if (m_menuDesktops[d] != m_desktopId && m_menuDesktops.size() > 1)
-                m_menu.items.push_back(MenuItem{ ID_MOVE + static_cast<UINT>(d), L"\xE8A7", kMoveLabels[d] });
+        if (m_menuDesktops.size() > 1)
+        {
+            // Named as in Task View: the name given to it, else "데스크톱 N".
+            auto names = vd::Names();
+            m_menu.labels.reserve(kMaxMoveTargets);     // the items point into these strings
+            for (size_t d = 0; d < m_menuDesktops.size() && d < kMaxMoveTargets; ++d)
+            {
+                if (m_menuDesktops[d] == m_desktopId)
+                    continue;
+                std::wstring name = d < names.size() && !names[d].empty() ? names[d] : L"데스크톱 " + std::to_wstring(d + 1);
+                m_menu.labels.push_back(SendLabel(name));
+                m_menu.items.push_back(MenuItem{ ID_MOVE + static_cast<UINT>(d), L"\xE8A7", m_menu.labels.back().c_str() });
+            }
+        }
+        if (m_menu.items.back().command != 0)
+            m_menu.items.push_back(MenuItem{ 0, nullptr, nullptr });
     }
     m_menu.items.push_back(MenuItem{ ID_SETTINGS, L"\xE713", L"설정" });
-    float w = S(kMenuW), h = S(kMenuPad) * 2 + S(kMenuItemH) * m_menu.items.size();
+    float w = S(kMenuW), h = MenuTop(m_menu.items.size()) + S(kMenuPad);
 
     auto dwrite = m_snap.Text();
     winrt::com_ptr<IDWriteTextFormat> text, icon;
@@ -445,21 +475,65 @@ void Stage::OpenCardMenu(int index, int anchorY)
             DWRITE_FONT_STRETCH_NORMAL, S(14.f), L"", icon.put());
     for (auto* f : { text.get(), icon.get() })
         f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    // One line per item: a label too long for the panel ends in an ellipsis instead of wrapping.
+    text->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    DWRITE_TRIMMING trim{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+    winrt::com_ptr<IDWriteInlineObject> ellipsis;
+    if (SUCCEEDED(dwrite->CreateEllipsisTrimmingSign(text.get(), ellipsis.put())))
+        text->SetTrimming(&trim, ellipsis.get());
 
     auto labels = m_snap.Paint(w, h, [&](ID2D1DeviceContext* dc) {
-        winrt::com_ptr<ID2D1SolidColorBrush> ink, dim;
+        winrt::com_ptr<ID2D1SolidColorBrush> ink, line;
         dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.94f), ink.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.72f), dim.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.13f), line.put());
         for (size_t i = 0; i < m_menu.items.size(); ++i)
         {
             auto& item = m_menu.items[i];
-            float top = S(kMenuPad) + S(kMenuItemH) * i;
-            D2D1_RECT_F iconRect{ S(14), top, S(40), top + S(kMenuItemH) };
-            D2D1_RECT_F textRect{ S(42), top, w - S(10), top + S(kMenuItemH) };
-            dc->DrawTextW(item.glyph, 1, icon.get(), iconRect, dim.get());
+            float top = MenuTop(i), bottom = top + MenuItemH(i);
+            if (!item.command)
+            {
+                float mid = std::round((top + bottom) / 2.f);
+                dc->FillRectangle({ S(12), mid, w - S(12), mid + 1.f }, line.get());
+                continue;
+            }
+            D2D1_RECT_F textRect{ S(42), top, w - S(10), bottom };
             dc->DrawTextW(item.label, static_cast<UINT32>(wcslen(item.label)), text.get(), textRect, ink.get());
         }
     });
+    // Each icon on its own visual, so hovering its row can move it.
+    icon->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    float iconSize = std::round(S(kMenuIcon));
+    for (size_t i = 0; i < m_menu.items.size(); ++i)
+    {
+        auto& item = m_menu.items[i];
+        if (!item.command)
+        {
+            m_menu.icons.push_back(nullptr);
+            m_menu.tints.push_back(nullptr);
+            m_menu.iconAt.push_back({});
+            continue;
+        }
+        auto glyph = m_snap.Paint(iconSize, iconSize, [&](ID2D1DeviceContext* dc) {
+            winrt::com_ptr<ID2D1SolidColorBrush> white;
+            dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f), white.put());
+            dc->DrawTextW(item.glyph, 1, icon.get(), { 0, 0, iconSize, iconSize }, white.get());
+        });
+        // The glyph masks a color brush, so hovering can change its color.
+        auto tint = m_compositor.CreateColorBrush({ 255, 255, 255, 255 });
+        auto mask = m_compositor.CreateMaskBrush();
+        mask.Source(tint);
+        mask.Mask(m_compositor.CreateSurfaceBrush(glyph));
+        auto sprite = m_compositor.CreateSpriteVisual();
+        sprite.Size({ iconSize, iconSize });
+        sprite.Brush(mask);
+        m_menu.tints.push_back(tint);
+        sprite.CenterPoint({ iconSize / 2.f, iconSize / 2.f, 0.f });
+        sprite.Opacity(0.72f);
+        float3 at{ S(27) - iconSize / 2.f, MenuTop(i) + MenuItemH(i) / 2.f - iconSize / 2.f, 0.f };
+        sprite.Offset(at);
+        m_menu.icons.push_back(sprite);
+        m_menu.iconAt.push_back(at);
+    }
 
     auto rounded = [&](float2 size, float radius) {
         auto g = m_compositor.CreateRoundedRectangleGeometry();
@@ -504,6 +578,9 @@ void Stage::OpenCardMenu(int index, int anchorY)
     text2.Size({ w, h });
     text2.Brush(m_compositor.CreateSurfaceBrush(labels));
     m_menu.root.Children().InsertAtTop(text2);
+    for (auto& i : m_menu.icons)
+        if (i)
+            m_menu.root.Children().InsertAtTop(i);
 
     // Next to the card, kept on screen.
     float2 cardCenter{ 0.f, card ? SideToAnim(SlotCenter(index)).y : static_cast<float>(anchorY) };
@@ -550,13 +627,96 @@ void Stage::CloseCardMenu()
     });
 }
 
+float Stage::MenuItemH(size_t item) const
+{
+    return m_menu.items[item].command ? S(kMenuItemH) : S(kMenuSepH);
+}
+
+float Stage::MenuTop(size_t item) const
+{
+    float y = S(kMenuPad);
+    for (size_t i = 0; i < item && i < m_menu.items.size(); ++i)
+        y += MenuItemH(i);
+    return y;
+}
+
 int Stage::MenuItemAt(POINT viewPt) const
 {
-    float x = viewPt.x - m_menu.origin.x, y = viewPt.y - m_menu.origin.y - S(kMenuPad);
-    if (x < 0 || x > S(kMenuW) || y < 0)
+    float x = viewPt.x - m_menu.origin.x, y = viewPt.y - m_menu.origin.y;
+    if (x < 0 || x > S(kMenuW))
         return -1;
-    int item = static_cast<int>(y / S(kMenuItemH));
-    return item < static_cast<int>(m_menu.items.size()) ? item : -1;
+    for (size_t i = 0; i < m_menu.items.size(); ++i)
+    {
+        float top = MenuTop(i);
+        if (y >= top && y < top + MenuItemH(i))
+            return m_menu.items[i].command ? static_cast<int>(i) : -1;     // a separator is nothing
+    }
+    return -1;
+}
+
+// A hovered row's icon comes alive a little, each in its own way, on a spring so it overshoots
+// and settles; it springs back when the pointer moves on.
+void Stage::AnimateMenuIcon(size_t item, bool hovered)
+{
+    if (item >= m_menu.icons.size() || !m_menu.icons[item])
+        return;
+    auto icon = m_menu.icons[item];
+    UINT command = m_menu.items[item].command;
+    float angle = 0.f, scale = 1.f, shift = 0.f;
+    winrt::Windows::UI::Color color{ 255, 255, 255, 255 };
+    if (hovered)
+    {
+        if (command == ID_PIN || command == ID_UNPIN)
+            angle = -20.f, scale = 1.15f, color = { 255, 255, 196, 86 };       // the pin tips over, amber
+        else if (command == ID_CLOSE)
+            angle = 90.f, scale = 1.1f, color = { 255, 255, 128, 110 };        // the cross turns, coral
+        else if (command == ID_QUIT)
+            scale = 1.28f, color = { 255, 255, 84, 84 };                       // the power sign pops, red
+        else if (command >= ID_MOVE && command < ID_MOVE + 9)
+            shift = S(4), scale = 1.1f, color = { 255, 110, 182, 255 };        // off toward the other desktop, sky blue
+        else if (command == ID_SETTINGS)
+            angle = 60.f, scale = 1.1f, color = { 255, 230, 201, 138 };        // the gear turns, champagne gold
+    }
+    if (auto tint = m_menu.tints[item])
+    {
+        if (m_cfg.speed == 3)
+            tint.Color(color);
+        else
+        {
+            auto shade = m_compositor.CreateColorKeyFrameAnimation();
+            shade.InsertKeyFrame(1.f, color);
+            shade.Duration(std::chrono::milliseconds(m_cfg.Ms(150)));
+            tint.StartAnimation(L"Color", shade);
+        }
+    }
+    if (m_cfg.speed == 3)
+    {
+        icon.RotationAngleInDegrees(angle);
+        icon.Scale({ scale, scale, 1.f });
+        icon.Offset(m_menu.iconAt[item] + float3{ shift, 0.f, 0.f });
+        icon.Opacity(hovered ? 1.f : 0.72f);
+        return;
+    }
+    auto period = std::chrono::milliseconds(m_cfg.Ms(45));
+    auto spinner = m_compositor.CreateSpringScalarAnimation();
+    spinner.FinalValue(angle);
+    spinner.DampingRatio(0.42f);
+    spinner.Period(period);
+    icon.StartAnimation(L"RotationAngleInDegrees", spinner);
+    auto grow = m_compositor.CreateSpringVector3Animation();
+    grow.FinalValue(winrt::box_value(float3{ scale, scale, 1.f }).as<winrt::Windows::Foundation::IReference<float3>>());
+    grow.DampingRatio(0.42f);
+    grow.Period(period);
+    icon.StartAnimation(L"Scale", grow);
+    auto slide = m_compositor.CreateSpringVector3Animation();
+    slide.FinalValue(winrt::box_value(m_menu.iconAt[item] + float3{ shift, 0.f, 0.f }).as<winrt::Windows::Foundation::IReference<float3>>());
+    slide.DampingRatio(0.5f);
+    slide.Period(period);
+    icon.StartAnimation(L"Offset", slide);
+    auto light = m_compositor.CreateScalarKeyFrameAnimation();
+    light.InsertKeyFrame(1.f, hovered ? 1.f : 0.72f);
+    light.Duration(std::chrono::milliseconds(m_cfg.Ms(120)));
+    icon.StartAnimation(L"Opacity", light);
 }
 
 void Stage::SetMenuHover(int item)
@@ -564,14 +724,18 @@ void Stage::SetMenuHover(int item)
     if (item == m_menu.hover)
         return;
     bool wasHidden = m_menu.hover < 0;
+    if (m_menu.hover >= 0)
+        AnimateMenuIcon(static_cast<size_t>(m_menu.hover), false);
     m_menu.hover = item;
+    if (item >= 0)
+        AnimateMenuIcon(static_cast<size_t>(item), true);
     auto fade = m_compositor.CreateScalarKeyFrameAnimation();
     fade.InsertKeyFrame(1.f, item >= 0 ? 1.f : 0.f);
     fade.Duration(std::chrono::milliseconds(100));
     m_menu.highlight.StartAnimation(L"Opacity", fade);
     if (item < 0)
         return;
-    float3 to{ S(kMenuPad), S(kMenuPad) + S(kMenuItemH) * item, 0.f };
+    float3 to{ S(kMenuPad), MenuTop(static_cast<size_t>(item)), 0.f };
     if (wasHidden)
         m_menu.highlight.Offset(to);
     else
@@ -789,7 +953,11 @@ void Stage::UpdateBadges(Card& c)
     auto& v = c.side;
     if (!v.alert)
         return;
-    v.alert.IsVisible(m_cfg.alerts && c.alert);
+    bool attention = m_cfg.alerts && c.alert;
+    v.alert.IsVisible(attention);
+    bool looping = std::any_of(m_traces.begin(), m_traces.end(), [&](auto& t) { return !t.hover && t.parent == v.sprite; });
+    if (!attention && looping)
+        StopAlertTrace(v.sprite);
     v.sound.IsVisible(m_cfg.sounds && c.sound != 0);
     if (c.sound)
         v.sound.Brush(SoundBrush(c.sound == 2));
@@ -802,6 +970,8 @@ void Stage::UpdateBadges(Card& c)
     v.alert.Offset({ a.x, a.y, 0.f });
     v.sound.StopAnimation(L"Offset");
     v.sound.Offset({ o.x, o.y, 0.f });
+    if (attention && !looping)
+        RunTrace(c, false);                         // an orange line keeps going round until it is looked at
 }
 
 // A window flashing its taskbar button (a new message...): its card gets the dot and, now and then,
@@ -820,42 +990,98 @@ void Stage::OnFlash(HWND hwnd)
             continue;
         Trace(L"flash", hwnd);
         c->alert = true;
-        UpdateBadges(*c);
-        ULONGLONG now = GetTickCount64();
-        if (now - c->alertTraceAt > 4000 && std::find(m_visible.begin(), m_visible.end(), c) != m_visible.end())
-        {
-            c->alertTraceAt = now;
-            RunTrace(*c, false);
-        }
+        UpdateBadges(*c);                           // the dot, and the orange loop
         return;
     }
 }
 
+// Looking at any window of the app counts as having seen its alert: the window that flashed is often
+// not the one read (KakaoTalk flashes its main window, the message is read in a chat window).
 void Stage::ClearAlert(HWND hwnd)
 {
+    DWORD pid = 0;
+    if (!hwnd || !GetWindowThreadProcessId(hwnd, &pid))
+        return;
     for (auto& c : m_cards)
-        if (c->hwnd == hwnd && c->alert)
+    {
+        if (!c->alert)
+            continue;
+        DWORD other = 0;
+        if (c->hwnd == hwnd || (GetWindowThreadProcessId(c->hwnd, &other) && other == pid))
         {
+            Trace(L"alert seen", c->hwnd);
             c->alert = false;
             UpdateBadges(*c);
         }
+    }
 }
 
 void Stage::OnAudioChanged()
 {
     m_playing = m_cfg.sounds ? m_audio.Current() : std::vector<Audio::Playing>{};
+    m_media = m_cfg.sounds ? m_audio.CurrentMedia() : std::vector<Audio::Media>{};
+    if (g_trace)
+        for (auto& m : m_media)
+            Trace((L"media: " + m.model + L" | " + m.title).c_str());
     if (g_trace)
         for (auto& p : m_playing)
             Trace((std::wstring(p.muted ? L"audio (muted): " : L"audio: ") + p.app.substr(p.app.find_last_of(L'\\') + 1)).c_str());
     for (auto& c : m_cards)
     {
-        int sound = 0;
-        for (auto& p : m_playing)
-            if (wt::IsCardApp(c->app, p.app, p.model))
-                sound = p.muted ? 2 : 1;
-        c->sound = sound;
+        c->sound = SoundOf(*c);
         UpdateBadges(*c);
     }
+}
+
+// Which card a sound belongs to. An app with one card: that card. A browser plays for all of its
+// windows and web apps through one process, so its media sessions decide: a web app card when its
+// own id is playing, a browser window when the title of what plays is in its title (its current tab).
+// When nothing tells, only the app's most recent card shows it.
+int Stage::SoundOf(Card const& c) const
+{
+    auto playing = std::find_if(m_playing.begin(), m_playing.end(), [&](auto& p) { return wt::IsCardApp(c.app, p.app, p.model); });
+    if (playing == m_playing.end())
+        return 0;
+    int sound = playing->muted ? 2 : 1;
+    auto exe = c.app.substr(0, c.app.find(L'#'));
+    auto sameApp = [&](Card const& o) { return wt::SameApp(o.app.substr(0, o.app.find(L'#')), exe); };
+    if (std::count_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return sameApp(*o); }) <= 1)
+        return sound;
+    // Media sessions of this app: their id starts with its executable's name ("chrome.exe" ->
+    // "Chrome", "Chrome._crx_..."), or is its UWP model id.
+    auto name = exe.substr(exe.find_last_of(L'\\') + 1);
+    name = name.substr(0, name.find_last_of(L'.'));
+    auto related = [&](Audio::Media const& m) {
+        return (!name.empty() && m.model.size() >= name.size() && _wcsnicmp(m.model.c_str(), name.c_str(), name.size()) == 0) ||
+               (c.app.rfind(L"uwp:", 0) == 0 && _wcsicmp(m.model.c_str(), c.app.c_str() + 4) == 0);
+    };
+    bool anyRelated = false;
+    auto hash = c.app.find(L'#');
+    wchar_t title[256]{};
+    GetWindowTextW(c.hwnd, title, ARRAYSIZE(title));
+    for (auto& m : m_media)
+    {
+        if (!related(m))
+            continue;
+        anyRelated = true;
+        if (hash != std::wstring::npos)
+        {
+            // The web app's id, "_crx_<id>", without the profile suffix a window's id may carry.
+            auto crx = [](std::wstring const& id) {
+                auto at = id.find(L"_crx_");
+                return at == std::wstring::npos ? std::wstring() : id.substr(at, id.find(L'.', at) - at);
+            };
+            auto mine = crx(c.app.substr(hash + 1));
+            if (!mine.empty() && _wcsicmp(crx(m.model).c_str(), mine.c_str()) == 0)
+                return sound;                       // this web app itself
+        }
+        else if (m.model.find(L"_crx_") == std::wstring::npos && !m.title.empty() && wcsstr(title, m.title.c_str()))
+            return sound;                           // the tab in front of this window
+    }
+    if (anyRelated)
+        return 0;
+    auto first = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return sameApp(*o); });
+    return first != m_cards.end() && first->get() == &c ? sound : 0;
 }
 
 int Stage::SoundAt(POINT pt) const
@@ -1324,14 +1550,16 @@ void Stage::OnMinimizeStart(HWND hwnd)
     auto card = TakeCard(hwnd);
     if (!card->pinned)
         m_cards.insert(m_cards.begin(), card);
+    bool standIn = false;
     if (!picture && m_cfg.iconsOnly)
     {
         // No pictures: its icon card flies in instead.
         frame = card->frame;
-        picture = m_snap.Placeholder(hwnd, card->w, card->h, PlaceholderScale() * ThumbW() * card->w / CropFor(*card, true).size.x);
+        picture = MakePlaceholder(*card);
+        standIn = true;
     }
     if (picture)
-        SetSnapshot(*card, frame, picture);
+        SetSnapshot(*card, frame, picture, standIn);
     Relayout(true);
     StageChanged();
 
@@ -1621,16 +1849,18 @@ std::shared_ptr<Card> Stage::MakeCard(HWND hwnd)
     // stand-in; a visible one is photographed right away.
     if (m_cfg.iconsOnly || IsIconic(hwnd) || !IsWindowVisible(hwnd) || wt::IsCloaked(hwnd))
     {
-        c->snapshot.Surface(m_snap.Placeholder(hwnd, c->w, c->h, PlaceholderScale() * ThumbW() * c->w / CropFor(*c, true).size.x));
+        c->snapshot.Surface(MakePlaceholder(*c));
         c->hasPicture = true;
+        c->placeholder = true;
     }
     return c;
 }
 
-void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface)
+void Stage::SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface, bool placeholder)
 {
     if (!surface)
         return;
+    c.placeholder = placeholder;
     if (!IsZoomed(c.hwnd) && !IsIconic(c.hwnd))
     {
         RECT wr;
@@ -1651,6 +1881,26 @@ void Stage::ApplySize(CardVis const& v, Card const& c)
 {
     v.sprite.Size({ c.w, c.h });
     v.sprite.Brush(c.hasPicture ? wuc::CompositionBrush(c.snapshot) : wuc::CompositionBrush(m_placeholderBrush));
+    if (v.glass)
+        v.glass.IsVisible(m_cfg.cardStyle == 1 && c.hasPicture && c.placeholder);
+}
+
+wuc::CompositionDrawingSurface Stage::MakePlaceholder(Card const& c)
+{
+    return m_snap.Placeholder(c.hwnd, c.w, c.h, PlaceholderScale() * ThumbW() * c.w / CropFor(c, true).size.x, m_cfg.cardStyle == 1);
+}
+
+// The stand-in style changed in Settings: stand-ins are drawn again, glass shown or hidden.
+void Stage::RestylePlaceholders()
+{
+    for (auto& c : m_cards)
+    {
+        if (!c->hasPicture || !c->placeholder)
+            continue;
+        c->snapshot.Surface(MakePlaceholder(*c));
+        if (c->side.holder)
+            ApplySize(c->side, *c);
+    }
 }
 
 void Stage::SetMinAnimate(bool on)
@@ -1670,6 +1920,31 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
     v.sprite.RotationAxis({ 0.f, 1.f, 0.f });
     v.clip = m_compositor.CreateRoundedRectangleGeometry();
     v.sprite.Clip(m_compositor.CreateGeometricClip(v.clip));
+
+    // Glass: the desktop behind the card, blurred, under the see-through stand-in. It copies the
+    // sprite's placement and shape through expressions, so every pose and animation carries it along.
+    if (!m_backdrop)
+    {
+        BOOL on = TRUE;
+        DwmSetWindowAttribute(m_view, DWMWA_USE_HOSTBACKDROPBRUSH, &on, sizeof(on));
+        m_backdrop = m_compositor.CreateHostBackdropBrush();
+    }
+    v.glass = m_compositor.CreateSpriteVisual();
+    v.glass.RotationAxis({ 0.f, 1.f, 0.f });
+    v.glass.Brush(m_backdrop);
+    auto glassClip = m_compositor.CreateRoundedRectangleGeometry();
+    v.glass.Clip(m_compositor.CreateGeometricClip(glassClip));
+    auto follow = [&](wuc::CompositionObject const& target, wuc::CompositionObject const& source, wchar_t const* prop) {
+        auto e = m_compositor.CreateExpressionAnimation(std::wstring(L"s.") + prop);
+        e.SetReferenceParameter(L"s", source);
+        target.StartAnimation(prop, e);
+    };
+    for (auto prop : { L"Offset", L"CenterPoint", L"Scale", L"RotationAngleInDegrees", L"Size" })
+        follow(v.glass, v.sprite, prop);
+    for (auto prop : { L"Offset", L"Size", L"CornerRadius" })
+        follow(glassClip, v.clip, prop);
+    v.holder.Children().InsertAtTop(v.glass);
+
     ApplySize(v, c);
     v.holder.Children().InsertAtTop(v.sprite);
 
@@ -1844,20 +2119,15 @@ void Stage::Relayout(bool animate)
         if (!c.hasPicture && (IsIconic(c.hwnd) || m_cfg.iconsOnly))
         {
             // Back in view after its picture was released.
-            c.snapshot.Surface(m_snap.Placeholder(c.hwnd, c.w, c.h, PlaceholderScale() * ThumbW() * c.w / CropFor(c, true).size.x));
+            c.snapshot.Surface(MakePlaceholder(c));
             c.hasPicture = true;
+            c.placeholder = true;
             if (c.side.holder)
                 ApplySize(c.side, c);
         }
         Pose target = SlotPose(c, i);
         if (m_cfg.sounds)
-        {
-            int sound = 0;
-            for (auto& p : m_playing)
-                if (wt::IsCardApp(c.app, p.app, p.model))
-                    sound = p.muted ? 2 : 1;
-            c.sound = sound;
-        }
+            c.sound = SoundOf(c);
         if (!c.side.holder)
         {
             c.side = MakeVis(c, true);
@@ -2004,6 +2274,8 @@ void Stage::RunTrace(Card& c, bool hover)
     auto sprite = c.side.sprite;
     if (!sprite || m_cfg.speed == 3)
         return;
+    if (!hover && std::any_of(m_traces.begin(), m_traces.end(), [&](auto& t) { return !t.hover && t.parent == sprite; }))
+        return;
     auto it = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& o) { return o.get() == &c; });
     if (it == m_visible.end())
         return;
@@ -2058,6 +2330,8 @@ void Stage::RunTrace(Card& c, bool hover)
         // piece i covers [p - (i+1)*seg, p - i*seg], so the head leads and dimmer pieces follow; past
         // the end they bunch up at the bottom middle and vanish. Nothing shows before its start.
         int wait = hover ? m_cfg.Ms(200) : 0, headMs = m_cfg.Ms(kTraceHeadMs);   // hover: once the card faces front
+        // The attention loop repeats: each cycle is one run of the line followed by a rest.
+        int cycle = std::max(m_cfg.Ms(kAlertCycleMs), static_cast<int>((1.f + kTraceTail) * headMs) + 1);
         auto linear = m_compositor.CreateLinearEasingFunction();
         auto shape = m_compositor.CreateShapeVisual();
         shape.Size({ c.w, c.h });
@@ -2072,11 +2346,24 @@ void Stage::RunTrace(Card& c, bool hover)
                 geometry.TrimEnd(0.f);
                 auto trim = [&](wchar_t const* prop, float lag) {
                     auto run = m_compositor.CreateScalarKeyFrameAnimation();
-                    run.InsertKeyFrame(0.f, 0.f);
-                    run.InsertKeyFrame(1.f, 1.f, linear);
-                    run.Duration(std::chrono::milliseconds(std::max(1, headMs)));
-                    run.DelayTime(std::chrono::milliseconds(wait + static_cast<int>(lag * headMs)));
-                    run.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
+                    if (hover)
+                    {
+                        run.InsertKeyFrame(0.f, 0.f);
+                        run.InsertKeyFrame(1.f, 1.f, linear);
+                        run.Duration(std::chrono::milliseconds(std::max(1, headMs)));
+                        run.DelayTime(std::chrono::milliseconds(wait + static_cast<int>(lag * headMs)));
+                        run.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
+                    }
+                    else
+                    {
+                        float from = lag * headMs / cycle, to = (lag * headMs + headMs) / cycle;
+                        run.InsertKeyFrame(0.f, 0.f);
+                        run.InsertKeyFrame(from, 0.f);
+                        run.InsertKeyFrame(to, 1.f, linear);
+                        run.InsertKeyFrame(1.f, 1.f);
+                        run.Duration(std::chrono::milliseconds(cycle));
+                        run.IterationBehavior(wuc::AnimationIterationBehavior::Forever);
+                    }
                     geometry.StartAnimation(prop, run);
                 };
                 trim(L"TrimEnd", seg * i);
@@ -2089,13 +2376,19 @@ void Stage::RunTrace(Card& c, bool hover)
                 shape.Shapes().Append(stroke);
             }
         }
-        // One run per card at a time.
+        // One hover run per card; its attention loop steps aside meanwhile (see SweepTraces).
         for (auto& t : m_traces)
             if (t.parent == sprite)
-                t.until = 0;
+            {
+                if (t.hover)
+                    t.until = 0;
+                else
+                    t.shape.IsVisible(false);
+            }
         SweepTraces();
         sprite.Children().InsertAtTop(shape);
-        m_traces.push_back({ shape, sprite, GetTickCount64() + wait + static_cast<ULONGLONG>((1.f + kTraceTail) * headMs) + 60, hover });
+        ULONGLONG until = hover ? GetTickCount64() + wait + static_cast<ULONGLONG>((1.f + kTraceTail) * headMs) + 60 : ~0ull;
+        m_traces.push_back({ shape, sprite, until, hover });
         SweepTraces();                              // (re)arms the timer for the earliest end
         Trace(hover ? L"trace: started" : L"trace: alert", c.hwnd);
     }
@@ -2108,10 +2401,16 @@ void Stage::RunTrace(Card& c, bool hover)
 void Stage::SweepTraces()
 {
     ULONGLONG now = GetTickCount64(), next = 0;
+    std::vector<wuc::ContainerVisual> freed;        // cards whose hover run ended
+    // An attention loop on a picture that is no longer any card's (its visuals were made again) goes.
+    for (auto& t : m_traces)
+        if (!t.hover && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->side.sprite == t.parent; }))
+            t.until = 0;
     std::erase_if(m_traces, [&](TraceRun& t) {
         if (t.until > now)
         {
-            next = next ? std::min(next, t.until) : t.until;
+            if (t.until != ~0ull)
+                next = next ? std::min(next, t.until) : t.until;
             return false;
         }
         try
@@ -2121,8 +2420,15 @@ void Stage::SweepTraces()
         catch (...)
         {
         }
+        if (t.hover)
+            freed.push_back(t.parent);
         return true;
     });
+    // Their attention loop comes back.
+    for (auto& t : m_traces)
+        if (!t.hover && std::find(freed.begin(), freed.end(), t.parent) != freed.end() &&
+            std::none_of(m_traces.begin(), m_traces.end(), [&](auto& o) { return o.hover && o.parent == t.parent; }))
+            t.shape.IsVisible(true);
     if (next)
         SetTimer(m_sidebar, kTimerTrace, static_cast<UINT>(next - now), nullptr);
     else
@@ -2133,6 +2439,14 @@ void Stage::ClearTrace()
 {
     for (auto& t : m_traces)
         if (t.hover)
+            t.until = 0;
+    SweepTraces();
+}
+
+void Stage::StopAlertTrace(wuc::ContainerVisual const& sprite)
+{
+    for (auto& t : m_traces)
+        if (!t.hover && t.parent == sprite)
             t.until = 0;
     SweepTraces();
 }
@@ -2290,7 +2604,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         if (m_cfg.iconsOnly)
         {
             auto& c = *flight->card;
-            OnOutCaptured(flight, frame, m_snap.Placeholder(h, c.w, c.h, PlaceholderScale() * ThumbW() * c.w / CropFor(c, true).size.x));
+            OnOutCaptured(flight, frame, MakePlaceholder(c), true);
         }
         else if (fresh)
         {
@@ -2523,12 +2837,12 @@ void Stage::Prefetch()
     });
 }
 
-void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, wuc::CompositionDrawingSurface const& surface)
+void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, wuc::CompositionDrawingSurface const& surface, bool placeholder)
 {
     if (std::find(m_outs.begin(), m_outs.end(), flight) == m_outs.end())
         return;
     auto card = flight->card;
-    SetSnapshot(*card, frame, surface);
+    SetSnapshot(*card, frame, surface, placeholder);
 
     // Below the incoming copy, so the new window visibly lands on top.
     flight->vis = MakeVis(*card, false);

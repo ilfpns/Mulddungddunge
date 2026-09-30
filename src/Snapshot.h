@@ -21,7 +21,8 @@ public:
     // Stand-in for a window we could not photograph (it was minimized): app icon and title on a dark
     // card, with the same aspect ratio as the window.
     // `displayWidth` is the width to draw at in pixels (the card's on-screen width, or a multiple of it).
-    wuc::CompositionDrawingSurface Placeholder(HWND hwnd, float w, float h, float displayWidth);
+    // glass: see-through with light edges, for a blurred backdrop behind it (Stage draws that).
+    wuc::CompositionDrawingSurface Placeholder(HWND hwnd, float w, float h, float displayWidth, bool glass = false);
     IDWriteFactory* Text();                         // created on first use
     // A transparent surface of the given size, drawn once by `draw`.
     wuc::CompositionDrawingSurface Paint(float w, float h, std::function<void(ID2D1DeviceContext*)> const& draw);

@@ -318,7 +318,7 @@ IDWriteFactory* Snapshot::Text()
     return m_dwrite.get();
 }
 
-wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h, float displayWidth)
+wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h, float displayWidth, bool glass)
 {
     // Only the top 3:2 part of a card is visible in the sidebar; center the content there.
     float pw = std::round(displayWidth), ph = std::round(pw * h / w);
@@ -341,11 +341,32 @@ wuc::CompositionDrawingSurface Snapshot::Placeholder(HWND hwnd, float w, float h
     return Paint(pw, ph, [&](ID2D1DeviceContext* dc) {
         winrt::com_ptr<ID2D1SolidColorBrush> fill, ink;
         dc->CreateSolidColorBrush(D2D1::ColorF(0.17f, 0.17f, 0.19f), fill.put());
-        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.72f), ink.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, glass ? 0.92f : 0.72f), ink.put());
         // Grayscale text: the card is tilted and warped by perspective, which turns ClearType's
         // colored subpixel edges into visible fringes.
         dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        dc->FillRectangle({ 0, 0, pw, ph }, fill.get());
+        if (!glass)
+            dc->FillRectangle({ 0, 0, pw, ph }, fill.get());
+        else
+        {
+            // Glass over the blurred backdrop: a light veil for contrast, a sheen fading down from the
+            // top edge, and a bright rim that is strongest at the top.
+            auto gradient = [&](D2D1_POINT_2F from, D2D1_POINT_2F to, std::initializer_list<D2D1_GRADIENT_STOP> stops) {
+                winrt::com_ptr<ID2D1GradientStopCollection> collection;
+                dc->CreateGradientStopCollection(stops.begin(), static_cast<UINT32>(stops.size()), collection.put());
+                winrt::com_ptr<ID2D1LinearGradientBrush> brush;
+                dc->CreateLinearGradientBrush({ from, to }, collection.get(), brush.put());
+                return brush;
+            };
+            dc->FillRectangle({ 0, 0, pw, ph }, gradient({ 0, 0 }, { 0, visible }, {
+                { 0.f, D2D1::ColorF(1.f, 1.f, 1.f, 0.16f) }, { 1.f, D2D1::ColorF(0.05f, 0.05f, 0.08f, 0.22f) } }).get());
+            dc->FillRectangle({ 0, 0, pw, visible * 0.42f }, gradient({ 0, 0 }, { 0, visible * 0.42f }, {
+                { 0.f, D2D1::ColorF(1.f, 1.f, 1.f, 0.20f) }, { 1.f, D2D1::ColorF(1.f, 1.f, 1.f, 0.f) } }).get());
+            float rim = std::max(1.f, 1.5f * u);
+            dc->DrawRectangle({ rim / 2, rim / 2, pw - rim / 2, visible - rim / 2 }, gradient({ 0, 0 }, { pw * 0.35f, visible }, {
+                { 0.f, D2D1::ColorF(1.f, 1.f, 1.f, 0.70f) }, { 0.55f, D2D1::ColorF(1.f, 1.f, 1.f, 0.18f) },
+                { 1.f, D2D1::ColorF(1.f, 1.f, 1.f, 0.38f) } }).get(), rim);
+        }
         float cy = std::round(visible / 2.f - 12.f * u), half = std::round(32.f * u);
         DrawIcon(dc, source.get(), { pw / 2 - half, cy - half, pw / 2 + half, cy + half });
         dc->DrawTextW(title, static_cast<UINT32>(wcslen(title)), format.get(),

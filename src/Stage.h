@@ -13,6 +13,7 @@ struct CardVis
     wuc::SpriteVisual badge{ nullptr };
     wuc::SpriteVisual pin{ nullptr };
     wuc::SpriteVisual alert{ nullptr };     // orange dot: its app asked for attention
+    wuc::SpriteVisual glass{ nullptr };     // blurred backdrop under a glass stand-in; follows the sprite
     wuc::SpriteVisual sound{ nullptr };     // speaker: its app is playing sound
 };
 
@@ -36,6 +37,7 @@ struct Card
     RECT border{};          // invisible resize borders: window rect minus visible frame, per side
     bool hasSnapshot = false;   // a real picture of the window (otherwise a placeholder, or nothing if released)
     bool hasPicture = false;    // snapshot or placeholder currently loaded
+    bool placeholder = false;   // the loaded picture is a stand-in (icon and title), not the window
     bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
     std::wstring pinKey;    // the saved pin entry it was pinned with (its desktop may change later)
     bool alert = false;     // flashed its taskbar button since it was last looked at
@@ -125,6 +127,7 @@ private:
     void StartTrace(int index);                     // the hovered card
     void RunTrace(Card& c, bool hover);
     void ClearTrace();                              // hover traces
+    void StopAlertTrace(wuc::ContainerVisual const& sprite);
     void SweepTraces();                             // finished ones
     // Card badges beyond the pin: attention dot and speaker.
     wuc::CompositionSurfaceBrush SoundBrush(bool muted);
@@ -135,6 +138,7 @@ private:
     void OnFlash(HWND hwnd);
     void ClearAlert(HWND hwnd);
     void OnAudioChanged();
+    int SoundOf(Card const& c) const;               // 0 silent, 1 playing, 2 playing but muted
     int SoundAt(POINT sidePt) const;                // index of the visible card whose speaker is there
     // An earlier version turned the system's three-finger swipe off while it ran; put it back if a
     // run of it ended without doing so.
@@ -188,14 +192,14 @@ private:
 
     void Populate();
     std::shared_ptr<Card> MakeCard(HWND hwnd);
-    void SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
+    void SetSnapshot(Card& c, RECT const& frame, wuc::CompositionDrawingSurface const& surface, bool placeholder = false);
     void ApplySize(CardVis const& v, Card const& c);
     void SetMinAnimate(bool on);
 
     // Transitions: `next` comes on stage, the current window flies into the sidebar.
     void SwitchTo(size_t index);
     void BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom);
-    void OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, wuc::CompositionDrawingSurface const& surface);
+    void OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, wuc::CompositionDrawingSurface const& surface, bool placeholder = false);
     bool OnStage(HWND hwnd) const;
     void LeaveStage(HWND hwnd);
 
@@ -301,15 +305,19 @@ private:
     {
         wuc::ShapeVisual shape{ nullptr };
         wuc::ContainerVisual parent{ nullptr };     // the card's sprite: the line tilts and grows with it
-        ULONGLONG until = 0;
-        bool hover = false;
+        ULONGLONG until = 0;                        // ~0: runs until taken away (an attention loop)
+        bool hover = false;                         // otherwise: the attention loop
     };
     std::vector<TraceRun> m_traces;
     std::vector<wuc::CompositionColorBrush> m_traceBrushes, m_alertTraceBrushes;   // head to tail
     wuc::CompositionSurfaceBrush m_soundBrush[2]{ nullptr, nullptr };
     wuc::CompositionSurfaceBrush m_alertBrush{ nullptr };
+    wuc::CompositionBackdropBrush m_backdrop{ nullptr };    // what is behind our window, blurred by DWM
+    wuc::CompositionDrawingSurface MakePlaceholder(Card const& c);
+    void RestylePlaceholders();
     Audio m_audio;
     std::vector<Audio::Playing> m_playing;
+    std::vector<Audio::Media> m_media;
     int m_pressSound = -1;                          // speaker pressed, released over it = mute toggle
     std::vector<GUID> m_menuDesktops;               // desktops listed in the open card menu
     winrt::com_ptr<ID2D1Factory> m_d2d;             // for the trace's outline paths
@@ -334,7 +342,7 @@ private:
 
     struct MenuItem
     {
-        UINT command;
+        UINT command;                               // 0: a separator line
         wchar_t const* glyph;
         wchar_t const* label;
     };
@@ -345,9 +353,16 @@ private:
         std::vector<MenuItem> items;
         wuc::ContainerVisual root{ nullptr };
         wuc::SpriteVisual highlight{ nullptr };
+        std::vector<wuc::SpriteVisual> icons;       // per item (null for separators): they move on hover
+        std::vector<wuc::CompositionColorBrush> tints;  // their color (the glyph is a mask over it)
+        std::vector<std::wstring> labels;           // text of items made up on the spot (desktop names)
+        std::vector<float3> iconAt;                 // their resting offsets
         float2 origin{};                            // view coordinates of the panel's top-left
         int hover = -1;
     } m_menu;
+    float MenuTop(size_t item) const;               // panel y of an item's top
+    float MenuItemH(size_t item) const;
+    void AnimateMenuIcon(size_t item, bool hovered);
     struct Hit
     {
         D2D1_RECT_F rect;                           // panel coordinates

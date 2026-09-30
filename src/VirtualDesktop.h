@@ -9,6 +9,7 @@ namespace vd
 {
     bool Available();
     std::vector<GUID> Desktops();                   // in Task View order
+    std::vector<std::wstring> Names();              // same order; empty for a desktop never renamed
     // The desktop being shown, asked of Explorer (the registry copy of it can lag behind). False where
     // the interface isn't known; the connection is kept, and made again after Explorer restarts.
     bool Current(GUID* id);

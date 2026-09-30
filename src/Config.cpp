@@ -1,4 +1,5 @@
 #include "Config.h"
+#include "WindowTracker.h"
 
 namespace
 {
@@ -52,6 +53,7 @@ void Config::Load()
     quality = ReadInt(L"Quality", quality, 0, 2);
     iconsOnly = ReadInt(L"IconsOnly", iconsOnly, 0, 1) != 0;
     hoverTrace = ReadInt(L"HoverTrace", hoverTrace, 0, 1) != 0;
+    cardStyle = ReadInt(L"CardStyle", cardStyle, 0, 1);
     alerts = ReadInt(L"Alerts", alerts, 0, 1) != 0;
     sounds = ReadInt(L"Sounds", sounds, 0, 1) != 0;
     hotkeys = ReadInt(L"Hotkeys", hotkeys, 0, 1) != 0;
@@ -72,6 +74,19 @@ void Config::Load()
 
     excluded = ReadList(L"Excluded");
     quitApps = ReadList(L"QuitApps");
+    // Apps the sidebar leaves alone out of the box (once: turned back on in Settings, they stay on).
+    // Store apps are compared without their version folder, so any version matches.
+    static constexpr wchar_t const* kUnmanaged[] = {
+        L"C:\\Program Files\\WindowsApps\\OpenAI.ChatGPT-Desktop_1.0.0.0_x64__2p2nqsd0c76g0\\app\\ChatGPT Classic.exe",
+    };
+    if (!ReadInt(L"DefaultsApplied", 0, 0, 1))
+    {
+        for (auto app : kUnmanaged)
+            if (std::none_of(excluded.begin(), excluded.end(), [&](auto& e) { return wt::SameApp(e, app); }))
+                excluded.emplace_back(app);
+        WriteList(L"Excluded", excluded);
+        WriteInt(L"DefaultsApplied", 1);
+    }
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kKey, L"QuitOnClose");     // the old all-apps switch
 }
 
@@ -81,6 +96,7 @@ void Config::Save() const
     WriteInt(L"Quality", quality);
     WriteInt(L"IconsOnly", iconsOnly);
     WriteInt(L"HoverTrace", hoverTrace);
+    WriteInt(L"CardStyle", cardStyle);
     WriteInt(L"Alerts", alerts);
     WriteInt(L"Sounds", sounds);
     WriteInt(L"Hotkeys", hotkeys);

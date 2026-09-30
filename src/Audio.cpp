@@ -4,6 +4,9 @@
 #include <audiopolicy.h>
 #include <mutex>
 #include <unordered_map>
+#include <winrt/Windows.Media.Control.h>
+
+using namespace winrt::Windows::Media::Control;
 
 namespace
 {
@@ -49,6 +52,7 @@ struct Audio::Worker
     std::atomic<bool> quit{ false }, deviceChanged{ true };
     std::mutex lock;
     std::vector<Playing> playing;                   // guarded by lock
+    std::vector<Media> media;                       // guarded by lock
     std::vector<std::pair<std::wstring, bool>> mutes;   // requests, guarded by lock
     std::thread thread;
 
@@ -76,6 +80,33 @@ struct Audio::Worker
     void Loop()
     {
         auto sink = winrt::make_self<Sink>(wake, &deviceChanged);
+        // Media sessions: their changes wake the worker like audio ones do.
+        GlobalSystemMediaTransportControlsSessionManager mediaManager{ nullptr };
+        winrt::event_token sessionsToken{};
+        std::vector<std::pair<GlobalSystemMediaTransportControlsSession, std::pair<winrt::event_token, winrt::event_token>>> watched;
+        auto unwatch = [&] {
+            for (auto& [s, t] : watched)
+            {
+                try
+                {
+                    s.PlaybackInfoChanged(t.first);
+                    s.MediaPropertiesChanged(t.second);
+                }
+                catch (...)
+                {
+                }
+            }
+            watched.clear();
+        };
+        try
+        {
+            mediaManager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+            sessionsToken = mediaManager.SessionsChanged([w = wake](auto&&, auto&&) { SetEvent(w); });
+        }
+        catch (...)
+        {
+            mediaManager = nullptr;
+        }
         auto devices = winrt::create_instance<IMMDeviceEnumerator>(__uuidof(MMDeviceEnumerator));
         devices->RegisterEndpointNotificationCallback(sink.get());
         winrt::com_ptr<IAudioSessionManager2> manager;
@@ -173,19 +204,59 @@ struct Audio::Worker
             if (images.size() > 64)
                 images.clear();                     // ids are reused; start over now and then
 
+            // Media sessions playing now, watched again each time (the list may have changed).
+            std::vector<Media> nowMedia;
+            if (mediaManager)
+            {
+                try
+                {
+                    unwatch();
+                    for (auto const& s : mediaManager.GetSessions())
+                    {
+                        auto t1 = s.PlaybackInfoChanged([w = wake](auto&&, auto&&) { SetEvent(w); });
+                        auto t2 = s.MediaPropertiesChanged([w = wake](auto&&, auto&&) { SetEvent(w); });
+                        watched.push_back({ s, { t1, t2 } });
+                        auto info = s.GetPlaybackInfo();
+                        if (!info || info.PlaybackStatus() != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+                            continue;
+                        std::wstring title;
+                        try
+                        {
+                            if (auto props = s.TryGetMediaPropertiesAsync().get())
+                                title = props.Title().c_str();
+                        }
+                        catch (...)
+                        {
+                        }
+                        nowMedia.push_back({ std::wstring(s.SourceAppUserModelId()), title });
+                    }
+                }
+                catch (...)
+                {
+                }
+            }
+
             bool changed;
             {
                 std::lock_guard g(lock);
                 changed = now.size() != playing.size() ||
-                          !std::equal(now.begin(), now.end(), playing.begin(), [](auto& a, auto& b) { return a.app == b.app && a.muted == b.muted; });
+                          !std::equal(now.begin(), now.end(), playing.begin(), [](auto& a, auto& b) { return a.app == b.app && a.muted == b.muted; }) ||
+                          nowMedia.size() != media.size() ||
+                          !std::equal(nowMedia.begin(), nowMedia.end(), media.begin(), [](auto& a, auto& b) { return a.model == b.model && a.title == b.title; });
                 if (changed)
+                {
                     playing = std::move(now);
+                    media = std::move(nowMedia);
+                }
             }
             if (changed)
                 PostMessageW(notify, msg, 0, 0);
             WaitForSingleObject(wake, INFINITE);
         }
         detach();
+        unwatch();
+        if (mediaManager)
+            mediaManager.SessionsChanged(sessionsToken);
         devices->UnregisterEndpointNotificationCallback(sink.get());
     }
 };
@@ -217,6 +288,14 @@ std::vector<Audio::Playing> Audio::Current()
         return {};
     std::lock_guard g(m_worker->lock);
     return m_worker->playing;
+}
+
+std::vector<Audio::Media> Audio::CurrentMedia()
+{
+    if (!m_worker)
+        return {};
+    std::lock_guard g(m_worker->lock);
+    return m_worker->media;
 }
 
 void Audio::SetMute(std::wstring const& cardApp, bool mute)

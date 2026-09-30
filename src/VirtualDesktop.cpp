@@ -1,4 +1,5 @@
 #include "VirtualDesktop.h"
+#include <winstring.h>
 
 namespace
 {
@@ -14,6 +15,7 @@ namespace
     {
         virtual HRESULT __stdcall IsViewVisible(IUnknown* view, BOOL* visible) = 0;
         virtual HRESULT __stdcall GetId(GUID* id) = 0;
+        virtual HRESULT __stdcall GetName(HSTRING* name) = 0;
     };
 
     struct IVirtualDesktopManagerInternal : IUnknown
@@ -111,6 +113,25 @@ namespace vd
                 ids.push_back(id);
         }
         return ids;
+    }
+
+    std::vector<std::wstring> Names()
+    {
+        std::vector<std::wstring> names;
+        for (auto& d : List(Connect()))
+        {
+            HSTRING raw = nullptr;
+            std::wstring name;
+            if (SUCCEEDED(d->GetName(&raw)) && raw)
+            {
+                UINT32 len = 0;
+                auto text = WindowsGetStringRawBuffer(raw, &len);
+                name.assign(text, len);
+                WindowsDeleteString(raw);
+            }
+            names.push_back(name);
+        }
+        return names;
     }
 
     bool MoveWindow(HWND hwnd, GUID const& desktop)

@@ -18,7 +18,7 @@ namespace
     enum : int
     {
         OptAutostart, OptHotkeys, OptHotkeyMod, OptCards, OptSide, OptMonitor, OptTilt, OptSize, OptSpeed,
-        OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace, OptAlerts, OptSounds,
+        OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace, OptAlerts, OptSounds, OptCardStyle,
     };
 
     wchar_t const* const kTabs[] = { L"일반", L"모양", L"동작", L"앱", L"고정", L"정보" };
@@ -359,12 +359,12 @@ void Stage::PaintSettings()
         {
         case 0:     // General
         {
-            toggle(row(L"Windows 시작 시 실행", L"로그인하면 자동으로 켜집니다", S(44)), StartsWithWindows(), OptAutostart);
-            toggle(row(L"단축키로 카드 전환", L"조합키 + 숫자로 사이드바 카드를 바로 엽니다", S(44)), m_cfg.hotkeys, OptHotkeys);
-            choice(row(L"단축키 조합", L"다른 앱과 겹치면 바꿔 보세요", S(252)), { L"Alt", L"Ctrl+Alt", L"Shift+Alt" }, m_cfg.hotkeyMod, OptHotkeyMod, S(84));
+            toggle(row(L"컴퓨터 켤 때 자동 실행", L"Windows에 로그인하면 알아서 켜집니다", S(44)), StartsWithWindows(), OptAutostart);
+            toggle(row(L"단축키로 카드 열기", L"Alt + 숫자키(1~6)를 누르면 사이드바의 그 순서 카드가 바로 열립니다", S(44)), m_cfg.hotkeys, OptHotkeys);
+            choice(row(L"단축키에 같이 누를 키", L"다른 프로그램의 단축키와 겹치면 바꿔 주세요", S(252)), { L"Alt", L"Ctrl+Alt", L"Shift+Alt" }, m_cfg.hotkeyMod, OptHotkeyMod, S(84));
             swprintf_s(buf, L"%d장", m_cfg.cards);
-            stepper(row(L"사이드바 카드 개수", L"한 데스크톱에 보여 줄 최근 창 수 (1~6)", S(132)), buf, OptCards, m_cfg.cards > 1, m_cfg.cards < 6);
-            choice(row(L"사이드바 위치", L"화면 왼쪽 또는 오른쪽", S(152)), { L"왼쪽", L"오른쪽" }, m_cfg.right ? 1 : 0, OptSide, S(76));
+            stepper(row(L"카드 개수", L"사이드바에 보여 줄 최근 창의 수 (1~6개)", S(132)), buf, OptCards, m_cfg.cards > 1, m_cfg.cards < 6);
+            choice(row(L"사이드바 위치", L"카드 목록을 화면의 어느 쪽에 둘지 고릅니다", S(152)), { L"왼쪽", L"오른쪽" }, m_cfg.right ? 1 : 0, OptSide, S(76));
             std::vector<std::wstring> names;
             int current = 0;
             for (size_t i = 0; i < m.monitors.size() && i < 4; ++i)
@@ -379,36 +379,48 @@ void Stage::PaintSettings()
                     current = static_cast<int>(i);
             }
             float segW = S(74);
-            choice(row(L"표시할 모니터", m.monitors.size() > 1 ? L"사이드바를 띄울 화면" : L"연결된 모니터가 하나입니다", segW * names.size()),
+            choice(row(L"표시할 모니터", m.monitors.size() > 1 ? L"사이드바를 띄울 화면을 고릅니다" : L"모니터가 하나만 연결되어 있습니다", segW * names.size()),
                 names, current, OptMonitor, segW);
             break;
         }
         case 1:     // Look
         {
             swprintf_s(buf, L"%d°", m_cfg.tilt);
-            stepper(row(L"카드 기울기", L"0°면 평평하게 놓입니다", S(132)), buf, OptTilt, m_cfg.tilt > 0, m_cfg.tilt < 60);
+            stepper(row(L"카드 기울기", L"0°로 하면 기울이지 않고 평평하게 보입니다", S(132)), buf, OptTilt, m_cfg.tilt > 0, m_cfg.tilt < 60);
             swprintf_s(buf, L"%d%%", m_cfg.size);
-            stepper(row(L"카드 크기", L"사이드바 폭도 함께 바뀝니다", S(132)), buf, OptSize, m_cfg.size > 80, m_cfg.size < 130);
-            choice(row(L"애니메이션 속도", nullptr, S(304)), { L"빠르게", L"보통", L"느리게", L"끄기" }, m_cfg.speed, OptSpeed, S(76));
-            choice(row(L"썸네일 화질", L"높을수록 선명하고 GPU 메모리를 조금 더 씁니다", S(228)), { L"낮음", L"보통", L"높음" }, m_cfg.quality, OptQuality, S(76));
-            toggle(row(L"아이콘만 보기 (절전)", L"창을 캡처하지 않고 앱 아이콘 카드만 보여 줍니다. 자원을 가장 적게 씁니다", S(44)), m_cfg.iconsOnly, OptIcons);
-            toggle(row(L"호버 테두리 애니메이션", L"마우스를 올린 카드의 테두리를 따라 얇은 선이 위에서 아래로 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
+            stepper(row(L"카드 크기", L"크게 하면 사이드바도 함께 넓어집니다", S(132)), buf, OptSize, m_cfg.size > 80, m_cfg.size < 130);
+            choice(row(L"애니메이션 속도", L"창이 카드로 들어가고 나오는 움직임의 빠르기", S(304)), { L"빠르게", L"보통", L"느리게", L"끄기" }, m_cfg.speed, OptSpeed, S(76));
+            choice(row(L"카드 속 화면 화질", L"높을수록 선명하지만 그래픽 메모리를 조금 더 씁니다", S(228)), { L"낮음", L"보통", L"높음" }, m_cfg.quality, OptQuality, S(76));
+            toggle(row(L"아이콘만 보기 (절전)", L"창 화면 대신 앱 아이콘만 보여 줍니다. 배터리와 메모리를 가장 적게 씁니다", S(44)), m_cfg.iconsOnly, OptIcons);
+            toggle(row(L"마우스 올리면 테두리 빛내기", L"카드에 마우스를 올리면 얇은 빛이 테두리를 따라 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
+            choice(row(L"대체 카드 모양", L"창 화면을 보여 줄 수 없을 때(최소화 등) 쓰는 카드", S(152)), { L"회색", L"유리" }, m_cfg.cardStyle, OptCardStyle, S(76));
             break;
         }
         case 2:     // Behavior
-            toggle(row(L"창이 가리면 사이드바 숨기기", L"최대화한 창 등이 덮으면 옆으로 비켜납니다", S(44)), m_cfg.autoTuck, OptAutoTuck);
-            toggle(row(L"화면 가장자리로 다시 불러오기", L"숨은 동안 마우스를 화면 끝에 대면 나타납니다", S(44)), m_cfg.edgeReveal, OptEdge);
-            toggle(row(L"분할한 창을 사이드바 옆에 맞추기", L"화면 분할로 붙인 창이 사이드바에 가려지지 않게 옆으로 옮깁니다", S(44)), m_cfg.fitSnapped, OptFit);
-            toggle(row(L"트레이로 숨는 앱도 카드 유지", L"카카오톡처럼 닫으면 트레이로 가는 앱의 카드를 남깁니다", S(44)), m_cfg.keepTray, OptTray);
-            toggle(row(L"알림 온 카드 표시", L"메시지가 와서 작업 표시줄이 깜빡이는 앱의 카드에 주황 점과 테두리 선을 띄웁니다", S(44)), m_cfg.alerts, OptAlerts);
-            toggle(row(L"소리 나는 카드 표시", L"소리를 내는 앱의 카드에 스피커를 띄웁니다. 누르면 그 앱만 음소거", S(44)), m_cfg.sounds, OptSounds);
+            toggle(row(L"창에 가리면 사이드바 비켜 주기", L"창을 최대화하는 등 사이드바를 덮으면 화면 옆으로 숨습니다", S(44)), m_cfg.autoTuck, OptAutoTuck);
+            toggle(row(L"화면 끝으로 다시 불러오기", L"숨어 있을 때 마우스를 화면 끝에 대면 다시 나타납니다", S(44)), m_cfg.edgeReveal, OptEdge);
+            toggle(row(L"반씩 나눈 창 자리 맞추기", L"화면을 반으로 나눠 붙인 창이 사이드바에 가리지 않게 옆으로 옮겨 줍니다", S(44)), m_cfg.fitSnapped, OptFit);
+            toggle(row(L"숨는 앱도 카드 남기기", L"카카오톡처럼 X를 눌러도 꺼지지 않고 작업 표시줄 오른쪽 아이콘으로 숨는 앱도 카드를 남깁니다", S(44)), m_cfg.keepTray, OptTray);
+            toggle(row(L"새 알림 표시", L"새 메시지가 와서 작업 표시줄이 깜빡이면 그 카드에 주황 점과 빛나는 테두리가 생깁니다", S(44)), m_cfg.alerts, OptAlerts);
+            toggle(row(L"소리 나는 앱 표시", L"소리가 나는 카드에 스피커가 뜹니다. 누르면 그 앱의 소리만 끄고 켭니다", S(44)), m_cfg.sounds, OptSounds);
             break;
         case 3:     // Apps
         case 4:     // Pins
         {
             bool apps = m.tab == 3;
-            note(apps ? L"X로 종료: X를 눌러 트레이로 숨으면 백그라운드까지 끕니다 · 관리: 끄면 사이드바가 관리하지 않습니다"
+            note(apps ? L"표시: 사이드바에 카드로 넣기 · 완전 종료: X를 누르면 숨지 않고 완전히 끄기"
                       : L"고정은 데스크톱마다 따로 저장됩니다. 카드를 오른쪽 클릭해 고정할 수 있어요");
+            if (apps)
+            {
+                // What each column of switches does, over them.
+                // Short and centered over each switch (they sit 70px apart), inside the panel.
+                m.caption->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                float quitX = x1 - S(70) - S(23), showX = x1 - S(23);
+                text(L"완전 종료", { quitX - S(35), y - S(6), quitX + S(35), y + S(14) }, m.caption.get(), dim.get());
+                text(L"표시", { showX - S(35), y - S(6), showX + S(35), y + S(14) }, m.caption.get(), dim.get());
+                m.caption->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                y += S(18);
+            }
             float top = y, bottom = h - (apps ? S(20) : S(76));
             size_t count = apps ? m.apps.size() : m_pinnedApps.size();
             m.scrollMax = std::max(0.f, count * S(kListRowH) - (bottom - top));
@@ -814,6 +826,7 @@ void Stage::SettingsClick(POINT pt)
         case OptSide: m_cfg.right = value == 1; break;
         case OptSpeed: m_cfg.speed = value; break;
         case OptQuality: m_cfg.quality = value; break;
+        case OptCardStyle: m_cfg.cardStyle = value; break;
         case OptMonitor:
             if (value >= static_cast<int>(m.monitors.size()))
                 return;
@@ -990,6 +1003,9 @@ void Stage::ApplySetting(int what)
     case OptTrace:
         if (!m_cfg.hoverTrace)
             ClearTrace();
+        break;
+    case OptCardStyle:
+        RestylePlaceholders();
         break;
     case OptAlerts:
     case OptSounds:
