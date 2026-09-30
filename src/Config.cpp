@@ -51,6 +51,7 @@ void Config::Load()
     cards = ReadInt(L"Cards", cards, 1, 6);
     quality = ReadInt(L"Quality", quality, 0, 2);
     iconsOnly = ReadInt(L"IconsOnly", iconsOnly, 0, 1) != 0;
+    hoverTrace = ReadInt(L"HoverTrace", hoverTrace, 0, 1) != 0;
     hotkeys = ReadInt(L"Hotkeys", hotkeys, 0, 1) != 0;
     hotkeyMod = ReadInt(L"HotkeyModifier", hotkeyMod, 0, 2);
     speed = ReadInt(L"Speed", speed, 0, 3);
@@ -77,6 +78,7 @@ void Config::Save() const
     WriteInt(L"Cards", cards);
     WriteInt(L"Quality", quality);
     WriteInt(L"IconsOnly", iconsOnly);
+    WriteInt(L"HoverTrace", hoverTrace);
     WriteInt(L"Hotkeys", hotkeys);
     WriteInt(L"HotkeyModifier", hotkeyMod);
     WriteInt(L"Speed", speed);

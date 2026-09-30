@@ -7,6 +7,7 @@ struct Config
     int cards = 4;                  // sidebar cards, 1..6
     int quality = 1;                // window pictures: 0 low, 1 normal, 2 high detail
     bool iconsOnly = false;         // no window pictures, app icon cards only: least GPU memory, no captures
+    bool hoverTrace = true;         // a thin line runs around the card the pointer is on
     bool hotkeys = true;            // modifier + 1..N switches to that card
     int hotkeyMod = 0;              // 0 Alt, 1 Ctrl+Alt, 2 Shift+Alt
     int speed = 1;                  // animations: 0 fast, 1 normal, 2 slow, 3 off

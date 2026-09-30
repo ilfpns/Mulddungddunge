@@ -114,6 +114,10 @@ private:
     bool QuitsOnClose(HWND hwnd) const;             // its app is one the user chose to quit on X
     void PutAwayHidden(HWND hwnd);                  // a window hidden to the tray: into the sidebar
     bool InputPanelUp();
+    // Hover: a thin white line runs around the hovered card, from the top edge's middle down both
+    // sides to the bottom edge's middle, its trail fading behind it.
+    void StartTrace(int index);
+    void ClearTrace();
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
     bool Here(Card const& c) const;                 // uses the cached desktop: no call
@@ -271,6 +275,10 @@ private:
     unsigned m_gen = 0;                             // transition number: late callbacks of an older one do nothing
     UINT m_taskbarMsg = 0;                          // "TaskbarCreated": Explorer restarted, re-add the tray icon
     HICON m_trayIcon = nullptr;
+    wuc::ShapeVisual m_trace{ nullptr };            // the running hover trace, see StartTrace
+    wuc::ContainerVisual m_traceParent{ nullptr };
+    std::vector<wuc::CompositionColorBrush> m_traceBrushes;     // head to tail, brightest first
+    winrt::com_ptr<ID2D1Factory> m_d2d;             // for the trace's outline paths
     std::vector<HWND> m_toMinimize;                 // stage windows whose flying copy is now on screen
     int m_pending = 0;                              // fly-out and fly-in steps still running
     wuc::CompositionScopedBatch m_inBatch{ nullptr };

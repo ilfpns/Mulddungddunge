@@ -18,7 +18,7 @@ namespace
     enum : int
     {
         OptAutostart, OptHotkeys, OptHotkeyMod, OptCards, OptSide, OptMonitor, OptTilt, OptSize, OptSpeed,
-        OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray,
+        OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace,
     };
 
     wchar_t const* const kTabs[] = { L"일반", L"모양", L"동작", L"앱", L"고정", L"정보" };
@@ -392,6 +392,7 @@ void Stage::PaintSettings()
             choice(row(L"애니메이션 속도", nullptr, S(304)), { L"빠르게", L"보통", L"느리게", L"끄기" }, m_cfg.speed, OptSpeed, S(76));
             choice(row(L"썸네일 화질", L"높을수록 선명하고 GPU 메모리를 조금 더 씁니다", S(228)), { L"낮음", L"보통", L"높음" }, m_cfg.quality, OptQuality, S(76));
             toggle(row(L"아이콘만 보기 (절전)", L"창을 캡처하지 않고 앱 아이콘 카드만 보여 줍니다. 자원을 가장 적게 씁니다", S(44)), m_cfg.iconsOnly, OptIcons);
+            toggle(row(L"호버 테두리 애니메이션", L"마우스를 올린 카드의 테두리를 따라 얇은 선이 위에서 아래로 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
             break;
         }
         case 2:     // Behavior
@@ -796,6 +797,7 @@ void Stage::SettingsClick(POINT pt)
         case OptEdge: m_cfg.edgeReveal = !m_cfg.edgeReveal; break;
         case OptFit: m_cfg.fitSnapped = !m_cfg.fitSnapped; break;
         case OptTray: m_cfg.keepTray = !m_cfg.keepTray; break;
+        case OptTrace: m_cfg.hoverTrace = !m_cfg.hoverTrace; break;
         }
         ApplySetting(target.arg);
         break;
@@ -980,6 +982,10 @@ void Stage::ApplySetting(int what)
     case OptFit:
         if (m_cfg.fitSnapped)
             FitBeside();
+        break;
+    case OptTrace:
+        if (!m_cfg.hoverTrace)
+            ClearTrace();
         break;
     }
     SaveSettings();

@@ -22,6 +22,7 @@
 #include <DispatcherQueue.h>
 #include <windows.ui.composition.interop.h>
 #include <windows.graphics.capture.interop.h>
+#include <windows.graphics.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 
 #include <winrt/base.h>

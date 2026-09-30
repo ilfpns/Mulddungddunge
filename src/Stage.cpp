@@ -42,6 +42,7 @@ namespace
     // running this long after, with nothing on screen, is ended.
     constexpr ULONGLONG kQuitGraceMs = 5000;
     constexpr UINT_PTR kTimerNewWindow = 15;  // a new window not ready yet when it took focus
+    constexpr UINT_PTR kTimerTrace = 16;      // the hover trace has run its course: remove it
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
@@ -105,6 +106,39 @@ namespace
             fclose(f);
         }
     }
+
+    // A Direct2D path handed to composition (CompositionPath takes an IGeometrySource2D). Composition
+    // asks for the path built with its own Direct2D factory, so the source keeps how to build it.
+    struct GeometrySource : winrt::implements<GeometrySource, winrt::Windows::Graphics::IGeometrySource2D,
+                                              ABI::Windows::Graphics::IGeometrySource2DInterop>
+    {
+        using Build = std::function<winrt::com_ptr<ID2D1Geometry>(ID2D1Factory*)>;
+        Build build;
+        winrt::com_ptr<ID2D1Factory> factory;
+        GeometrySource(Build b, winrt::com_ptr<ID2D1Factory> f) : build(std::move(b)), factory(std::move(f)) {}
+        HRESULT __stdcall GetGeometry(ID2D1Geometry** value) noexcept override
+        {
+            return TryGetGeometryUsingFactory(factory.get(), value);
+        }
+        HRESULT __stdcall TryGetGeometryUsingFactory(ID2D1Factory* f, ID2D1Geometry** value) noexcept override
+        {
+            *value = nullptr;
+            try
+            {
+                build(f).copy_to(value);
+                return *value ? S_OK : E_FAIL;
+            }
+            catch (...)
+            {
+                return E_FAIL;
+            }
+        }
+    };
+
+    constexpr int kTraceSegments = 6;       // the trail is drawn as this many pieces, fading toward its end
+    constexpr float kTraceTail = 0.42f;     // trail length, as a fraction of the path (half the outline)
+    constexpr int kTraceHeadMs = 800;       // the head from the top edge's middle to the bottom edge's middle
+    constexpr float kTraceWidth = 1.f;      // px: a hairline
 
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
     {
@@ -1613,6 +1647,7 @@ void Stage::SetHover(int index)
 {
     if (index == m_hover)
         return;
+    ClearTrace();
     auto settle = [&](int i, bool hovered) {
         if (i < 0 || i >= static_cast<int>(m_visible.size()))
             return;
@@ -1680,6 +1715,125 @@ void Stage::SetHover(int index)
     settle(m_hover, false);
     settle(index, true);
     m_hover = index;
+    StartTrace(index);
+}
+
+void Stage::StartTrace(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_visible.size()) || m_busy || m_dragging ||
+        m_dock != DockState::Shown || m_cfg.speed == 3 || !m_cfg.hoverTrace)
+        return;
+    auto& c = *m_visible[index];
+    if (!c.side.holder || !c.side.sprite)
+        return;
+    try
+    {
+        // Facing front at hover size (it gets there while the trace waits for the turn to finish), so
+        // the outline is a plain rounded rectangle in view pixels, centered on the card's holder.
+        Pose p = HoverPose(c, index, true);
+        Crop k = CropFor(c, true);
+        float w = k.size.x * p.scale, h = k.size.y * p.scale, r = std::min(S(kRadius), std::min(w, h) / 2.f);
+        float pad = 2.f;                            // room for the stroke at the edges of the shape visual
+        if (!m_d2d)
+            winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, m_d2d.put()));
+        if (m_traceBrushes.empty())
+            for (int i = 0; i < kTraceSegments; ++i)
+            {
+                float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
+                m_traceBrushes.push_back(m_compositor.CreateColorBrush({ static_cast<uint8_t>(235 * fade), 255, 255, 255 }));
+            }
+
+        // One half of the outline: top middle, along the top to a corner, down the side, along the
+        // bottom to its middle. The left half mirrors the right one.
+        auto half = [&](bool right) {
+            auto build = [=](ID2D1Factory* factory) {
+                winrt::com_ptr<ID2D1PathGeometry> path;
+                winrt::check_hresult(factory->CreatePathGeometry(path.put()));
+                winrt::com_ptr<ID2D1GeometrySink> sink;
+                winrt::check_hresult(path->Open(sink.put()));
+                float left = pad, top = pad, rightX = pad + w, bottom = pad + h, mid = pad + w / 2.f;
+                auto x = [&](float v) { return right ? v : left + rightX - v; };
+                auto sweep = right ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
+                sink->BeginFigure({ mid, top }, D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddLine({ x(rightX - r), top });
+                sink->AddArc({ { x(rightX), top + r }, { r, r }, 0.f, sweep, D2D1_ARC_SIZE_SMALL });
+                sink->AddLine({ x(rightX), bottom - r });
+                sink->AddArc({ { x(rightX - r), bottom }, { r, r }, 0.f, sweep, D2D1_ARC_SIZE_SMALL });
+                sink->AddLine({ mid, bottom });
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                winrt::check_hresult(sink->Close());
+                return path.as<ID2D1Geometry>();
+            };
+            return wuc::CompositionPath(winrt::make<GeometrySource>(build, m_d2d));
+        };
+
+        // Every piece runs the path at the same steady speed, each a little later than the one ahead:
+        // piece i covers [p - (i+1)*seg, p - i*seg], so the head leads and dimmer pieces follow; past
+        // the end they bunch up at the bottom middle and vanish. Nothing shows before its start.
+        int wait = m_cfg.Ms(200), headMs = m_cfg.Ms(kTraceHeadMs);   // after the card has turned to face front
+        auto linear = m_compositor.CreateLinearEasingFunction();
+        auto shape = m_compositor.CreateShapeVisual();
+        shape.Size({ w + pad * 2.f, h + pad * 2.f });
+        shape.Offset({ -w / 2.f - pad, -h / 2.f - pad, 0.f });
+        float seg = kTraceTail / kTraceSegments;
+        for (bool right : { true, false })
+        {
+            auto path = half(right);
+            for (int i = 0; i < kTraceSegments; ++i)
+            {
+                auto geometry = m_compositor.CreatePathGeometry(path);
+                geometry.TrimStart(0.f);
+                geometry.TrimEnd(0.f);
+                auto trim = [&](wchar_t const* prop, float lag) {
+                    auto run = m_compositor.CreateScalarKeyFrameAnimation();
+                    run.InsertKeyFrame(0.f, 0.f);
+                    run.InsertKeyFrame(1.f, 1.f, linear);
+                    run.Duration(std::chrono::milliseconds(std::max(1, headMs)));
+                    run.DelayTime(std::chrono::milliseconds(wait + static_cast<int>(lag * headMs)));
+                    run.DelayBehavior(wuc::AnimationDelayBehavior::SetInitialValueBeforeDelay);
+                    geometry.StartAnimation(prop, run);
+                };
+                trim(L"TrimEnd", seg * i);
+                trim(L"TrimStart", seg * (i + 1));
+                auto stroke = m_compositor.CreateSpriteShape(geometry);
+                stroke.StrokeBrush(m_traceBrushes[i]);
+                stroke.StrokeThickness(kTraceWidth);
+                stroke.StrokeStartCap(wuc::CompositionStrokeCap::Round);
+                stroke.StrokeEndCap(wuc::CompositionStrokeCap::Round);
+                shape.Shapes().Append(stroke);
+            }
+        }
+        // Above the picture, under the app icon and pin.
+        c.side.holder.Children().InsertAbove(shape, c.side.sprite);
+        m_trace = shape;
+        m_traceParent = c.side.holder;
+
+        // Removed once the tail has reached the bottom (a timer: simpler than a batch per piece).
+        SetTimer(m_sidebar, kTimerTrace, static_cast<UINT>(wait + (1.f + kTraceTail) * headMs + 60), nullptr);
+        Trace(L"trace: started", c.hwnd);
+    }
+    catch (winrt::hresult_error const& e)
+    {
+        LogError(0, e.code(), L"hover trace");
+        ClearTrace();
+    }
+}
+
+void Stage::ClearTrace()
+{
+    if (m_trace && m_traceParent)
+    {
+        try
+        {
+            m_traceParent.Children().Remove(m_trace);
+        }
+        catch (...)
+        {
+        }
+    }
+    m_trace = nullptr;
+    m_traceParent = nullptr;
+    KillTimer(m_sidebar, kTimerTrace);
 }
 
 // ---- transitions ----------------------------------------------------------
@@ -1739,6 +1893,7 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
 
 void Stage::SwitchTo(size_t index)
 {
+    ClearTrace();
     auto next = m_visible[index];
     if (wt::IsCloaked(next->hwnd))
     {
@@ -1775,6 +1930,7 @@ void Stage::SwitchTo(size_t index)
 
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
+    ClearTrace();
     m_busy = true;
     SetTimer(m_sidebar, kTimerWatchdog, kWatchdogMs, nullptr);
     std::vector<HWND> leaving;
@@ -2677,6 +2833,11 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 }
                 UpdateDock();
             }
+        }
+        else if (wp == kTimerTrace)
+        {
+            Trace(L"trace: done");
+            ClearTrace();
         }
         else if (wp == kTimerQuit)
             FinishQuits();                          // also hands out cards held back during an animation
