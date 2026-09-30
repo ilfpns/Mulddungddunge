@@ -389,7 +389,7 @@ void Stage::PaintSettings()
             stepper(row(L"카드 기울기", L"0°로 하면 기울이지 않고 평평하게 보입니다", S(132)), buf, OptTilt, m_cfg.tilt > 0, m_cfg.tilt < 60);
             swprintf_s(buf, L"%d%%", m_cfg.size);
             stepper(row(L"카드 크기", L"크게 하면 사이드바도 함께 넓어집니다", S(132)), buf, OptSize, m_cfg.size > 80, m_cfg.size < 130);
-            choice(row(L"애니메이션 속도", L"창이 카드로 들어가고 나오는 움직임의 빠르기", S(304)), { L"빠르게", L"보통", L"느리게", L"끄기" }, m_cfg.speed, OptSpeed, S(76));
+            choice(row(L"애니메이션 속도", L"창이 움직이는 빠르기", S(304)), { L"빠르게", L"보통", L"느리게", L"끄기" }, m_cfg.speed, OptSpeed, S(76));
             choice(row(L"카드 속 화면 화질", L"높을수록 선명하지만 그래픽 메모리를 조금 더 씁니다", S(228)), { L"낮음", L"보통", L"높음" }, m_cfg.quality, OptQuality, S(76));
             toggle(row(L"아이콘만 보기 (절전)", L"창 화면 대신 앱 아이콘만 보여 줍니다. 배터리와 메모리를 가장 적게 씁니다", S(44)), m_cfg.iconsOnly, OptIcons);
             toggle(row(L"마우스 올리면 테두리 빛내기", L"카드에 마우스를 올리면 얇은 빛이 테두리를 따라 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
@@ -400,7 +400,7 @@ void Stage::PaintSettings()
             toggle(row(L"창에 가리면 사이드바 비켜 주기", L"창을 최대화하는 등 사이드바를 덮으면 화면 옆으로 숨습니다", S(44)), m_cfg.autoTuck, OptAutoTuck);
             toggle(row(L"화면 끝으로 다시 불러오기", L"숨어 있을 때 마우스를 화면 끝에 대면 다시 나타납니다", S(44)), m_cfg.edgeReveal, OptEdge);
             toggle(row(L"반씩 나눈 창 자리 맞추기", L"화면을 반으로 나눠 붙인 창이 사이드바에 가리지 않게 옆으로 옮겨 줍니다", S(44)), m_cfg.fitSnapped, OptFit);
-            toggle(row(L"숨는 앱도 카드 남기기", L"카카오톡처럼 X를 눌러도 꺼지지 않고 작업 표시줄 오른쪽 아이콘으로 숨는 앱도 카드를 남깁니다", S(44)), m_cfg.keepTray, OptTray);
+            toggle(row(L"숨는 앱도 카드 남기기", L"카카오톡처럼 X를 눌러도 꺼지지 않고 숨는 앱도 카드로 남깁니다", S(44)), m_cfg.keepTray, OptTray);
             toggle(row(L"새 알림 표시", L"새 메시지가 와서 작업 표시줄이 깜빡이면 그 카드에 주황 점과 빛나는 테두리가 생깁니다", S(44)), m_cfg.alerts, OptAlerts);
             toggle(row(L"소리 나는 앱 표시", L"소리가 나는 카드에 스피커가 뜹니다. 누르면 그 앱의 소리만 끄고 켭니다", S(44)), m_cfg.sounds, OptSounds);
             break;
