@@ -770,7 +770,7 @@ void Stage::RunMenuItem(int item)
     else if (command == ID_QUIT)
         QuitApp(card->hwnd);
     else if (command == ID_FIT)
-        FitToSaved(card->hwnd);
+        FitAndOpen(card->hwnd);
     else if (command >= ID_MOVE && command < ID_MOVE + m_menuDesktops.size())
     {
         GUID to = m_menuDesktops[command - ID_MOVE];
@@ -1132,6 +1132,26 @@ void Stage::RestoreTouchpadGesture()
     if (SystemParametersInfoW(SPI_GETTOUCHPADPARAMETERS, sizeof(tp), &tp, 0))
         SystemParametersInfoW(SPI_SETTOUCHPADPARAMETERS, sizeof(tp), &tp, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
     Trace(L"touchpad: three-finger swipe setting restored");
+}
+
+// "크기 맞추기": the window takes the saved place and size, then comes up on stage there, as if its
+// card had been clicked (already on stage: only the size changes).
+void Stage::FitAndOpen(HWND hwnd)
+{
+    FitToSaved(hwnd);
+    if (OnStage(hwnd) && IsWindowVisible(hwnd) && !IsIconic(hwnd))
+        return;                                     // on screen already: only the size changed
+    auto it = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& c) { return c->hwnd == hwnd; });
+    if (it == m_visible.end())
+    {
+        Trace(L"fit: no card in view, showing it", hwnd);
+        BringBack(hwnd);                            // no card in view: just show it
+        ForceForeground(hwnd);
+        return;
+    }
+    Trace(m_busy ? L"fit: opening its card (busy)" : L"fit: opening its card", hwnd);
+    Prefetch();
+    SwitchTo(static_cast<size_t>(it - m_visible.begin()));
 }
 
 void Stage::FitToSaved(HWND hwnd)
@@ -3456,8 +3476,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (LOWORD(wp) == ID_FIT)
         {
             Trace(L"fit requested", reinterpret_cast<HWND>(lp));
-            if (IsWindow(reinterpret_cast<HWND>(lp)))
-                FitToSaved(reinterpret_cast<HWND>(lp));
+            if (IsWindow(reinterpret_cast<HWND>(lp)) && !m_busy && !m_dragging)
+                FitAndOpen(reinterpret_cast<HWND>(lp));
         }
         return 0;
     case WM_TIMER:

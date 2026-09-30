@@ -147,6 +147,7 @@ private:
     // "크기 맞추기": the window takes one saved place and size (its visible frame lands there, whatever
     // invisible borders the app has).
     void FitToSaved(HWND hwnd);
+    void FitAndOpen(HWND hwnd);                     // then brings it on stage
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
     bool Here(Card const& c) const;                 // uses the cached desktop: no call
