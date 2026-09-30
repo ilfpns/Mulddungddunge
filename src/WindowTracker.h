@@ -34,6 +34,10 @@ namespace wt
     // QuitTarget: the process behind a window, or 0 if it must not or can't be quit (the shell, system
     // hosts, us, a browser web app, an elevated app, a UWP frame whose app can't be found).
     DWORD QuitTarget(HWND hwnd);
+    std::wstring ImageOf(DWORD pid);                        // a process's executable path
+    std::wstring ModelOf(DWORD pid);                        // a packaged app's AppUserModelID, or empty
+    // Whether an app (executable path + model id, as Audio reports it) is the one a card's id names.
+    bool IsCardApp(std::wstring const& cardApp, std::wstring const& image, std::wstring const& model);
     DWORD AppProcess(HWND hwnd);                            // the window's process; for a UWP frame, the app's
     bool IsShellWindow(HWND hwnd);                          // taskbar, desktop, shell popups
     // App ids compared without version folders (Discord "app-1.0.9", Store "Name_1.2.3.0_x64__pub").

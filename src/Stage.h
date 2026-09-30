@@ -1,6 +1,7 @@
 #pragma once
 #include "pch.h"
 #include "Snapshot.h"
+#include "Audio.h"
 #include "Config.h"
 
 // Visual tree for one card: holder (perspective, position) -> sprite (image, tilt, scale) + badge.
@@ -11,6 +12,8 @@ struct CardVis
     wuc::CompositionRoundedRectangleGeometry clip{ nullptr };
     wuc::SpriteVisual badge{ nullptr };
     wuc::SpriteVisual pin{ nullptr };
+    wuc::SpriteVisual alert{ nullptr };     // orange dot: its app asked for attention
+    wuc::SpriteVisual sound{ nullptr };     // speaker: its app is playing sound
 };
 
 struct Card;
@@ -35,6 +38,9 @@ struct Card
     bool hasPicture = false;    // snapshot or placeholder currently loaded
     bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
     std::wstring pinKey;    // the saved pin entry it was pinned with (its desktop may change later)
+    bool alert = false;     // flashed its taskbar button since it was last looked at
+    ULONGLONG alertTraceAt = 0;
+    int sound = 0;          // 0 silent, 1 playing, 2 playing but muted
     float w = 0, h = 0;     // sprite size = frame size
     wuc::CompositionSurfaceBrush snapshot{ nullptr };
     wuc::CompositionSurfaceBrush icon{ nullptr };
@@ -114,10 +120,26 @@ private:
     bool QuitsOnClose(HWND hwnd) const;             // its app is one the user chose to quit on X
     void PutAwayHidden(HWND hwnd);                  // a window hidden to the tray: into the sidebar
     bool InputPanelUp();
-    // Hover: a thin white line runs around the hovered card, from the top edge's middle down both
-    // sides to the bottom edge's middle, its trail fading behind it.
-    void StartTrace(int index);
-    void ClearTrace();
+    // A thin line runs around a card, from the top edge's middle down both sides to the bottom edge's
+    // middle, its trail fading behind it: white on hover, orange when its app asks for attention.
+    void StartTrace(int index);                     // the hovered card
+    void RunTrace(Card& c, bool hover);
+    void ClearTrace();                              // hover traces
+    void SweepTraces();                             // finished ones
+    // Card badges beyond the pin: attention dot and speaker.
+    wuc::CompositionSurfaceBrush SoundBrush(bool muted);
+    wuc::CompositionSurfaceBrush AlertBrush();
+    float2 AlertOffset(Card const& c, Pose const& p) const;
+    float2 SoundOffset(Card const& c, Pose const& p) const;
+    void UpdateBadges(Card& c);
+    void OnFlash(HWND hwnd);
+    void ClearAlert(HWND hwnd);
+    void OnAudioChanged();
+    int SoundAt(POINT sidePt) const;                // index of the visible card whose speaker is there
+    // An earlier version turned the system's three-finger swipe off while it ran; put it back if a
+    // run of it ended without doing so.
+    static void RestoreTouchpadGesture();
+    void MovePin(std::wstring const& from, std::wstring const& to);
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
     bool Here(Card const& c) const;                 // uses the cached desktop: no call
@@ -275,9 +297,21 @@ private:
     unsigned m_gen = 0;                             // transition number: late callbacks of an older one do nothing
     UINT m_taskbarMsg = 0;                          // "TaskbarCreated": Explorer restarted, re-add the tray icon
     HICON m_trayIcon = nullptr;
-    wuc::ShapeVisual m_trace{ nullptr };            // the running hover trace, see StartTrace
-    wuc::ContainerVisual m_traceParent{ nullptr };
-    std::vector<wuc::CompositionColorBrush> m_traceBrushes;     // head to tail, brightest first
+    struct TraceRun
+    {
+        wuc::ShapeVisual shape{ nullptr };
+        wuc::ContainerVisual parent{ nullptr };     // the card's sprite: the line tilts and grows with it
+        ULONGLONG until = 0;
+        bool hover = false;
+    };
+    std::vector<TraceRun> m_traces;
+    std::vector<wuc::CompositionColorBrush> m_traceBrushes, m_alertTraceBrushes;   // head to tail
+    wuc::CompositionSurfaceBrush m_soundBrush[2]{ nullptr, nullptr };
+    wuc::CompositionSurfaceBrush m_alertBrush{ nullptr };
+    Audio m_audio;
+    std::vector<Audio::Playing> m_playing;
+    int m_pressSound = -1;                          // speaker pressed, released over it = mute toggle
+    std::vector<GUID> m_menuDesktops;               // desktops listed in the open card menu
     winrt::com_ptr<ID2D1Factory> m_d2d;             // for the trace's outline paths
     std::vector<HWND> m_toMinimize;                 // stage windows whose flying copy is now on screen
     int m_pending = 0;                              // fly-out and fly-in steps still running

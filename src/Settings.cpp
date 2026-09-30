@@ -18,7 +18,7 @@ namespace
     enum : int
     {
         OptAutostart, OptHotkeys, OptHotkeyMod, OptCards, OptSide, OptMonitor, OptTilt, OptSize, OptSpeed,
-        OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace,
+        OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace, OptAlerts, OptSounds,
     };
 
     wchar_t const* const kTabs[] = { L"일반", L"모양", L"동작", L"앱", L"고정", L"정보" };
@@ -400,6 +400,8 @@ void Stage::PaintSettings()
             toggle(row(L"화면 가장자리로 다시 불러오기", L"숨은 동안 마우스를 화면 끝에 대면 나타납니다", S(44)), m_cfg.edgeReveal, OptEdge);
             toggle(row(L"분할한 창을 사이드바 옆에 맞추기", L"화면 분할로 붙인 창이 사이드바에 가려지지 않게 옆으로 옮깁니다", S(44)), m_cfg.fitSnapped, OptFit);
             toggle(row(L"트레이로 숨는 앱도 카드 유지", L"카카오톡처럼 닫으면 트레이로 가는 앱의 카드를 남깁니다", S(44)), m_cfg.keepTray, OptTray);
+            toggle(row(L"알림 온 카드 표시", L"메시지가 와서 작업 표시줄이 깜빡이는 앱의 카드에 주황 점과 테두리 선을 띄웁니다", S(44)), m_cfg.alerts, OptAlerts);
+            toggle(row(L"소리 나는 카드 표시", L"소리를 내는 앱의 카드에 스피커를 띄웁니다. 누르면 그 앱만 음소거", S(44)), m_cfg.sounds, OptSounds);
             break;
         case 3:     // Apps
         case 4:     // Pins
@@ -798,6 +800,8 @@ void Stage::SettingsClick(POINT pt)
         case OptFit: m_cfg.fitSnapped = !m_cfg.fitSnapped; break;
         case OptTray: m_cfg.keepTray = !m_cfg.keepTray; break;
         case OptTrace: m_cfg.hoverTrace = !m_cfg.hoverTrace; break;
+        case OptAlerts: m_cfg.alerts = !m_cfg.alerts; break;
+        case OptSounds: m_cfg.sounds = !m_cfg.sounds; break;
         }
         ApplySetting(target.arg);
         break;
@@ -986,6 +990,14 @@ void Stage::ApplySetting(int what)
     case OptTrace:
         if (!m_cfg.hoverTrace)
             ClearTrace();
+        break;
+    case OptAlerts:
+    case OptSounds:
+        if (m_cfg.sounds)
+            m_audio.Start(m_sidebar, WM_APP + 3);
+        else
+            m_audio.Stop();
+        OnAudioChanged();                           // also re-applies the alert dots
         break;
     }
     SaveSettings();

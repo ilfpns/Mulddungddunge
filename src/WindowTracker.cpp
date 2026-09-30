@@ -433,6 +433,31 @@ namespace wt
         return pid;
     }
 
+    std::wstring ImageOf(DWORD pid)
+    {
+        return PathOf(pid);
+    }
+
+    std::wstring ModelOf(DWORD pid)
+    {
+        HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+        if (!proc)
+            return {};
+        wchar_t id[APPLICATION_USER_MODEL_ID_MAX_LENGTH]{};
+        UINT32 len = ARRAYSIZE(id);
+        bool ok = GetApplicationUserModelId(proc, &len, id) == ERROR_SUCCESS;
+        CloseHandle(proc);
+        return ok ? std::wstring(id) : std::wstring();
+    }
+
+    bool IsCardApp(std::wstring const& cardApp, std::wstring const& image, std::wstring const& model)
+    {
+        auto id = cardApp.substr(0, cardApp.find(L'#'));     // a web app plays through its browser
+        if (id.rfind(L"uwp:", 0) == 0)
+            return !model.empty() && _wcsicmp(id.c_str() + 4, model.c_str()) == 0;
+        return SameApp(image, id);
+    }
+
     bool IsShellWindow(HWND hwnd)
     {
         return IsShellClass(hwnd);

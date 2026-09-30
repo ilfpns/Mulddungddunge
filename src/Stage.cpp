@@ -1,9 +1,12 @@
 #include "Stage.h"
 #include "WindowTracker.h"
+#include "VirtualDesktop.h"
 
 namespace
 {
     constexpr UINT WM_TRAY = WM_APP + 2;
+    constexpr UINT WM_AUDIO = WM_APP + 3;     // Audio: which apps play sound changed
+    constexpr wchar_t kTouchpadKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\PrecisionTouchPad";
     constexpr UINT ID_EXIT = 1;
     constexpr UINT ID_PIN = 2;
     constexpr UINT ID_UNPIN = 3;
@@ -11,6 +14,13 @@ namespace
     constexpr UINT ID_SETTINGS = 6;
     constexpr UINT ID_AUTOSTART = 5;
     constexpr UINT ID_QUIT = 7;
+    constexpr UINT ID_MOVE = 20;              // 20..28: send to desktop 1..9
+    wchar_t const* const kMoveLabels[] = {
+        L"데스크톱 1로 보내기", L"데스크톱 2로 보내기", L"데스크톱 3으로 보내기", L"데스크톱 4로 보내기",
+        L"데스크톱 5로 보내기", L"데스크톱 6으로 보내기", L"데스크톱 7로 보내기", L"데스크톱 8로 보내기",
+        L"데스크톱 9로 보내기",
+    };
+    constexpr float kAlertDot = 9.f;
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValue[] = L"StageManager";
     constexpr wchar_t kStateKey[] = L"Software\\StageManager";
@@ -237,6 +247,9 @@ bool Stage::Init(HINSTANCE inst)
     ShrinkView();
     m_taskbarMsg = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
+    if (m_cfg.sounds)
+        m_audio.Start(m_sidebar, WM_AUDIO);
+    RestoreTouchpadGesture();
     SetTimer(m_sidebar, kTimerPopulate, 400, nullptr);
     // While we run, a minimized stage window flies into the sidebar instead of shrinking to the
     // taskbar. Not persisted (no SPIF_UPDATEINIFILE); restored on exit. Only now: an Init that
@@ -248,6 +261,7 @@ bool Stage::Init(HINSTANCE inst)
 void Stage::Shutdown()
 {
     SetHotkeys(false);
+    m_audio.Stop();
     for (auto hook : m_hooks)
         UnhookWinEvent(hook);
     for (auto& [pid, hook] : m_moveHooks)
@@ -413,6 +427,10 @@ void Stage::OpenCardMenu(int index, int anchorY)
         };
         if (wt::QuitTarget(card->hwnd))
             m_menu.items.push_back(MenuItem{ ID_QUIT, L"\xE7E8", L"앱 종료" });
+        m_menuDesktops = vd::Desktops();            // empty where the move isn't supported
+        for (size_t d = 0; d < m_menuDesktops.size() && d < ARRAYSIZE(kMoveLabels); ++d)
+            if (m_menuDesktops[d] != m_desktopId && m_menuDesktops.size() > 1)
+                m_menu.items.push_back(MenuItem{ ID_MOVE + static_cast<UINT>(d), L"\xE8A7", kMoveLabels[d] });
     }
     m_menu.items.push_back(MenuItem{ ID_SETTINGS, L"\xE713", L"설정" });
     float w = S(kMenuW), h = S(kMenuPad) * 2 + S(kMenuItemH) * m_menu.items.size();
@@ -580,6 +598,17 @@ void Stage::RunMenuItem(int item)
         PostMessageW(card->hwnd, WM_CLOSE, 0, 0);   // the card goes away when the window is destroyed
     else if (command == ID_QUIT)
         QuitApp(card->hwnd);
+    else if (command >= ID_MOVE && command < ID_MOVE + m_menuDesktops.size())
+    {
+        GUID to = m_menuDesktops[command - ID_MOVE];
+        if (vd::MoveWindow(card->hwnd, to))
+        {
+            Trace(L"sent to another desktop", card->hwnd);
+            card->desktop = to;
+            LeaveStage(card->hwnd);
+            Relayout(true);
+        }
+    }
 }
 
 // Closes every window of the app the way its close buttons would, then, if it keeps running with
@@ -708,6 +737,179 @@ wuc::CompositionSurfaceBrush Stage::PinBrush()
     });
     m_pinBrush = m_compositor.CreateSurfaceBrush(surface);
     return m_pinBrush;
+}
+
+wuc::CompositionSurfaceBrush Stage::SoundBrush(bool muted)
+{
+    auto& brush = m_soundBrush[muted ? 1 : 0];
+    if (brush)
+        return brush;
+    float size = std::round(S(kPinBadge));
+    winrt::com_ptr<IDWriteTextFormat> glyph;
+    if (FAILED(m_snap.Text()->CreateTextFormat(L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size * 0.55f, L"", glyph.put())))
+        m_snap.Text()->CreateTextFormat(L"Segoe MDL2 Assets", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size * 0.55f, L"", glyph.put());
+    glyph->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    glyph->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    auto surface = m_snap.Paint(size, size, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> disc, ring, ink;
+        dc->CreateSolidColorBrush(D2D1::ColorF(0.11f, 0.11f, 0.13f, 0.92f), disc.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.35f), ring.put());
+        dc->CreateSolidColorBrush(muted ? D2D1::ColorF(1.f, 0.42f, 0.38f) : D2D1::ColorF(1.f, 1.f, 1.f), ink.put());
+        D2D1_ELLIPSE e{ { size / 2, size / 2 }, size / 2 - 1, size / 2 - 1 };
+        dc->FillEllipse(e, disc.get());
+        dc->DrawEllipse(e, ring.get(), 1.f);
+        dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        dc->DrawTextW(muted ? L"\xE74F" : L"\xE767", 1, glyph.get(), { 0, 0, size, size }, ink.get());
+    });
+    brush = m_compositor.CreateSurfaceBrush(surface);
+    return brush;
+}
+
+wuc::CompositionSurfaceBrush Stage::AlertBrush()
+{
+    if (m_alertBrush)
+        return m_alertBrush;
+    float size = std::round(S(kAlertDot));
+    auto surface = m_snap.Paint(size, size, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> dot, ring;
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 0.58f, 0.f), dot.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 0.45f), ring.put());
+        D2D1_ELLIPSE e{ { size / 2, size / 2 }, size / 2 - 1, size / 2 - 1 };
+        dc->FillEllipse(e, dot.get());
+        dc->DrawEllipse(e, ring.get(), 1.f);
+    });
+    m_alertBrush = m_compositor.CreateSurfaceBrush(surface);
+    return m_alertBrush;
+}
+
+void Stage::UpdateBadges(Card& c)
+{
+    auto& v = c.side;
+    if (!v.alert)
+        return;
+    v.alert.IsVisible(m_cfg.alerts && c.alert);
+    v.sound.IsVisible(m_cfg.sounds && c.sound != 0);
+    if (c.sound)
+        v.sound.Brush(SoundBrush(c.sound == 2));
+    auto it = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& o) { return o.get() == &c; });
+    if (it == m_visible.end())
+        return;
+    int i = static_cast<int>(it - m_visible.begin());
+    Pose p = HoverPose(c, i, i == m_hover);
+    float2 a = AlertOffset(c, p), o = SoundOffset(c, p);
+    v.alert.Offset({ a.x, a.y, 0.f });
+    v.sound.StopAnimation(L"Offset");
+    v.sound.Offset({ o.x, o.y, 0.f });
+}
+
+// A window flashing its taskbar button (a new message...): its card gets the dot and, now and then,
+// an orange run of the outline line.
+void Stage::OnFlash(HWND hwnd)
+{
+    if (!m_cfg.alerts || !hwnd)
+        return;
+    if (HWND owner = wt::ModalOwner(hwnd))
+        hwnd = owner;
+    if (hwnd == GetForegroundWindow())
+        return;
+    for (auto& c : m_cards)
+    {
+        if (c->hwnd != hwnd)
+            continue;
+        Trace(L"flash", hwnd);
+        c->alert = true;
+        UpdateBadges(*c);
+        ULONGLONG now = GetTickCount64();
+        if (now - c->alertTraceAt > 4000 && std::find(m_visible.begin(), m_visible.end(), c) != m_visible.end())
+        {
+            c->alertTraceAt = now;
+            RunTrace(*c, false);
+        }
+        return;
+    }
+}
+
+void Stage::ClearAlert(HWND hwnd)
+{
+    for (auto& c : m_cards)
+        if (c->hwnd == hwnd && c->alert)
+        {
+            c->alert = false;
+            UpdateBadges(*c);
+        }
+}
+
+void Stage::OnAudioChanged()
+{
+    m_playing = m_cfg.sounds ? m_audio.Current() : std::vector<Audio::Playing>{};
+    if (g_trace)
+        for (auto& p : m_playing)
+            Trace((std::wstring(p.muted ? L"audio (muted): " : L"audio: ") + p.app.substr(p.app.find_last_of(L'\\') + 1)).c_str());
+    for (auto& c : m_cards)
+    {
+        int sound = 0;
+        for (auto& p : m_playing)
+            if (wt::IsCardApp(c->app, p.app, p.model))
+                sound = p.muted ? 2 : 1;
+        c->sound = sound;
+        UpdateBadges(*c);
+    }
+}
+
+int Stage::SoundAt(POINT pt) const
+{
+    auto hit = [&](int i) {
+        auto& c = *m_visible[i];
+        if (!c.sound || !m_cfg.sounds)
+            return false;
+        Pose p = HoverPose(c, i, i == m_hover);
+        float2 o = p.center + SoundOffset(c, p);
+        float pad = S(3), size = S(kPinBadge);
+        return pt.x >= o.x - pad && pt.x <= o.x + size + pad && pt.y >= o.y - pad && pt.y <= o.y + size + pad;
+    };
+    if (m_hover >= 0 && m_hover < static_cast<int>(m_visible.size()) && hit(m_hover))
+        return m_hover;
+    for (int i = 0; i < static_cast<int>(m_visible.size()); ++i)
+        if (i != m_hover && hit(i))
+            return i;
+    return -1;
+}
+
+void Stage::RestoreTouchpadGesture()
+{
+    DWORD saved = 0, size = sizeof(saved);
+    if (RegGetValueW(HKEY_CURRENT_USER, kStateKey, L"ThreeFingerSlide", RRF_RT_REG_DWORD, nullptr, &saved, &size) != ERROR_SUCCESS)
+        return;
+    if (saved == 0xFFFFFFFF)                        // it was not set: the system default
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, kTouchpadKey, L"ThreeFingerSlideEnabled");
+    else
+        RegSetKeyValueW(HKEY_CURRENT_USER, kTouchpadKey, L"ThreeFingerSlideEnabled", REG_DWORD, &saved, sizeof(saved));
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kStateKey, L"ThreeFingerSlide");
+    // The touchpad stack reads its gesture settings again when its parameters are set.
+    TOUCHPAD_PARAMETERS_V1 tp{};
+    tp.versionNumber = TOUCHPAD_PARAMETERS_VERSION_1;
+    if (SystemParametersInfoW(SPI_GETTOUCHPADPARAMETERS, sizeof(tp), &tp, 0))
+        SystemParametersInfoW(SPI_SETTOUCHPADPARAMETERS, sizeof(tp), &tp, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    Trace(L"touchpad: three-finger swipe setting restored");
+}
+
+// Dragging a pinned card onto another pinned one puts it there; the order is the saved pin list's.
+void Stage::MovePin(std::wstring const& from, std::wstring const& to)
+{
+    auto find = [&](std::wstring const& e) {
+        return std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto& x) { return _wcsicmp(x.c_str(), e.c_str()) == 0; });
+    };
+    auto a = find(from), b = find(to);
+    if (a == m_pinnedApps.end() || b == m_pinnedApps.end() || a == b)
+        return;
+    bool down = a < b;
+    auto entry = *a;
+    m_pinnedApps.erase(a);
+    b = find(to);
+    m_pinnedApps.insert(down ? b + 1 : b, entry);
+    SavePins();
 }
 
 void Stage::SetPinned(Card& c, bool pinned)
@@ -898,6 +1100,26 @@ float2 Stage::BadgeOffset(Card const& c, Pose const& p) const
     return offset;
 }
 
+// The top-left corner as it appears after the tilt: the attention dot, then the speaker beside it.
+float2 Stage::AlertOffset(Card const& c, Pose const& p) const
+{
+    Crop k = CropFor(c, p.thumb);
+    float halfW = k.size.x * p.scale / 2.f, halfH = k.size.y * p.scale / 2.f;
+    float rad = p.angle * 3.14159265f / 180.f;
+    float2 corner = Project(p, { -halfW * std::cos(rad), -halfH }, halfW * std::sin(rad));
+    return corner + float2{ S(13), S(13) } - float2{ S(kAlertDot), S(kAlertDot) } / 2.f;
+}
+
+float2 Stage::SoundOffset(Card const& c, Pose const& p) const
+{
+    Crop k = CropFor(c, p.thumb);
+    float halfW = k.size.x * p.scale / 2.f, halfH = k.size.y * p.scale / 2.f;
+    float rad = p.angle * 3.14159265f / 180.f;
+    float2 corner = Project(p, { -halfW * std::cos(rad), -halfH }, halfW * std::sin(rad));
+    float x = (c.alert && m_cfg.alerts) ? S(33) : S(16);
+    return corner + float2{ x, S(14) } - float2{ S(kPinBadge), S(kPinBadge) } / 2.f;
+}
+
 float2 Stage::PinOffset(Card const& c, Pose const& p) const
 {
     Crop k = CropFor(c, p.thumb);
@@ -1006,6 +1228,7 @@ void Stage::OnForeground(HWND hwnd)
     // A dialog stands in for the window it blocks (a file picker in front of its chat window).
     if (HWND owner = wt::ModalOwner(hwnd); owner && (OnStage(owner) || !IsIconic(owner)))
         hwnd = owner;
+    ClearAlert(hwnd);
     CloseCardMenu();
     // Another window took focus (Alt+Tab...): the settings panel steps aside, like a menu.
     // (Focus handed back to the stage window, as after the tray menu, doesn't count.)
@@ -1250,6 +1473,8 @@ void Stage::AdoptPinnedElsewhere()
 GUID Stage::CurrentDesktopId()
 {
     GUID id{};
+    if (vd::Current(&id))
+        return id;
     DWORD size = sizeof(id);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
             L"CurrentVirtualDesktop", RRF_RT_REG_BINARY, nullptr, &id, &size) == ERROR_SUCCESS)
@@ -1456,6 +1681,18 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
         v.pin.IsVisible(c.pinned);
         v.holder.Children().InsertAtTop(v.pin);
     }
+    if (withBadge)
+    {
+        v.alert = m_compositor.CreateSpriteVisual();
+        v.alert.Size({ S(kAlertDot), S(kAlertDot) });
+        v.alert.Brush(AlertBrush());
+        v.alert.IsVisible(false);
+        v.holder.Children().InsertAtTop(v.alert);
+        v.sound = m_compositor.CreateSpriteVisual();
+        v.sound.Size({ S(kPinBadge), S(kPinBadge) });
+        v.sound.IsVisible(false);
+        v.holder.Children().InsertAtTop(v.sound);
+    }
     if (withBadge && c.icon)
     {
         v.badge = m_compositor.CreateSpriteVisual();
@@ -1489,6 +1726,12 @@ void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
     {
         float2 pin = PinOffset(c, p);
         v.pin.Offset({ pin.x, pin.y, 0.f });
+    }
+    if (v.alert)
+    {
+        float2 a = AlertOffset(c, p), o = SoundOffset(c, p);
+        v.alert.Offset({ a.x, a.y, 0.f });
+        v.sound.Offset({ o.x, o.y, 0.f });
     }
 }
 
@@ -1544,11 +1787,26 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
         move.Duration(dur);
         v.pin.StartAnimation(L"Offset", move);
     }
+    if (v.alert)
+    {
+        for (auto [visual, at] : { std::pair{ v.alert, AlertOffset(c, to) }, std::pair{ v.sound, SoundOffset(c, to) } })
+        {
+            auto move = m_compositor.CreateVector3KeyFrameAnimation();
+            move.InsertKeyFrame(1.f, { at.x, at.y, 0.f }, m_ease);
+            move.Duration(dur);
+            visual.StartAnimation(L"Offset", move);
+        }
+    }
 }
 
 void Stage::Relayout(bool animate)
 {
-    std::stable_partition(m_cards.begin(), m_cards.end(), [](auto& c) { return c->pinned; });
+    auto pinnedEnd = std::stable_partition(m_cards.begin(), m_cards.end(), [](auto& c) { return c->pinned; });
+    auto rank = [&](Card const& c) {
+        auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto& e) { return _wcsicmp(e.c_str(), c.pinKey.c_str()) == 0; });
+        return it - m_pinnedApps.begin();
+    };
+    std::stable_sort(m_cards.begin(), pinnedEnd, [&](auto& a, auto& b) { return rank(*a) < rank(*b); });
     m_visible.clear();
     // Every desktop's sidebar shows its 4 most recent cards; a card pushed out of its own desktop's
     // top 4 can never be seen again, so its snapshot is released.
@@ -1592,11 +1850,20 @@ void Stage::Relayout(bool animate)
                 ApplySize(c.side, c);
         }
         Pose target = SlotPose(c, i);
+        if (m_cfg.sounds)
+        {
+            int sound = 0;
+            for (auto& p : m_playing)
+                if (wt::IsCardApp(c.app, p.app, p.model))
+                    sound = p.muted ? 2 : 1;
+            c.sound = sound;
+        }
         if (!c.side.holder)
         {
             c.side = MakeVis(c, true);
             m_sideContent.Children().InsertAtTop(c.side.holder);
             ApplyPose(c.side, c, target);
+            UpdateBadges(c);
             continue;
         }
         c.side.holder.IsVisible(true);
@@ -1680,6 +1947,12 @@ void Stage::SetHover(int index)
             float2 o = PinOffset(c, p);
             vec(v.pin, L"Offset", { o.x, o.y, 0.f });
         }
+        if (v.alert)
+        {
+            float2 a = AlertOffset(c, p), o = SoundOffset(c, p);
+            vec(v.alert, L"Offset", { a.x, a.y, 0.f });
+            vec(v.sound, L"Offset", { o.x, o.y, 0.f });
+        }
         if (hovered)
         {
             // In front of its neighbours while it is larger than its slot.
@@ -1721,44 +1994,58 @@ void Stage::SetHover(int index)
 void Stage::StartTrace(int index)
 {
     if (index < 0 || index >= static_cast<int>(m_visible.size()) || m_busy || m_dragging ||
-        m_dock != DockState::Shown || m_cfg.speed == 3 || !m_cfg.hoverTrace)
+        m_dock != DockState::Shown || !m_cfg.hoverTrace)
         return;
-    auto& c = *m_visible[index];
-    if (!c.side.holder || !c.side.sprite)
+    RunTrace(*m_visible[index], true);
+}
+
+void Stage::RunTrace(Card& c, bool hover)
+{
+    auto sprite = c.side.sprite;
+    if (!sprite || m_cfg.speed == 3)
+        return;
+    auto it = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& o) { return o.get() == &c; });
+    if (it == m_visible.end())
         return;
     try
     {
-        // Facing front at hover size (it gets there while the trace waits for the turn to finish), so
-        // the outline is a plain rounded rectangle in view pixels, centered on the card's holder.
-        Pose p = HoverPose(c, index, true);
+        // Drawn inside the card's sprite, in its own (unscaled window) pixels: the line tilts, turns
+        // and grows with the card. Sizes that should look fixed on screen are divided by its scale.
+        int index = static_cast<int>(it - m_visible.begin());
+        Pose p = hover ? HoverPose(c, index, true) : SlotPose(c, index);
         Crop k = CropFor(c, true);
-        float w = k.size.x * p.scale, h = k.size.y * p.scale, r = std::min(S(kRadius), std::min(w, h) / 2.f);
-        float pad = 2.f;                            // room for the stroke at the edges of the shape visual
+        float width = kTraceWidth / p.scale, inset = width / 2.f;  // inside the card's clip
+        float left = k.offset.x + inset, top = k.offset.y + inset;
+        float right = k.offset.x + k.size.x - inset, bottom = k.offset.y + k.size.y - inset;
+        float r = std::max(0.f, std::min(S(kRadius) / p.scale - inset, std::min(right - left, bottom - top) / 2.f));
         if (!m_d2d)
             winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, m_d2d.put()));
-        if (m_traceBrushes.empty())
+        auto& brushes = hover ? m_traceBrushes : m_alertTraceBrushes;
+        if (brushes.empty())
             for (int i = 0; i < kTraceSegments; ++i)
             {
                 float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
-                m_traceBrushes.push_back(m_compositor.CreateColorBrush({ static_cast<uint8_t>(235 * fade), 255, 255, 255 }));
+                auto a = static_cast<uint8_t>(235 * fade);
+                brushes.push_back(m_compositor.CreateColorBrush(hover ? winrt::Windows::UI::Color{ a, 255, 255, 255 }
+                                                                      : winrt::Windows::UI::Color{ a, 255, 149, 0 }));
             }
 
         // One half of the outline: top middle, along the top to a corner, down the side, along the
         // bottom to its middle. The left half mirrors the right one.
-        auto half = [&](bool right) {
+        auto half = [&](bool toRight) {
             auto build = [=](ID2D1Factory* factory) {
                 winrt::com_ptr<ID2D1PathGeometry> path;
                 winrt::check_hresult(factory->CreatePathGeometry(path.put()));
                 winrt::com_ptr<ID2D1GeometrySink> sink;
                 winrt::check_hresult(path->Open(sink.put()));
-                float left = pad, top = pad, rightX = pad + w, bottom = pad + h, mid = pad + w / 2.f;
-                auto x = [&](float v) { return right ? v : left + rightX - v; };
-                auto sweep = right ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
+                float mid = (left + right) / 2.f;
+                auto x = [&](float v) { return toRight ? v : left + right - v; };
+                auto sweep = toRight ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
                 sink->BeginFigure({ mid, top }, D2D1_FIGURE_BEGIN_HOLLOW);
-                sink->AddLine({ x(rightX - r), top });
-                sink->AddArc({ { x(rightX), top + r }, { r, r }, 0.f, sweep, D2D1_ARC_SIZE_SMALL });
-                sink->AddLine({ x(rightX), bottom - r });
-                sink->AddArc({ { x(rightX - r), bottom }, { r, r }, 0.f, sweep, D2D1_ARC_SIZE_SMALL });
+                sink->AddLine({ x(right - r), top });
+                sink->AddArc({ { x(right), top + r }, { r, r }, 0.f, sweep, D2D1_ARC_SIZE_SMALL });
+                sink->AddLine({ x(right), bottom - r });
+                sink->AddArc({ { x(right - r), bottom }, { r, r }, 0.f, sweep, D2D1_ARC_SIZE_SMALL });
                 sink->AddLine({ mid, bottom });
                 sink->EndFigure(D2D1_FIGURE_END_OPEN);
                 winrt::check_hresult(sink->Close());
@@ -1770,15 +2057,14 @@ void Stage::StartTrace(int index)
         // Every piece runs the path at the same steady speed, each a little later than the one ahead:
         // piece i covers [p - (i+1)*seg, p - i*seg], so the head leads and dimmer pieces follow; past
         // the end they bunch up at the bottom middle and vanish. Nothing shows before its start.
-        int wait = m_cfg.Ms(200), headMs = m_cfg.Ms(kTraceHeadMs);   // after the card has turned to face front
+        int wait = hover ? m_cfg.Ms(200) : 0, headMs = m_cfg.Ms(kTraceHeadMs);   // hover: once the card faces front
         auto linear = m_compositor.CreateLinearEasingFunction();
         auto shape = m_compositor.CreateShapeVisual();
-        shape.Size({ w + pad * 2.f, h + pad * 2.f });
-        shape.Offset({ -w / 2.f - pad, -h / 2.f - pad, 0.f });
+        shape.Size({ c.w, c.h });
         float seg = kTraceTail / kTraceSegments;
-        for (bool right : { true, false })
+        for (bool toRight : { true, false })
         {
-            auto path = half(right);
+            auto path = half(toRight);
             for (int i = 0; i < kTraceSegments; ++i)
             {
                 auto geometry = m_compositor.CreatePathGeometry(path);
@@ -1796,44 +2082,59 @@ void Stage::StartTrace(int index)
                 trim(L"TrimEnd", seg * i);
                 trim(L"TrimStart", seg * (i + 1));
                 auto stroke = m_compositor.CreateSpriteShape(geometry);
-                stroke.StrokeBrush(m_traceBrushes[i]);
-                stroke.StrokeThickness(kTraceWidth);
+                stroke.StrokeBrush(brushes[i]);
+                stroke.StrokeThickness(width);
                 stroke.StrokeStartCap(wuc::CompositionStrokeCap::Round);
                 stroke.StrokeEndCap(wuc::CompositionStrokeCap::Round);
                 shape.Shapes().Append(stroke);
             }
         }
-        // Above the picture, under the app icon and pin.
-        c.side.holder.Children().InsertAbove(shape, c.side.sprite);
-        m_trace = shape;
-        m_traceParent = c.side.holder;
-
-        // Removed once the tail has reached the bottom (a timer: simpler than a batch per piece).
-        SetTimer(m_sidebar, kTimerTrace, static_cast<UINT>(wait + (1.f + kTraceTail) * headMs + 60), nullptr);
-        Trace(L"trace: started", c.hwnd);
+        // One run per card at a time.
+        for (auto& t : m_traces)
+            if (t.parent == sprite)
+                t.until = 0;
+        SweepTraces();
+        sprite.Children().InsertAtTop(shape);
+        m_traces.push_back({ shape, sprite, GetTickCount64() + wait + static_cast<ULONGLONG>((1.f + kTraceTail) * headMs) + 60, hover });
+        SweepTraces();                              // (re)arms the timer for the earliest end
+        Trace(hover ? L"trace: started" : L"trace: alert", c.hwnd);
     }
     catch (winrt::hresult_error const& e)
     {
-        LogError(0, e.code(), L"hover trace");
-        ClearTrace();
+        LogError(0, e.code(), L"card trace");
     }
 }
 
-void Stage::ClearTrace()
+void Stage::SweepTraces()
 {
-    if (m_trace && m_traceParent)
-    {
+    ULONGLONG now = GetTickCount64(), next = 0;
+    std::erase_if(m_traces, [&](TraceRun& t) {
+        if (t.until > now)
+        {
+            next = next ? std::min(next, t.until) : t.until;
+            return false;
+        }
         try
         {
-            m_traceParent.Children().Remove(m_trace);
+            t.parent.Children().Remove(t.shape);
         }
         catch (...)
         {
         }
-    }
-    m_trace = nullptr;
-    m_traceParent = nullptr;
-    KillTimer(m_sidebar, kTimerTrace);
+        return true;
+    });
+    if (next)
+        SetTimer(m_sidebar, kTimerTrace, static_cast<UINT>(next - now), nullptr);
+    else
+        KillTimer(m_sidebar, kTimerTrace);
+}
+
+void Stage::ClearTrace()
+{
+    for (auto& t : m_traces)
+        if (t.hover)
+            t.until = 0;
+    SweepTraces();
 }
 
 // ---- transitions ----------------------------------------------------------
@@ -1931,6 +2232,7 @@ void Stage::SwitchTo(size_t index)
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
     ClearTrace();
+    ClearAlert(next);
     m_busy = true;
     SetTimer(m_sidebar, kTimerWatchdog, kWatchdogMs, nullptr);
     std::vector<HWND> leaving;
@@ -2441,6 +2743,17 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
         JoinStage(card, viewPt);
         return;
     }
+    // Dropped on another pinned card: it takes that place (and keeps it after a restart).
+    if (!cancel && stillOurs && card->pinned && !card->pinKey.empty())
+    {
+        int target = HitTest(ViewToSide(MAKELPARAM(viewPt.x, viewPt.y)));
+        if (target >= 0 && m_visible[target] != card && m_visible[target]->pinned && !m_visible[target]->pinKey.empty())
+        {
+            Trace(L"pin moved", card->hwnd);
+            MovePin(card->pinKey, m_visible[target]->pinKey);
+            Relayout(true);
+        }
+    }
     // Dropped back on the sidebar: return to its slot.
     size_t slot = static_cast<size_t>(std::find(m_visible.begin(), m_visible.end(), card) - m_visible.begin());
     Pose home = SlotPose(*card, std::min(slot, m_visible.empty() ? 0 : m_visible.size() - 1));
@@ -2652,13 +2965,26 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:
         if (!m_busy)
         {
-            m_pressIndex = HitTest(ViewToSide(lp));
+            // The speaker is a button of its own: no switch, no drag.
+            m_pressSound = SoundAt(ViewToSide(lp));
+            m_pressIndex = m_pressSound >= 0 ? -1 : HitTest(ViewToSide(lp));
             m_pressPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         }
         return 0;
     case WM_LBUTTONUP:
     {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (m_pressSound >= 0)
+        {
+            int s = m_pressSound;
+            m_pressSound = -1;
+            if (!m_busy && s < static_cast<int>(m_visible.size()) && SoundAt(ViewToSide(lp)) == s)
+            {
+                auto& c = *m_visible[s];
+                m_audio.SetMute(c.app, c.sound != 2);
+            }
+            return 0;
+        }
         int pressed = m_pressIndex;
         m_pressIndex = -1;
         if (m_dragging)
@@ -2699,6 +3025,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     {
         if ((wp & 0x7FFF) == HSHELL_WINDOWDESTROYED)
             OnGone(reinterpret_cast<HWND>(lp));
+        else if (wp == (HSHELL_REDRAW | HSHELL_HIGHBIT))           // HSHELL_FLASH
+            OnFlash(reinterpret_cast<HWND>(lp));
         else if ((wp & 0x7FFF) == HSHELL_WINDOWCREATED)
         {
             // A new window on the taskbar: often shown (or titled) only after it took focus, when the
@@ -2712,6 +3040,9 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     }
     switch (msg)
     {
+    case WM_AUDIO:
+        OnAudioChanged();
+        return 0;
     case WM_HOTKEY:
     {
         size_t index = static_cast<size_t>(wp - kHotkeyBase);
@@ -2835,10 +3166,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         else if (wp == kTimerTrace)
-        {
-            Trace(L"trace: done");
-            ClearTrace();
-        }
+            SweepTraces();
         else if (wp == kTimerQuit)
             FinishQuits();                          // also hands out cards held back during an animation
         else if (wp == kTimerSweep)

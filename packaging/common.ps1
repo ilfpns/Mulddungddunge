@@ -35,6 +35,7 @@ function Stop-StageManager {
         $stuck | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue   # the exe stays locked until it has exited
     }
     Restore-MinimizeAnimation
+    Restore-TouchpadGesture
 }
 
 # The app turns the system minimize animation off while it runs and records the original value in
@@ -44,6 +45,20 @@ function Restore-MinimizeAnimation {
     if ($null -eq $state) { return }
     [StageManagerSetup.Native]::SystemParametersInfo(0x0049, 8, @(8, [int]$state.MinAnimate), 0x2) | Out-Null   # SPI_SETANIMATION
     Remove-ItemProperty -Path $StateKey -Name MinAnimate -ErrorAction SilentlyContinue
+}
+
+# The app turns the system's three-finger swipe off while its own card swipe is on, keeping the
+# user's value in HKCU\Software\StageManager; if it could not put it back itself (killed), do it here.
+function Restore-TouchpadGesture {
+    $state = Get-ItemProperty -Path $StateKey -Name ThreeFingerSlide -ErrorAction SilentlyContinue
+    if ($null -eq $state) { return }
+    $pad = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad'
+    if ([uint32]$state.ThreeFingerSlide -eq [uint32]::MaxValue) {
+        Remove-ItemProperty -Path $pad -Name ThreeFingerSlideEnabled -ErrorAction SilentlyContinue
+    } else {
+        Set-ItemProperty -Path $pad -Name ThreeFingerSlideEnabled -Value ([int]$state.ThreeFingerSlide) -Type DWord
+    }
+    Remove-ItemProperty -Path $StateKey -Name ThreeFingerSlide -ErrorAction SilentlyContinue
 }
 
 function Show-Message([string]$text, [string]$buttons = 'OK', [string]$icon = 'Information') {
