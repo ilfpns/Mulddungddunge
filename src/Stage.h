@@ -144,10 +144,9 @@ private:
     // run of it ended without doing so.
     static void RestoreTouchpadGesture();
     void MovePin(std::wstring const& from, std::wstring const& to);
-    // "Orca 크기·위치로 맞추기": the window takes the reference window's place and size (its visible
-    // frame, whatever invisible borders each app has). Null: no reference window open.
-    static HWND ReferenceWindow(HWND except);
-    void FitToReference(HWND hwnd);
+    // "크기 맞추기": the window takes one saved place and size (its visible frame lands there, whatever
+    // invisible borders the app has).
+    void FitToSaved(HWND hwnd);
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
     bool Here(Card const& c) const;                 // uses the cached desktop: no call
@@ -272,6 +271,7 @@ private:
     // Cards of windows that went on stage. Kept (without sidebar visuals) so a window minimized before
     // it could be photographed again still comes back with its last picture instead of a placeholder.
     std::vector<std::shared_ptr<Card>> m_offstage;
+    std::vector<std::pair<HWND, RECT>> m_borders;   // invisible borders of windows seen on stage (for 크기 맞추기)
     winrt::com_ptr<IVirtualDesktopManager> m_desktops;
     GUID m_desktopId{};
     bool m_busy = false;
