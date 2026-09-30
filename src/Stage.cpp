@@ -3473,6 +3473,8 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             CloseCardMenu();
             OpenSettings();                         // also reachable by other tools (and tests)
         }
+        else if (LOWORD(wp) == ID_QUIT && IsWindow(reinterpret_cast<HWND>(lp)))
+            QuitApp(reinterpret_cast<HWND>(lp));    // as the card menu does (tests, other tools)
         else if (LOWORD(wp) == ID_FIT)
         {
             Trace(L"fit requested", reinterpret_cast<HWND>(lp));
