@@ -144,6 +144,10 @@ private:
     // run of it ended without doing so.
     static void RestoreTouchpadGesture();
     void MovePin(std::wstring const& from, std::wstring const& to);
+    // "Orca 크기·위치로 맞추기": the window takes the reference window's place and size (its visible
+    // frame, whatever invisible borders each app has). Null: no reference window open.
+    static HWND ReferenceWindow(HWND except);
+    void FitToReference(HWND hwnd);
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
     bool Here(Card const& c) const;                 // uses the cached desktop: no call

@@ -14,6 +14,8 @@ namespace
     constexpr UINT ID_SETTINGS = 6;
     constexpr UINT ID_AUTOSTART = 5;
     constexpr UINT ID_QUIT = 7;
+    constexpr UINT ID_FIT = 8;                // the card's window takes the reference window's place and size
+    constexpr wchar_t kReferenceApp[] = L"Orca.exe";
     constexpr UINT ID_MOVE = 20;              // 20..28: send to desktop 1..9
     constexpr size_t kMaxMoveTargets = 9;
 
@@ -440,6 +442,8 @@ void Stage::OpenCardMenu(int index, int anchorY)
             card->pinned ? MenuItem{ ID_UNPIN, L"\xE77A", L"고정 해제" } : MenuItem{ ID_PIN, L"\xE718", L"탭 고정" },
             MenuItem{ ID_CLOSE, L"\xE8BB", L"창 닫기" },
         };
+        if (ReferenceWindow(card->hwnd))
+            m_menu.items.push_back(MenuItem{ ID_FIT, L"\xE740", L"Orca 크기·위치로 맞추기" });
         if (wt::QuitTarget(card->hwnd))
             m_menu.items.push_back(MenuItem{ ID_QUIT, L"\xE7E8", L"앱 종료" });
         // The window's own actions, then where to send it, then settings, each group set apart.
@@ -672,6 +676,8 @@ void Stage::AnimateMenuIcon(size_t item, bool hovered)
             angle = 90.f, scale = 1.1f, color = { 255, 255, 128, 110 };        // the cross turns, coral
         else if (command == ID_QUIT)
             scale = 1.28f, color = { 255, 255, 84, 84 };                       // the power sign pops, red
+        else if (command == ID_FIT)
+            scale = 1.22f, color = { 255, 186, 150, 255 };                     // the frame stretches, violet
         else if (command >= ID_MOVE && command < ID_MOVE + 9)
             shift = S(4), scale = 1.1f, color = { 255, 110, 182, 255 };        // off toward the other desktop, sky blue
         else if (command == ID_SETTINGS)
@@ -762,6 +768,8 @@ void Stage::RunMenuItem(int item)
         PostMessageW(card->hwnd, WM_CLOSE, 0, 0);   // the card goes away when the window is destroyed
     else if (command == ID_QUIT)
         QuitApp(card->hwnd);
+    else if (command == ID_FIT)
+        FitToReference(card->hwnd);
     else if (command >= ID_MOVE && command < ID_MOVE + m_menuDesktops.size())
     {
         GUID to = m_menuDesktops[command - ID_MOVE];
@@ -1119,6 +1127,99 @@ void Stage::RestoreTouchpadGesture()
     if (SystemParametersInfoW(SPI_GETTOUCHPADPARAMETERS, sizeof(tp), &tp, 0))
         SystemParametersInfoW(SPI_SETTOUCHPADPARAMETERS, sizeof(tp), &tp, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
     Trace(L"touchpad: three-finger swipe setting restored");
+}
+
+// The reference app's main window (the topmost one if it has several), not `except`'s app.
+HWND Stage::ReferenceWindow(HWND except)
+{
+    struct Ctx { DWORD skip; HWND found; } ctx{ 0, nullptr };
+    GetWindowThreadProcessId(except, &ctx.skip);
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto c = reinterpret_cast<Ctx*>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == c->skip || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) || GetWindowTextLengthW(h) == 0 || wt::IsCloaked(h))
+            return TRUE;
+        auto path = wt::ProcessPath(h);
+        auto name = path.substr(path.find_last_of(L'\\') + 1);
+        if (_wcsicmp(name.c_str(), kReferenceApp) != 0)
+            return TRUE;
+        c->found = h;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+void Stage::FitToReference(HWND hwnd)
+{
+    HWND ref = ReferenceWindow(hwnd);
+    if (!ref || !IsWindow(hwnd))
+    {
+        Trace(L"fit: no reference window", hwnd);
+        return;
+    }
+    // The reference's visible frame, in screen coordinates, whatever its state: where it would be
+    // restored to if it is minimized.
+    bool refMax = false;
+    RECT area = wt::RestoreRect(ref, &refMax);
+    refMax = refMax || IsZoomed(ref);
+    // This window's own invisible borders (measured now if it is on screen, otherwise as its card
+    // last saw them).
+    RECT border{};
+    if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsZoomed(hwnd))
+    {
+        RECT wr{};
+        GetWindowRect(hwnd, &wr);
+        RECT visible = wt::FrameRect(hwnd);
+        border = { visible.left - wr.left, visible.top - wr.top, wr.right - visible.right, wr.bottom - visible.bottom };
+    }
+    else if (auto c = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->hwnd == hwnd; }); c != m_cards.end())
+        border = (*c)->border;
+    RECT frame = area;
+    if (!refMax)
+    {
+        // The reference's invisible borders: measured if it is on screen, else as its card last saw
+        // them; never seen (minimized all along): taken to be like this window's, which for two
+        // ordinary windows makes the visible frames line up exactly.
+        RECT refBorder = border;
+        if (!IsIconic(ref))
+        {
+            RECT wr{};
+            GetWindowRect(ref, &wr);
+            RECT visible = wt::FrameRect(ref);
+            refBorder = { visible.left - wr.left, visible.top - wr.top, wr.right - visible.right, wr.bottom - visible.bottom };
+        }
+        else if (auto rc = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->hwnd == ref; });
+                 rc != m_cards.end() && ((*rc)->border.left || (*rc)->border.right || (*rc)->border.bottom))
+            refBorder = (*rc)->border;
+        frame = { area.left + refBorder.left, area.top + refBorder.top, area.right - refBorder.right, area.bottom - refBorder.bottom };
+    }
+    RECT target{ frame.left - border.left, frame.top - border.top, frame.right + border.right, frame.bottom + border.bottom };
+
+    // Placement is in workspace coordinates of the monitor the rectangle is on. The window keeps its
+    // state: a card stays minimized (and opens there), a hidden one stays hidden.
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromRect(&target, MONITOR_DEFAULTTONEAREST), &mi);
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    GetWindowPlacement(hwnd, &wp);
+    wp.rcNormalPosition = target;
+    OffsetRect(&wp.rcNormalPosition, mi.rcMonitor.left - mi.rcWork.left, mi.rcMonitor.top - mi.rcWork.top);
+    wp.flags &= ~WPF_RESTORETOMAXIMIZED;
+    if (!IsWindowVisible(hwnd))
+        wp.showCmd = SW_HIDE;
+    else if (IsIconic(hwnd))
+    {
+        wp.showCmd = SW_SHOWMINNOACTIVE;
+        if (refMax)
+            wp.flags |= WPF_RESTORETOMAXIMIZED;
+    }
+    else
+        wp.showCmd = refMax ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE;
+    SetWindowPlacement(hwnd, &wp);
+    Trace(refMax ? L"fit to reference (maximized)" : L"fit to reference", hwnd);
+    // The card flies from/to the new place from now on.
+    if (auto c = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& o) { return o->hwnd == hwnd; }); c != m_cards.end() && !refMax)
+        (*c)->frame = frame;
 }
 
 // Dragging a pinned card onto another pinned one puts it there; the order is the saved pin list's.
@@ -3379,6 +3480,12 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             CloseCardMenu();
             OpenSettings();                         // also reachable by other tools (and tests)
+        }
+        else if (LOWORD(wp) == ID_FIT)
+        {
+            Trace(L"fit requested", reinterpret_cast<HWND>(lp));
+            if (IsWindow(reinterpret_cast<HWND>(lp)))
+                FitToReference(reinterpret_cast<HWND>(lp));
         }
         return 0;
     case WM_TIMER:
