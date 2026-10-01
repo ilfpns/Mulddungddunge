@@ -17,6 +17,7 @@ struct Config
     bool hoverTrace = true;         // a thin line runs around the card the pointer is on
     int cardStyle = 1;              // stand-in cards (no picture of the window): 0 gray, 1 frosted glass
     int traceColor = 0;             // the card line's color, one for all its uses (index into kTraceColors)
+    int traceWidth = 2;             // the card line's thickness in px on screen, 1..5
     bool alerts = true;             // a card whose app flashes its taskbar button gets an orange dot
     bool sounds = true;             // a card whose app plays sound gets a speaker (click: mute)
     bool hotkeys = true;            // modifier + 1..N switches to that card

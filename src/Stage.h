@@ -334,6 +334,7 @@ private:
     // recolors the lines already running.
     std::vector<wuc::CompositionColorBrush> m_traceBrushes;
     void TintTraces();
+    void RedrawTraces();                            // after the line's thickness changed
     wuc::CompositionSurfaceBrush m_soundBrush[2]{ nullptr, nullptr };
     wuc::CompositionSurfaceBrush m_alertBrush{ nullptr };
     wuc::CompositionBackdropBrush m_backdrop{ nullptr };    // what is behind our window, blurred by DWM

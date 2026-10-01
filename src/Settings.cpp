@@ -19,7 +19,7 @@ namespace
     {
         OptAutostart, OptHotkeys, OptHotkeyMod, OptCards, OptSide, OptMonitor, OptTilt, OptSize, OptSpeed,
         OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace, OptAlerts, OptSounds, OptCardStyle,
-        OptTraceColor,
+        OptTraceColor, OptTraceWidth,
     };
 
     wchar_t const* const kTabs[] = { L"일반", L"모양", L"동작", L"앱", L"고정", L"정보" };
@@ -411,6 +411,8 @@ void Stage::PaintSettings()
             choice(row(L"카드 속 화면 화질", L"높을수록 선명하지만 그래픽 메모리를 조금 더 씁니다", S(228)), { L"낮음", L"보통", L"높음" }, m_cfg.quality, OptQuality, S(76));
             toggle(row(L"아이콘만 보기 (절전)", L"창 화면 대신 앱 아이콘만 보여 줍니다. 배터리와 메모리를 가장 적게 씁니다", S(44)), m_cfg.iconsOnly, OptIcons);
             toggle(row(L"마우스 올리면 테두리 빛내기", L"카드에 마우스를 올리면 얇은 빛이 테두리를 따라 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
+            swprintf_s(buf, L"%dpx", m_cfg.traceWidth);
+            stepper(row(L"테두리 빛 굵기", L"잘 안 보이면 굵게 해 주세요 (1~5px)", S(132)), buf, OptTraceWidth, m_cfg.traceWidth > 1, m_cfg.traceWidth < 5);
             swatches(row(L"테두리 빛 색", L"마우스 올릴 때, 파일을 올릴 때, 새 알림 때 도는 빛의 색", S(34) * kTraceColorCount), m_cfg.traceColor, OptTraceColor);
             choice(row(L"대체 카드 모양", L"창 화면을 보여 줄 수 없을 때(최소화 등) 쓰는 카드", S(152)), { L"회색", L"유리" }, m_cfg.cardStyle, OptCardStyle, S(76));
             break;
@@ -867,6 +869,8 @@ void Stage::SettingsClick(POINT pt)
             m_cfg.tilt = std::clamp(m_cfg.tilt + dir * 6, 0, 60);
         else if (what == OptSize)
             m_cfg.size = std::clamp(m_cfg.size + dir * 10, 80, 130);
+        else if (what == OptTraceWidth)
+            m_cfg.traceWidth = std::clamp(m_cfg.traceWidth + dir, 1, 5);
         ApplySetting(what);
         break;
     }
@@ -1029,6 +1033,9 @@ void Stage::ApplySetting(int what)
         break;
     case OptTraceColor:
         TintTraces();                               // lines already running change color too
+        break;
+    case OptTraceWidth:
+        RedrawTraces();
         break;
     case OptAlerts:
     case OptSounds:

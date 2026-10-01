@@ -233,7 +233,6 @@ namespace
     constexpr int kTraceSegments = 6;       // the trail is drawn as this many pieces, fading toward its end
     constexpr float kTraceTail = 0.42f;     // trail length, as a fraction of the path (half the outline)
     constexpr int kTraceHeadMs = 800;       // the head from the top edge's middle to the bottom edge's middle
-    constexpr float kTraceWidth = 1.f;      // px: a hairline
     constexpr int kAlertCycleMs = 2600;     // attention loop: one run, then a rest (DWM idles meanwhile)
 
     wuc::CompositionEasingFunction MakeEase(wuc::Compositor const& c)
@@ -2518,7 +2517,8 @@ void Stage::RunTrace(Card& c, bool hover, int countdownMs)
         int index = static_cast<int>(it - m_visible.begin());
         Pose p = hover ? HoverPose(c, index, true) : SlotPose(c, index);
         Crop k = CropFor(c, true);
-        float width = kTraceWidth / p.scale, inset = width / 2.f;  // inside the card's clip
+        // The thickness chosen in Settings, in screen px (scaled by the display's DPI).
+        float width = S(static_cast<float>(std::clamp(m_cfg.traceWidth, 1, 5))) / p.scale, inset = width / 2.f;  // inside the card's clip
         float left = k.offset.x + inset, top = k.offset.y + inset;
         float right = k.offset.x + k.size.x - inset, bottom = k.offset.y + k.size.y - inset;
         float r = std::max(0.f, std::min(S(kRadius) / p.scale - inset, std::min(right - left, bottom - top) / 2.f));
@@ -2584,7 +2584,7 @@ void Stage::RunTrace(Card& c, bool hover, int countdownMs)
                     geometry.StartAnimation(L"TrimEnd", fill);
                     auto stroke = m_compositor.CreateSpriteShape(geometry);
                     stroke.StrokeBrush(brushes[0]);
-                    stroke.StrokeThickness(width * 1.5f);
+                    stroke.StrokeThickness(width);
                     stroke.StrokeStartCap(wuc::CompositionStrokeCap::Round);
                     stroke.StrokeEndCap(wuc::CompositionStrokeCap::Round);
                     shape.Shapes().Append(stroke);
@@ -2654,6 +2654,16 @@ void Stage::TintTraces()
         float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
         m_traceBrushes[i].Color({ static_cast<uint8_t>(235 * fade), rgb[0], rgb[1], rgb[2] });
     }
+}
+
+// Lines already drawn keep their thickness: the hover one goes, the alert loops are drawn again.
+void Stage::RedrawTraces()
+{
+    for (auto& t : m_traces)
+        t.until = 0;
+    SweepTraces();
+    for (auto& c : m_cards)
+        UpdateBadges(*c);
 }
 
 void Stage::SweepTraces()
