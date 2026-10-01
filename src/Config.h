@@ -1,6 +1,13 @@
 #pragma once
 #include "pch.h"
 
+// Colors the line running around a card can take (pointer on it, file held over it, new alert):
+// white, orange, blue, green, purple, pink. Bright, so a hairline still shows on any picture.
+inline constexpr uint8_t kTraceColors[][3] = {
+    { 255, 255, 255 }, { 255, 149, 0 }, { 10, 132, 255 }, { 48, 209, 88 }, { 191, 90, 242 }, { 255, 55, 95 },
+};
+inline constexpr int kTraceColorCount = static_cast<int>(std::size(kTraceColors));
+
 // User settings, kept under HKCU\Software\StageManager\Settings. Read once at startup, written on change.
 struct Config
 {
@@ -9,6 +16,7 @@ struct Config
     bool iconsOnly = false;         // no window pictures, app icon cards only: least GPU memory, no captures
     bool hoverTrace = true;         // a thin line runs around the card the pointer is on
     int cardStyle = 1;              // stand-in cards (no picture of the window): 0 gray, 1 frosted glass
+    int traceColor = 0;             // the card line's color, one for all its uses (index into kTraceColors)
     bool alerts = true;             // a card whose app flashes its taskbar button gets an orange dot
     bool sounds = true;             // a card whose app plays sound gets a speaker (click: mute)
     bool hotkeys = true;            // modifier + 1..N switches to that card

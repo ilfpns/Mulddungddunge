@@ -73,6 +73,10 @@ class Stage
 public:
     bool Init(HINSTANCE inst);
     void Shutdown();
+    // Something (files from Explorer...) is dragged over the sidebar: held over a card, the card opens
+    // its window after a moment so the drop can land in the app. Called by the view's drop target.
+    void DragHover(POINTL screen);
+    void DragEnd();
 
 private:
     static LRESULT CALLBACK SidebarProc(HWND, UINT, WPARAM, LPARAM);
@@ -125,7 +129,8 @@ private:
     // A thin line runs around a card, from the top edge's middle down both sides to the bottom edge's
     // middle, its trail fading behind it: white on hover, orange when its app asks for attention.
     void StartTrace(int index);                     // the hovered card
-    void RunTrace(Card& c, bool hover);
+    // countdownMs > 0: a file is held over the card; the line fills the outline over that long.
+    void RunTrace(Card& c, bool hover, int countdownMs = 0);
     void ClearTrace();                              // hover traces
     void StopAlertTrace(wuc::ContainerVisual const& sprite);
     void SweepTraces();                             // finished ones
@@ -307,6 +312,10 @@ private:
     bool m_shownEarly = false;                      // the incoming window was restored mid-flight (kTimerEarlyShow)
     // A click or right-click on a card while a transition was running: carried out once it ends,
     // rather than dropped (kTimerQueued).
+    winrt::com_ptr<IDropTarget> m_dropTarget;       // the view, as a place things can be dragged over
+    bool m_fileDrag = false;                        // a drag from another app is over the sidebar
+    HWND m_dropHwnd = nullptr;                      // ...held over this window's card (kTimerDropOpen)
+    bool m_dropHold = false;                        // a card was opened: none opens again until the pointer leaves the cards
     HWND m_queuedSwitch = nullptr;
     HWND m_queuedMenu = nullptr;
     int m_queuedMenuY = 0;
@@ -321,7 +330,10 @@ private:
         bool hover = false;                         // otherwise: the attention loop
     };
     std::vector<TraceRun> m_traces;
-    std::vector<wuc::CompositionColorBrush> m_traceBrushes, m_alertTraceBrushes;   // head to tail
+    // Head to tail, shared by every card line (hover, file held over, alert): recoloring them
+    // recolors the lines already running.
+    std::vector<wuc::CompositionColorBrush> m_traceBrushes;
+    void TintTraces();
     wuc::CompositionSurfaceBrush m_soundBrush[2]{ nullptr, nullptr };
     wuc::CompositionSurfaceBrush m_alertBrush{ nullptr };
     wuc::CompositionBackdropBrush m_backdrop{ nullptr };    // what is behind our window, blurred by DWM

@@ -19,6 +19,7 @@ namespace
     {
         OptAutostart, OptHotkeys, OptHotkeyMod, OptCards, OptSide, OptMonitor, OptTilt, OptSize, OptSpeed,
         OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace, OptAlerts, OptSounds, OptCardStyle,
+        OptTraceColor,
     };
 
     wchar_t const* const kTabs[] = { L"일반", L"모양", L"동작", L"앱", L"고정", L"정보" };
@@ -333,6 +334,23 @@ void Stage::PaintSettings()
                 text(options[i], r, m.value.get(), static_cast<int>(i) == current ? gold.get() : dim.get());
             }
         };
+        // Round color samples; the chosen one gets a ring.
+        auto swatches = [&](float cy, int current, int what) {
+            float gap = S(34), radius = S(10);
+            float first = x1 - gap * (kTraceColorCount - 1) - S(14);
+            for (int i = 0; i < kTraceColorCount; ++i)
+            {
+                D2D1_POINT_2F c{ first + gap * i, cy };
+                bool over = hit({ c.x - gap / 2, cy - S(17), c.x + gap / 2, cy + S(17) }, HitChoice, what * 16 + i);
+                winrt::com_ptr<ID2D1SolidColorBrush> fill;
+                dc->CreateSolidColorBrush(D2D1::ColorF(kTraceColors[i][0] / 255.f, kTraceColors[i][1] / 255.f, kTraceColors[i][2] / 255.f), fill.put());
+                dc->FillEllipse(D2D1::Ellipse(c, radius, radius), fill.get());
+                if (i == current)
+                    dc->DrawEllipse(D2D1::Ellipse(c, radius + S(4), radius + S(4)), ink.get(), S(2));
+                else if (over)
+                    dc->DrawEllipse(D2D1::Ellipse(c, radius + S(4), radius + S(4)), faint.get(), S(1.5f));
+            }
+        };
         auto stepper = [&](float cy, std::wstring const& value, int what, bool canDown, bool canUp) {
             D2D1_RECT_F minus{ x1 - S(132), cy - S(16), x1 - S(100), cy + S(16) };
             D2D1_RECT_F plus{ x1 - S(32), cy - S(16), x1, cy + S(16) };
@@ -393,6 +411,7 @@ void Stage::PaintSettings()
             choice(row(L"카드 속 화면 화질", L"높을수록 선명하지만 그래픽 메모리를 조금 더 씁니다", S(228)), { L"낮음", L"보통", L"높음" }, m_cfg.quality, OptQuality, S(76));
             toggle(row(L"아이콘만 보기 (절전)", L"창 화면 대신 앱 아이콘만 보여 줍니다. 배터리와 메모리를 가장 적게 씁니다", S(44)), m_cfg.iconsOnly, OptIcons);
             toggle(row(L"마우스 올리면 테두리 빛내기", L"카드에 마우스를 올리면 얇은 빛이 테두리를 따라 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
+            swatches(row(L"테두리 빛 색", L"마우스 올릴 때, 파일을 올릴 때, 새 알림 때 도는 빛의 색", S(34) * kTraceColorCount), m_cfg.traceColor, OptTraceColor);
             choice(row(L"대체 카드 모양", L"창 화면을 보여 줄 수 없을 때(최소화 등) 쓰는 카드", S(152)), { L"회색", L"유리" }, m_cfg.cardStyle, OptCardStyle, S(76));
             break;
         }
@@ -827,6 +846,7 @@ void Stage::SettingsClick(POINT pt)
         case OptSpeed: m_cfg.speed = value; break;
         case OptQuality: m_cfg.quality = value; break;
         case OptCardStyle: m_cfg.cardStyle = value; break;
+        case OptTraceColor: m_cfg.traceColor = std::clamp(value, 0, kTraceColorCount - 1); break;
         case OptMonitor:
             if (value >= static_cast<int>(m.monitors.size()))
                 return;
@@ -1006,6 +1026,9 @@ void Stage::ApplySetting(int what)
         break;
     case OptCardStyle:
         RestylePlaceholders();
+        break;
+    case OptTraceColor:
+        TintTraces();                               // lines already running change color too
         break;
     case OptAlerts:
     case OptSounds:

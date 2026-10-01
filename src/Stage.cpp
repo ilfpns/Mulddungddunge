@@ -73,6 +73,8 @@ namespace
     constexpr UINT_PTR kTimerTrace = 16;      // the hover trace has run its course: remove it
     constexpr UINT_PTR kTimerEarlyShow = 17;  // early in a card's flight: bring its window up under it
     constexpr UINT_PTR kTimerQueued = 18;     // a click held back by a transition: carry it out now
+    constexpr UINT_PTR kTimerDropOpen = 19;   // a file held over a card this long: its window opens
+    constexpr int kDropOpenMs = 2000;
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -188,6 +190,46 @@ namespace
         }
     };
 
+    // The view as a drop target. It never takes the drop (the effect stays "none"); it only learns
+    // where the drag is, so a card held under it can open its window for the drop to land in.
+    struct DropTarget : winrt::implements<DropTarget, ::IDropTarget>
+    {
+        Stage* stage;
+        explicit DropTarget(Stage* s) : stage(s) {}
+        HRESULT __stdcall DragEnter(IDataObject*, DWORD, POINTL pt, DWORD* effect) noexcept override
+        {
+            return DragOver(0, pt, effect);
+        }
+        HRESULT __stdcall DragOver(DWORD, POINTL pt, DWORD* effect) noexcept override
+        {
+            *effect = DROPEFFECT_NONE;
+            try
+            {
+                stage->DragHover(pt);
+            }
+            catch (...)
+            {
+            }
+            return S_OK;
+        }
+        HRESULT __stdcall DragLeave() noexcept override
+        {
+            try
+            {
+                stage->DragEnd();
+            }
+            catch (...)
+            {
+            }
+            return S_OK;
+        }
+        HRESULT __stdcall Drop(IDataObject*, DWORD, POINTL, DWORD* effect) noexcept override
+        {
+            *effect = DROPEFFECT_NONE;
+            return DragLeave();
+        }
+    };
+
     constexpr int kTraceSegments = 6;       // the trail is drawn as this many pieces, fading toward its end
     constexpr float kTraceTail = 0.42f;     // trail length, as a fraction of the path (half the outline)
     constexpr int kTraceHeadMs = 800;       // the head from the top edge's middle to the bottom edge's middle
@@ -289,6 +331,19 @@ bool Stage::Init(HINSTANCE inst)
 
     Dock();
     ShrinkView();
+    // Drag and drop needs OLE on this thread (COM alone is not enough); without it cards just don't
+    // open under a dragged file.
+    if (SUCCEEDED(OleInitialize(nullptr)))
+    {
+        m_dropTarget = winrt::make<DropTarget>(this).as<IDropTarget>();
+        if (HRESULT hr = RegisterDragDrop(m_view, m_dropTarget.get()); FAILED(hr))
+        {
+            LogError(0, hr, L"drop target not registered");
+            m_dropTarget = nullptr;
+        }
+        else
+            Trace(L"drop target registered");
+    }
     m_taskbarMsg = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
     if (m_cfg.sounds)
@@ -324,6 +379,10 @@ void Stage::Shutdown()
     m_quitting.clear();
     SetMinAnimate(true);
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kStateKey, L"MinAnimate");
+    if (m_dropTarget)
+        RevokeDragDrop(m_view);
+    m_dropTarget = nullptr;
+    OleUninitialize();
     DestroyWindow(m_view);
     DestroyWindow(m_sidebar);
 }
@@ -2431,14 +2490,19 @@ void Stage::SetHover(int index)
 
 void Stage::StartTrace(int index)
 {
-    if (index < 0 || index >= static_cast<int>(m_visible.size()) || m_busy || m_dragging ||
-        m_dock != DockState::Shown || !m_cfg.hoverTrace)
+    if (index < 0 || index >= static_cast<int>(m_visible.size()) || m_busy || m_dragging || m_dock != DockState::Shown)
         return;
-    RunTrace(*m_visible[index], true);
+    // A file held over the card: the line counts down to its window opening (shown even with the
+    // hover line turned off, since it tells what is about to happen).
+    if (m_fileDrag && m_dropHwnd == m_visible[index]->hwnd)
+        RunTrace(*m_visible[index], true, kDropOpenMs);
+    else if (m_cfg.hoverTrace)
+        RunTrace(*m_visible[index], true);
 }
 
-void Stage::RunTrace(Card& c, bool hover)
+void Stage::RunTrace(Card& c, bool hover, int countdownMs)
 {
+    bool countdown = hover && countdownMs > 0;
     auto sprite = c.side.sprite;
     if (!sprite || m_cfg.speed == 3)
         return;
@@ -2460,15 +2524,13 @@ void Stage::RunTrace(Card& c, bool hover)
         float r = std::max(0.f, std::min(S(kRadius) / p.scale - inset, std::min(right - left, bottom - top) / 2.f));
         if (!m_d2d)
             winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, m_d2d.put()));
-        auto& brushes = hover ? m_traceBrushes : m_alertTraceBrushes;
+        auto& brushes = m_traceBrushes;
         if (brushes.empty())
+        {
             for (int i = 0; i < kTraceSegments; ++i)
-            {
-                float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
-                auto a = static_cast<uint8_t>(235 * fade);
-                brushes.push_back(m_compositor.CreateColorBrush(hover ? winrt::Windows::UI::Color{ a, 255, 255, 255 }
-                                                                      : winrt::Windows::UI::Color{ a, 255, 149, 0 }));
-            }
+                brushes.push_back(m_compositor.CreateColorBrush());
+            TintTraces();
+        }
 
         // One half of the outline: top middle, along the top to a corner, down the side, along the
         // bottom to its middle. The left half mirrors the right one.
@@ -2497,7 +2559,7 @@ void Stage::RunTrace(Card& c, bool hover)
         // Every piece runs the path at the same steady speed, each a little later than the one ahead:
         // piece i covers [p - (i+1)*seg, p - i*seg], so the head leads and dimmer pieces follow; past
         // the end they bunch up at the bottom middle and vanish. Nothing shows before its start.
-        int wait = hover ? m_cfg.Ms(200) : 0, headMs = m_cfg.Ms(kTraceHeadMs);   // hover: once the card faces front
+        int wait = hover && !countdown ? m_cfg.Ms(200) : 0, headMs = m_cfg.Ms(kTraceHeadMs);   // hover: once the card faces front
         // The attention loop repeats: each cycle is one run of the line followed by a rest.
         int cycle = std::max(m_cfg.Ms(kAlertCycleMs), static_cast<int>((1.f + kTraceTail) * headMs) + 1);
         auto linear = m_compositor.CreateLinearEasingFunction();
@@ -2507,11 +2569,27 @@ void Stage::RunTrace(Card& c, bool hover)
         for (bool toRight : { true, false })
         {
             auto path = half(toRight);
-            for (int i = 0; i < kTraceSegments; ++i)
+            // Countdown: one bright line from the top middle that fills both halves and stays.
+            for (int i = 0; i < (countdown ? 1 : kTraceSegments); ++i)
             {
                 auto geometry = m_compositor.CreatePathGeometry(path);
                 geometry.TrimStart(0.f);
                 geometry.TrimEnd(0.f);
+                if (countdown)
+                {
+                    auto fill = m_compositor.CreateScalarKeyFrameAnimation();
+                    fill.InsertKeyFrame(0.f, 0.f);
+                    fill.InsertKeyFrame(1.f, 1.f, linear);
+                    fill.Duration(std::chrono::milliseconds(countdownMs));
+                    geometry.StartAnimation(L"TrimEnd", fill);
+                    auto stroke = m_compositor.CreateSpriteShape(geometry);
+                    stroke.StrokeBrush(brushes[0]);
+                    stroke.StrokeThickness(width * 1.5f);
+                    stroke.StrokeStartCap(wuc::CompositionStrokeCap::Round);
+                    stroke.StrokeEndCap(wuc::CompositionStrokeCap::Round);
+                    shape.Shapes().Append(stroke);
+                    continue;
+                }
                 auto trim = [&](wchar_t const* prop, float lag) {
                     auto run = m_compositor.CreateScalarKeyFrameAnimation();
                     if (hover)
@@ -2555,14 +2633,26 @@ void Stage::RunTrace(Card& c, bool hover)
             }
         SweepTraces();
         sprite.Children().InsertAtTop(shape);
-        ULONGLONG until = hover ? GetTickCount64() + wait + static_cast<ULONGLONG>((1.f + kTraceTail) * headMs) + 60 : ~0ull;
+        ULONGLONG until = countdown ? GetTickCount64() + countdownMs + 600
+                        : hover ? GetTickCount64() + wait + static_cast<ULONGLONG>((1.f + kTraceTail) * headMs) + 60 : ~0ull;
         m_traces.push_back({ shape, sprite, until, hover });
         SweepTraces();                              // (re)arms the timer for the earliest end
-        Trace(hover ? L"trace: started" : L"trace: alert", c.hwnd);
+        Trace(countdown ? L"trace: countdown" : hover ? L"trace: started" : L"trace: alert", c.hwnd);
     }
     catch (winrt::hresult_error const& e)
     {
         LogError(0, e.code(), L"card trace");
+    }
+}
+
+// The card line in the color chosen in Settings, fading toward its tail.
+void Stage::TintTraces()
+{
+    auto const& rgb = kTraceColors[std::clamp(m_cfg.traceColor, 0, kTraceColorCount - 1)];
+    for (size_t i = 0; i < m_traceBrushes.size(); ++i)
+    {
+        float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
+        m_traceBrushes[i].Color({ static_cast<uint8_t>(235 * fade), rgb[0], rgb[1], rgb[2] });
     }
 }
 
@@ -3149,6 +3239,58 @@ void Stage::FinishTransition()
     TrimMemory();
 }
 
+void Stage::DragHover(POINTL screen)
+{
+    m_fileDrag = true;
+    KillTimer(m_sidebar, kTimerTuck);
+    if (m_busy || m_dragging || m_menu.open || m_settings.open)
+        return;
+    if (m_dock == DockState::Tucked)
+    {
+        m_revealed = true;                          // tucks again once the drag leaves
+        SetDock(DockState::Shown);
+    }
+    int index = HitTest(ViewToSide(MAKELPARAM(screen.x - m_monitor.left, screen.y - m_monitor.top)));
+    if (index < 0)
+        m_dropHold = false;                         // off the cards: the next one held may open
+    HWND h = index >= 0 && !m_dropHold ? m_visible[index]->hwnd : nullptr;
+    if (h == m_dropHwnd && index == m_hover)
+        return;
+    bool changed = h != m_dropHwnd;
+    m_dropHwnd = h;
+    if (index == m_hover)
+    {
+        // Already the hovered card (the pointer was there before the drag): just restart its line.
+        ClearTrace();
+        StartTrace(index);
+    }
+    else
+        SetHover(index);                            // enlarges it and starts the countdown line
+    if (!changed)
+        return;
+    if (h)
+    {
+        Trace(L"file drag over card", h);
+        SetTimer(m_sidebar, kTimerDropOpen, static_cast<UINT>(kDropOpenMs), nullptr);
+    }
+    else
+        KillTimer(m_sidebar, kTimerDropOpen);
+}
+
+void Stage::DragEnd()
+{
+    if (!m_fileDrag)
+        return;
+    m_fileDrag = false;
+    m_dropHwnd = nullptr;
+    m_dropHold = false;
+    KillTimer(m_sidebar, kTimerDropOpen);
+    if (!m_busy)
+        SetHover(-1);
+    if (m_revealed)
+        SetTimer(m_sidebar, kTimerTuck, 350, nullptr);
+}
+
 // A click or right-click that came while a transition ran, carried out now that it is over.
 void Stage::RunQueued()
 {
@@ -3205,8 +3347,8 @@ void Stage::ForceForeground(HWND hwnd)
         return;
     // Foreground lock: a synthetic Alt tap counts as input and lets us hand focus over. Not while the
     // user holds Alt (Alt+number): our key-up would leave Alt stuck up, and the real release would
-    // then open the new window's menu bar.
-    if (GetAsyncKeyState(VK_MENU) & 0x8000)
+    // then open the new window's menu bar. Nor during a drag: Alt would change what the drop does.
+    if ((GetAsyncKeyState(VK_MENU) & 0x8000) || (g_stage && g_stage->m_fileDrag))
     {
         // Sharing input state with the foreground thread lifts the lock without touching the keyboard.
         DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr), self = GetCurrentThreadId();
@@ -3690,6 +3832,22 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         }
         else if (wp == kTimerFade)
             FadeOutFlyIn();
+        else if (wp == kTimerDropOpen)
+        {
+            KillTimer(m_sidebar, kTimerDropOpen);
+            auto at = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& c) { return c->hwnd == m_dropHwnd; });
+            if (!m_fileDrag || !m_dropHwnd || at == m_visible.end() || !IsWindow(m_dropHwnd))
+                ;                                   // the drag ended or its card went away
+            else if (m_busy || m_dragging || m_menu.open || m_settings.open)
+                SetTimer(m_sidebar, kTimerDropOpen, 100, nullptr);  // once that is over
+            else
+            {
+                Trace(L"file drag: opening", m_dropHwnd);
+                m_dropHwnd = nullptr;
+                m_dropHold = true;
+                SwitchTo(static_cast<size_t>(at - m_visible.begin()));
+            }
+        }
         else if (wp == kTimerQueued)
         {
             KillTimer(m_sidebar, kTimerQueued);

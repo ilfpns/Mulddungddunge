@@ -54,6 +54,7 @@ void Config::Load()
     iconsOnly = ReadInt(L"IconsOnly", iconsOnly, 0, 1) != 0;
     hoverTrace = ReadInt(L"HoverTrace", hoverTrace, 0, 1) != 0;
     cardStyle = ReadInt(L"CardStyle", cardStyle, 0, 1);
+    traceColor = ReadInt(L"TraceColor", traceColor, 0, kTraceColorCount - 1);
     alerts = ReadInt(L"Alerts", alerts, 0, 1) != 0;
     sounds = ReadInt(L"Sounds", sounds, 0, 1) != 0;
     hotkeys = ReadInt(L"Hotkeys", hotkeys, 0, 1) != 0;
@@ -97,6 +98,7 @@ void Config::Save() const
     WriteInt(L"IconsOnly", iconsOnly);
     WriteInt(L"HoverTrace", hoverTrace);
     WriteInt(L"CardStyle", cardStyle);
+    WriteInt(L"TraceColor", traceColor);
     WriteInt(L"Alerts", alerts);
     WriteInt(L"Sounds", sounds);
     WriteInt(L"Hotkeys", hotkeys);
