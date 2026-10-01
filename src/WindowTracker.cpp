@@ -438,6 +438,66 @@ namespace wt
         return PathOf(pid);
     }
 
+    std::wstring IconFile(HWND hwnd)
+    {
+        auto exe = ProcessPath(hwnd);
+        auto name = exe.substr(exe.find_last_of(L'\\') + 1);
+        if (_wcsicmp(name.c_str(), L"WindowsTerminal.exe") != 0 && _wcsicmp(name.c_str(), L"OpenConsole.exe") != 0 &&
+            _wcsicmp(name.c_str(), L"conhost.exe") != 0)
+            return exe;
+        // One terminal process hosts every tab of every window, so which shell a window shows is told
+        // by its title (the current tab's); the shells running under the terminal give their paths.
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        std::wstring pwsh, powershell, bash;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE)
+        {
+            PROCESSENTRY32W e{ sizeof(e) };
+            for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e))
+            {
+                if (e.th32ParentProcessID != pid)
+                    continue;
+                if (_wcsicmp(e.szExeFile, L"pwsh.exe") == 0 && pwsh.empty())
+                    pwsh = PathOf(e.th32ProcessID);
+                else if (_wcsicmp(e.szExeFile, L"powershell.exe") == 0 && powershell.empty())
+                    powershell = PathOf(e.th32ProcessID);
+                else if (_wcsicmp(e.szExeFile, L"bash.exe") == 0 && bash.empty())
+                    bash = PathOf(e.th32ProcessID);
+            }
+            CloseHandle(snap);
+        }
+        wchar_t raw[256]{};
+        GetWindowTextW(hwnd, raw, ARRAYSIZE(raw));
+        std::wstring title = raw;
+        CharLowerBuffW(title.data(), static_cast<DWORD>(title.size()));
+        wchar_t system[MAX_PATH]{};
+        GetSystemDirectoryW(system, MAX_PATH);
+        auto exists = [](std::wstring const& p) { return !p.empty() && GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+
+        if (title.find(L"mingw") != std::wstring::npos || title.find(L"msys") != std::wstring::npos || title.find(L"bash") != std::wstring::npos)
+        {
+            // Git Bash: git-bash.exe at the root of the Git folder the shell runs from.
+            std::wstring root = bash;
+            CharLowerBuffW(root.data(), static_cast<DWORD>(root.size()));
+            auto at = root.find(L"\\git\\");
+            std::wstring gitBash = at != std::wstring::npos ? bash.substr(0, at + 5) + L"git-bash.exe" : L"C:\\Program Files\\Git\\git-bash.exe";
+            if (exists(gitBash))
+                return gitBash;
+            return exists(bash) ? bash : exe;
+        }
+        if (title.find(L"명령 프롬프트") != std::wstring::npos || title.find(L"command prompt") != std::wstring::npos ||
+            title.find(L"cmd.exe") != std::wstring::npos)
+            return std::wstring(system) + L"\\cmd.exe";
+        // Otherwise the terminal's usual shell: PowerShell (7 if it is the one running).
+        if (exists(pwsh))
+            return pwsh;
+        if (exists(powershell))
+            return powershell;
+        auto fallback = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+        return exists(fallback) ? fallback : exe;
+    }
+
     std::wstring ModelOf(DWORD pid)
     {
         HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;

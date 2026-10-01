@@ -71,6 +71,7 @@ namespace
     constexpr ULONGLONG kQuitGraceMs = 5000;
     constexpr UINT_PTR kTimerNewWindow = 15;  // a new window not ready yet when it took focus
     constexpr UINT_PTR kTimerTrace = 16;      // the hover trace has run its course: remove it
+    constexpr UINT_PTR kTimerEarlyShow = 17;  // halfway through a card's flight: bring its window up under it
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
@@ -91,15 +92,15 @@ namespace
     constexpr int kMaxHotkeys = 6;       // as many as the most cards the sidebar can show
     constexpr UINT_PTR kTimerFit = 13;   // a stage window moved: snapped next to the sidebar?
     constexpr int kSlideMs = 260;
-    constexpr int kFlyMs = 420;
-    constexpr int kFadeMs = 150;
-    constexpr int kPaintWaitMs = 110;    // restored windows need a moment to repaint before the copy fades
+    constexpr int kFlyMs = 300;
+    constexpr int kFadeMs = 100;
+    constexpr int kPaintWaitMs = 60;     // restored windows need a moment to repaint before the copy fades
     constexpr ULONGLONG kPrefetchMaxAge = 4000;
     // A picture of the stage window this recent (and with the window unmoved) is reused instead of
     // starting another capture session, which is most of what a switch costs.
     constexpr ULONGLONG kReuseMaxAge = 3000;
     constexpr float kDragStart = 8.f;    // px of movement before a press turns into a drag
-    constexpr ULONGLONG kQuietMs = 700;
+    constexpr ULONGLONG kQuietMs = 400;
 
     Stage* g_stage = nullptr;
 
@@ -1554,7 +1555,10 @@ void Stage::OnForeground(HWND hwnd)
     if (m_settings.open && hwnd != m_active)
         CloseSettings();
     if (!m_ready || m_busy || m_syncing)
+    {
+        Trace(m_busy ? L"  ignored: mid-transition" : L"  ignored: not ready / syncing", hwnd);
         return;
+    }
     GUID desktop = CurrentDesktopId();
     if (desktop != m_desktopId)
     {
@@ -1564,6 +1568,8 @@ void Stage::OnForeground(HWND hwnd)
     }
     if (hwnd == m_active || GetTickCount64() < m_quietUntil)
     {
+        if (hwnd != m_active)
+            Trace(L"  ignored: quiet after a transition", hwnd);
         UpdateDock();
         return;
     }
@@ -2638,6 +2644,7 @@ void Stage::SwitchTo(size_t index)
 
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
+    Trace(L"switch begin", next);
     ClearTrace();
     ClearAlert(next);
     m_busy = true;
@@ -2727,6 +2734,10 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         AnimatePose(m_flyIn, *m_inCard, nextFrom, to, m_cfg.Ms(kFlyMs));
         m_inBatch.End();
         m_inBatch.Completed([this, gen = m_gen](auto&&, auto&&) { if (gen == m_gen) OnFlyInDone(); });
+        // The window comes up (and takes focus) halfway through the flight, under the flying copy, so
+        // it has painted by the time the copy lands and the copy can fade at once.
+        m_shownEarly = false;
+        SetTimer(m_sidebar, kTimerEarlyShow, static_cast<UINT>(std::max(1, m_cfg.Ms(kFlyMs) / 2)), nullptr);
     }
     if (!m_pending)
     {
@@ -2968,6 +2979,13 @@ void Stage::OnFlyInDone()
     if (!m_inCard)
         return;
     m_inBatch = nullptr;
+    KillTimer(m_sidebar, kTimerEarlyShow);
+    if (m_shownEarly)
+    {
+        // Already up and painted under the copy: it can go now.
+        FadeOutFlyIn();
+        return;
+    }
     BringBack(m_inCard->hwnd);
     ForceForeground(m_inCard->hwnd);
     // Give the real window a moment to paint before the flying copy fades away.
@@ -3001,9 +3019,12 @@ void Stage::StepDone()
 
 void Stage::FinishTransition()
 {
+    Trace(L"switch end", m_active);
     ++m_gen;                                        // callbacks still pending belong to the old one
     KillTimer(m_sidebar, kTimerWatchdog);
     KillTimer(m_sidebar, kTimerFade);
+    KillTimer(m_sidebar, kTimerEarlyShow);
+    m_shownEarly = false;
     m_inBatch = nullptr;
     for (auto& flight : m_outs)
     {
@@ -3546,6 +3567,15 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         }
         else if (wp == kTimerFade)
             FadeOutFlyIn();
+        else if (wp == kTimerEarlyShow)
+        {
+            if (m_busy && m_inCard && !m_shownEarly)
+            {
+                m_shownEarly = true;
+                BringBack(m_inCard->hwnd);
+                ForceForeground(m_inCard->hwnd);
+            }
+        }
         else if (wp == kTimerShrink && !m_busy && !m_dragging && !m_menu.open && !m_settings.open && m_hover < 0)
         {
             ShrinkView();
@@ -3670,6 +3700,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             break;
         [[fallthrough]];
     case WM_DISPLAYCHANGE:
+        Trace(msg == WM_DISPLAYCHANGE ? L"display changed" : L"work area changed");
         Dock();
         Relayout(false);
         return 0;

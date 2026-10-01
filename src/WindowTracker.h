@@ -35,6 +35,9 @@ namespace wt
     // hosts, us, a browser web app, an elevated app, a UWP frame whose app can't be found).
     DWORD QuitTarget(HWND hwnd);
     std::wstring ImageOf(DWORD pid);                        // a process's executable path
+    // The file whose icon stands for the window: its executable, except for a terminal host (Windows
+    // Terminal, conhost), where it is the shell inside: Git Bash, PowerShell, Command Prompt.
+    std::wstring IconFile(HWND hwnd);
     std::wstring ModelOf(DWORD pid);                        // a packaged app's AppUserModelID, or empty
     // Whether an app (executable path + model id, as Audio reports it) is the one a card's id names.
     bool IsCardApp(std::wstring const& cardApp, std::wstring const& image, std::wstring const& model);

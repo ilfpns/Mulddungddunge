@@ -304,6 +304,7 @@ private:
     std::vector<HWND> m_inputPanels;                // emoji panel / touch keyboard windows shown
     int m_rechecks = 0;                             // looks left at a foreground window not ready yet
     unsigned m_gen = 0;                             // transition number: late callbacks of an older one do nothing
+    bool m_shownEarly = false;                      // the incoming window was restored mid-flight (kTimerEarlyShow)
     UINT m_taskbarMsg = 0;                          // "TaskbarCreated": Explorer restarted, re-add the tray icon
     HICON m_trayIcon = nullptr;
     struct TraceRun

@@ -31,8 +31,9 @@ namespace
         bool frameHost = path.size() >= 24 && _wcsicmp(path.c_str() + path.size() - 24, L"ApplicationFrameHost.exe") == 0;
         if (!path.empty() && !frameHost && wt::AppId(hwnd) == path)
         {
+            auto file = wt::IconFile(hwnd);           // a terminal's shell rather than the terminal
             HICON icon = nullptr;
-            if (SUCCEEDED(SHDefExtractIconW(path.c_str(), 0, 0, &icon, nullptr, MAKELONG(px, 16))) && icon)
+            if (SUCCEEDED(SHDefExtractIconW(file.c_str(), 0, 0, &icon, nullptr, MAKELONG(px, 16))) && icon)
             {
                 owned = true;
                 return icon;
@@ -245,14 +246,15 @@ namespace
                 return converter;
         }
         auto path = wt::ProcessPath(hwnd);
+        auto file = wt::IconFile(hwnd);               // a terminal's shell rather than the terminal
         // Store apps live under the locked-down WindowsApps folder, and the shell draws a padlock over
         // their file icons; the icon taken from the executable itself (LoadAppIcon) has none.
-        bool packaged = path.find(L"\\WindowsApps\\") != std::wstring::npos;
+        bool packaged = file.find(L"\\WindowsApps\\") != std::wstring::npos;
         if (!path.empty() && !packaged && !IsFrameHost(path) && wt::AppId(hwnd) == path)
         {
             winrt::com_ptr<IShellItemImageFactory> images;
             HBITMAP hbmp = nullptr;
-            if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(images.put()))) &&
+            if (SUCCEEDED(SHCreateItemFromParsingName(file.c_str(), nullptr, IID_PPV_ARGS(images.put()))) &&
                 SUCCEEDED(images->GetImage({ px, px }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hbmp)))
             {
                 winrt::com_ptr<IWICBitmap> bitmap;
@@ -294,6 +296,9 @@ winrt::com_ptr<IWICFormatConverter> Snapshot::CachedIcon(HWND hwnd)
     // again each time rather than caching a generic one.
     if (path.empty() || IsFrameHost(wt::ProcessPath(hwnd)))
         return IconSource(m_wic.get(), hwnd, 128);
+    // Cached by the file the icon comes from: a terminal's windows differ by the shell they show.
+    if (path.find(L'#') == std::wstring::npos)
+        path = wt::IconFile(hwnd);
     for (auto& [app, source] : m_icons)
         if (_wcsicmp(app.c_str(), path.c_str()) == 0)
             return source;
