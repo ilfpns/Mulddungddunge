@@ -71,7 +71,9 @@ namespace
     constexpr ULONGLONG kQuitGraceMs = 5000;
     constexpr UINT_PTR kTimerNewWindow = 15;  // a new window not ready yet when it took focus
     constexpr UINT_PTR kTimerTrace = 16;      // the hover trace has run its course: remove it
-    constexpr UINT_PTR kTimerEarlyShow = 17;  // halfway through a card's flight: bring its window up under it
+    constexpr UINT_PTR kTimerEarlyShow = 17;  // early in a card's flight: bring its window up under it
+    constexpr UINT_PTR kTimerQueued = 18;     // a click held back by a transition: carry it out now
+    constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
     constexpr float kEdgeStrip = 2.f;    // px of the tucked sidebar left at the screen edge to call it back
@@ -121,6 +123,28 @@ namespace
         fwprintf(g_trace, L"%llu %s %p '%s'\n", GetTickCount64(), what, hwnd, title);
         fflush(g_trace);
     }
+
+    // Traces how long the rest of the scope took to respond to the user (a click, a minimize...), in ms.
+    struct Took
+    {
+        wchar_t const* what;
+        LARGE_INTEGER start{};
+        explicit Took(wchar_t const* w) : what(w)
+        {
+            if (g_trace)
+                QueryPerformanceCounter(&start);
+        }
+        ~Took()
+        {
+            if (!g_trace)
+                return;
+            LARGE_INTEGER end, freq;
+            QueryPerformanceCounter(&end);
+            QueryPerformanceFrequency(&freq);
+            fwprintf(g_trace, L"%llu   %s took %.1f ms\n", GetTickCount64(), what, (end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart);
+            fflush(g_trace);
+        }
+    };
 
     // Appends to %TEMP%\stage-manager.log; only written when something goes wrong.
     void LogError(UINT msg, HRESULT hr, wchar_t const* text)
@@ -433,6 +457,7 @@ void Stage::ShowMenu(HMENU menu, UINT* command)
 
 void Stage::OpenCardMenu(int index, int anchorY)
 {
+    Took took(L"menu");
     if (m_menu.open)
         CloseCardMenu();
     auto card = index >= 0 ? m_visible[index] : nullptr;
@@ -1155,6 +1180,22 @@ void Stage::FitAndOpen(HWND hwnd)
     SwitchTo(static_cast<size_t>(it - m_visible.begin()));
 }
 
+// The saved frame, kept on screen: with a smaller display (or another layout) it is shrunk and moved
+// into the work area of the monitor it is closest to, rather than landing partly off screen.
+RECT Stage::FitFrame()
+{
+    RECT frame = kFitFrame;
+    MONITORINFO mi{ sizeof(mi) };
+    if (!GetMonitorInfoW(MonitorFromRect(&frame, MONITOR_DEFAULTTONEAREST), &mi))
+        return frame;
+    RECT const& work = mi.rcWork;
+    LONG w = std::min(frame.right - frame.left, work.right - work.left);
+    LONG h = std::min(frame.bottom - frame.top, work.bottom - work.top);
+    LONG x = std::clamp(frame.left, work.left, work.right - w);
+    LONG y = std::clamp(frame.top, work.top, work.bottom - h);
+    return { x, y, x + w, y + h };
+}
+
 void Stage::FitToSaved(HWND hwnd)
 {
     if (!IsWindow(hwnd))
@@ -1184,7 +1225,7 @@ void Stage::FitToSaved(HWND hwnd)
         int bottom = std::max(0, GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + padded - 1);
         border = { side, 0, side, bottom };
     }
-    RECT frame = kFitFrame;
+    RECT frame = FitFrame();
     RECT target{ frame.left - border.left, frame.top - border.top, frame.right + border.right, frame.bottom + border.bottom };
 
     // Placement is in workspace coordinates of the monitor the rectangle is on. The window keeps its
@@ -1623,6 +1664,7 @@ void Stage::OnForeground(HWND hwnd)
 
 void Stage::OnMinimizeStart(HWND hwnd)
 {
+    Took took(L"minimize response");
     if (m_ready)
         SetTimer(m_sidebar, kTimerDock, 100, nullptr);     // e.g. a fullscreen game minimized by Alt+Tab
     if (!m_ready || !OnStage(hwnd))
@@ -2000,6 +2042,33 @@ void Stage::RestylePlaceholders()
         if (c->side.holder)
             ApplySize(c->side, *c);
     }
+}
+
+// After the GPU device was lost (sleep, driver update): new devices, and every card drawn again. A
+// photo can't be redrawn, so its card shows its stand-in until the window is photographed again.
+void Stage::RecoverDevice()
+{
+    if (!m_snap.Recover())
+        return;
+    LogError(0, E_FAIL, L"GPU device lost: recreated");
+    auto redraw = [&](Card& c) {
+        c.icon.Surface(m_snap.Icon(c.hwnd, static_cast<int>(std::lround(S(kBadge)))));
+        if (c.hasPicture)
+        {
+            c.placeholder = true;
+            c.snapshot.Surface(MakePlaceholder(c));
+            if (c.side.holder)
+                ApplySize(c.side, c);
+        }
+    };
+    for (auto& c : m_cards)
+        if (IsWindow(c->hwnd))
+            redraw(*c);
+    for (auto& c : m_offstage)
+        if (IsWindow(c->hwnd))
+            redraw(*c);
+    m_activeSnap = m_prefetch = nullptr;
+    SnapActiveSoon();
 }
 
 void Stage::SetMinAnimate(bool on)
@@ -2597,6 +2666,9 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
         auto card = *parked;
         m_offstage.erase(parked);
         card->desktop = m_desktopId;
+        // A terminal's card shows the shell of its current tab, which may have changed since.
+        if (card->icon && wt::IconFile(hwnd) != wt::ProcessPath(hwnd))
+            card->icon.Surface(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
         return card;
     }
     auto card = *it;
@@ -2644,6 +2716,8 @@ void Stage::SwitchTo(size_t index)
 
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
+    Took took(L"switch start");
+    ULONGLONG begun = GetTickCount64();
     Trace(L"switch begin", next);
     ClearTrace();
     ClearAlert(next);
@@ -2734,10 +2808,14 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         AnimatePose(m_flyIn, *m_inCard, nextFrom, to, m_cfg.Ms(kFlyMs));
         m_inBatch.End();
         m_inBatch.Completed([this, gen = m_gen](auto&&, auto&&) { if (gen == m_gen) OnFlyInDone(); });
-        // The window comes up (and takes focus) halfway through the flight, under the flying copy, so
-        // it has painted by the time the copy lands and the copy can fade at once.
+        // The window comes up (and takes focus) a third into the flight, under the flying copy (which
+        // has covered most of the way by then: the motion eases out), so the app answers within about
+        // 100 ms of the click and has painted by the time the copy lands.
+        // Counted from the click: setting up the flight (a capture to start, say) can itself take tens
+        // of milliseconds, which must not push the window's arrival out.
         m_shownEarly = false;
-        SetTimer(m_sidebar, kTimerEarlyShow, static_cast<UINT>(std::max(1, m_cfg.Ms(kFlyMs) / 2)), nullptr);
+        int spent = static_cast<int>(GetTickCount64() - begun);
+        SetTimer(m_sidebar, kTimerEarlyShow, static_cast<UINT>(std::max(1, m_cfg.Ms(kFlyMs) / 3 - spent)), nullptr);
     }
     if (!m_pending)
     {
@@ -3066,7 +3144,30 @@ void Stage::FinishTransition()
     StageChanged();                                 // after m_busy is cleared, or the dock won't update
     // Focus changes that arrived while animating were ignored; catch up once things have settled.
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
+    if (m_queuedSwitch || m_queuedMenu)
+        SetTimer(m_sidebar, kTimerQueued, 1, nullptr);   // after this layout has been applied
     TrimMemory();
+}
+
+// A click or right-click that came while a transition ran, carried out now that it is over.
+void Stage::RunQueued()
+{
+    HWND sw = m_queuedSwitch, menu = m_queuedMenu;
+    m_queuedSwitch = m_queuedMenu = nullptr;
+    if (m_busy || m_dragging || GetTickCount64() - m_queuedAt > kQueuedMaxAge)
+        return;
+    HWND h = sw ? sw : menu;
+    auto at = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& c) { return c->hwnd == h; });
+    if (at == m_visible.end() || !IsWindow(h))
+        return;                                     // its card left the sidebar meanwhile
+    size_t index = static_cast<size_t>(at - m_visible.begin());
+    if (sw)
+    {
+        Trace(L"queued click run", h);
+        SwitchTo(index);
+    }
+    else
+        OpenCardMenu(static_cast<int>(index), m_queuedMenuY);
 }
 
 // Makes a window visible again however it was put away: hidden to the tray (KakaoTalk, Discord...
@@ -3391,13 +3492,12 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             SetHover(HitTest(ViewToSide(lp)));
         return 0;
     case WM_LBUTTONDOWN:
-        if (!m_busy)
-        {
-            // The speaker is a button of its own: no switch, no drag.
-            m_pressSound = SoundAt(ViewToSide(lp));
-            m_pressIndex = m_pressSound >= 0 ? -1 : HitTest(ViewToSide(lp));
-            m_pressPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        }
+        // Recorded mid-transition too, so a quick click on the next card isn't lost (it is queued on
+        // release); a drag only starts once nothing is animating.
+        // The speaker is a button of its own: no switch, no drag.
+        m_pressSound = m_busy ? -1 : SoundAt(ViewToSide(lp));
+        m_pressIndex = m_pressSound >= 0 ? -1 : HitTest(ViewToSide(lp));
+        m_pressPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         return 0;
     case WM_LBUTTONUP:
     {
@@ -3417,19 +3517,42 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         m_pressIndex = -1;
         if (m_dragging)
             EndDrag(pt, false);
-        else if (!m_busy && pressed >= 0 && HitTest(ViewToSide(lp)) == pressed)
-            SwitchTo(static_cast<size_t>(pressed));
+        else if (pressed >= 0 && HitTest(ViewToSide(lp)) == pressed && pressed < static_cast<int>(m_visible.size()))
+        {
+            Trace(L"card clicked", m_visible[pressed]->hwnd);
+            if (!m_busy)
+                SwitchTo(static_cast<size_t>(pressed));
+            else
+            {
+                // Clicked while another card is still flying: the switch follows once it lands.
+                m_queuedSwitch = m_visible[pressed]->hwnd;
+                m_queuedMenu = nullptr;
+                m_queuedAt = GetTickCount64();
+                Trace(L"  queued: mid-transition", m_queuedSwitch);
+            }
+        }
         return 0;
     }
 
     case WM_RBUTTONUP:
+    {
+        POINT side = ViewToSide(lp);
+        if (side.x < 0 || side.x >= m_bar.right - m_bar.left)
+            return 0;
+        int index = HitTest(side);
+        Trace(L"card right-clicked", index >= 0 ? m_visible[index]->hwnd : nullptr);
         if (!m_busy)
+            OpenCardMenu(index, GET_Y_LPARAM(lp));
+        else if (index >= 0)
         {
-            POINT side = ViewToSide(lp);
-            if (side.x >= 0 && side.x < m_bar.right - m_bar.left)
-                OpenCardMenu(HitTest(side), GET_Y_LPARAM(lp));
+            // Mid-transition: the menu opens once it ends (for the same card, wherever it is then).
+            m_queuedMenu = m_visible[index]->hwnd;
+            m_queuedMenuY = GET_Y_LPARAM(lp);
+            m_queuedSwitch = nullptr;
+            m_queuedAt = GetTickCount64();
         }
         return 0;
+    }
     case WM_MOUSELEAVE:
         m_tracking = false;
         if (m_revealed)
@@ -3567,13 +3690,20 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         }
         else if (wp == kTimerFade)
             FadeOutFlyIn();
+        else if (wp == kTimerQueued)
+        {
+            KillTimer(m_sidebar, kTimerQueued);
+            RunQueued();
+        }
         else if (wp == kTimerEarlyShow)
         {
+            KillTimer(m_sidebar, kTimerEarlyShow);
             if (m_busy && m_inCard && !m_shownEarly)
             {
                 m_shownEarly = true;
                 BringBack(m_inCard->hwnd);
                 ForceForeground(m_inCard->hwnd);
+                Trace(L"early show", m_inCard->hwnd);
             }
         }
         else if (wp == kTimerShrink && !m_busy && !m_dragging && !m_menu.open && !m_settings.open && m_hover < 0)
@@ -3647,6 +3777,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             // Something went wrong mid-transition (an exception, a lost device, a batch that never
             // completed). Never leave input blocked or the view covering the screen.
             LogError(WM_TIMER, E_FAIL, L"transition watchdog fired");
+            RecoverDevice();
             // The clicked window comes up (hidden or still minimized), the leaving ones go down, as the
             // transition would have left them.
             if (m_inCard && IsWindow(m_inCard->hwnd) && (!IsWindowVisible(m_inCard->hwnd) || IsIconic(m_inCard->hwnd)))
@@ -3695,12 +3826,20 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 FitBeside();
         }
         return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC)
+        {
+            Trace(L"resumed from sleep");
+            RecoverDevice();
+        }
+        return TRUE;
     case WM_SETTINGCHANGE:
         if (wp != SPI_SETWORKAREA)
             break;
         [[fallthrough]];
     case WM_DISPLAYCHANGE:
         Trace(msg == WM_DISPLAYCHANGE ? L"display changed" : L"work area changed");
+        RecoverDevice();                            // a display or driver change may take the GPU device
         Dock();
         Relayout(false);
         return 0;

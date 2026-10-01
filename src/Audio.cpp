@@ -146,6 +146,7 @@ struct Audio::Worker
 
             std::vector<Playing> now;
             std::vector<Session> seen;
+            std::vector<DWORD> live;                // processes with a session now
             winrt::com_ptr<IAudioSessionEnumerator> list;
             int count = 0;
             if (manager && SUCCEEDED(manager->GetSessionEnumerator(list.put())))
@@ -175,6 +176,7 @@ struct Audio::Worker
                 DWORD pid = 0;
                 if (FAILED(control->GetProcessId(&pid)) || !pid)
                     continue;                       // system sounds
+                live.push_back(pid);
                 auto& known2 = images[pid];
                 if (known2.first.empty())
                     known2 = { wt::ImageOf(pid), wt::ModelOf(pid) };
@@ -201,8 +203,9 @@ struct Audio::Worker
                 if (std::none_of(seen.begin(), seen.end(), [&](auto& n) { return n.id == s.id; }))
                     s.control->UnregisterAudioSessionNotification(sink.get());
             sessions = std::move(seen);
-            if (images.size() > 64)
-                images.clear();                     // ids are reused; start over now and then
+            // A process id is reused once its process ends, by any other program: only ids that still
+            // have a session are remembered, so a new process never inherits an old one's app.
+            std::erase_if(images, [&](auto const& e) { return std::find(live.begin(), live.end(), e.first) == live.end(); });
 
             // Media sessions playing now, watched again each time (the list may have changed).
             std::vector<Media> nowMedia;

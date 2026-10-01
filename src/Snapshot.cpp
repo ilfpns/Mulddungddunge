@@ -48,8 +48,11 @@ namespace
     }
 }
 
-void Snapshot::Init(wuc::Compositor const& compositor)
+void Snapshot::CreateDevices()
 {
+    m_d3d = nullptr;
+    m_d2d = nullptr;
+    m_device = nullptr;
     winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         nullptr, 0, D3D11_SDK_VERSION, m_d3d.put(), nullptr, nullptr));
     // Composition may touch the device from its own thread.
@@ -64,7 +67,28 @@ void Snapshot::Init(wuc::Compositor const& compositor)
 
     winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(),
         reinterpret_cast<IInspectable**>(winrt::put_abi(m_device))));
+}
 
+bool Snapshot::Recover()
+{
+    if (!m_d3d || m_d3d->GetDeviceRemovedReason() == S_OK)
+        return false;
+    try
+    {
+        CreateDevices();
+        auto interop = m_graphics.as<ABI::Windows::UI::Composition::ICompositionGraphicsDeviceInterop>();
+        winrt::check_hresult(interop->SetRenderingDevice(m_d2d.get()));
+        return true;
+    }
+    catch (...)
+    {
+        return false;                               // the GPU isn't back yet: tried again next time
+    }
+}
+
+void Snapshot::Init(wuc::Compositor const& compositor)
+{
+    CreateDevices();
     auto interop = compositor.as<ABI::Windows::UI::Composition::ICompositorInterop>();
     winrt::check_hresult(interop->CreateGraphicsDevice(m_d2d.get(),
         reinterpret_cast<ABI::Windows::UI::Composition::ICompositionGraphicsDevice**>(winrt::put_abi(m_graphics))));
@@ -106,6 +130,8 @@ std::shared_ptr<Snapshot::Job> Snapshot::Start(HWND hwnd, RECT const& frame)
 {
     try
     {
+        if (m_d3d && m_d3d->GetDeviceRemovedReason() != S_OK)
+            return nullptr;                         // Stage::RecoverDevice makes a new one first
         auto job = std::make_shared<Job>();
         job->hwnd = hwnd;
         job->frame = frame;

@@ -6,6 +6,10 @@ class Snapshot
 {
 public:
     void Init(wuc::Compositor const& compositor);
+    // The GPU device is lost after sleep, a driver update or a GPU reset: then every surface drawn so
+    // far is blank and new captures fail. Makes new devices in that case and returns true (the caller
+    // draws its surfaces again); false while the device is fine.
+    bool Recover();
 
     using Done = std::function<void(wuc::CompositionDrawingSurface)>;
 
@@ -44,6 +48,7 @@ private:
     wuc::CompositionDrawingSurface Render(Job const& job,
         winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame const& captured);
 
+    void CreateDevices();
     winrt::com_ptr<ID3D11Device> m_d3d;
     winrt::com_ptr<ID2D1Device> m_d2d;
     winrt::com_ptr<IWICImagingFactory> m_wic;

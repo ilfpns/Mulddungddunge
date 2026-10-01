@@ -305,6 +305,12 @@ private:
     int m_rechecks = 0;                             // looks left at a foreground window not ready yet
     unsigned m_gen = 0;                             // transition number: late callbacks of an older one do nothing
     bool m_shownEarly = false;                      // the incoming window was restored mid-flight (kTimerEarlyShow)
+    // A click or right-click on a card while a transition was running: carried out once it ends,
+    // rather than dropped (kTimerQueued).
+    HWND m_queuedSwitch = nullptr;
+    HWND m_queuedMenu = nullptr;
+    int m_queuedMenuY = 0;
+    ULONGLONG m_queuedAt = 0;
     UINT m_taskbarMsg = 0;                          // "TaskbarCreated": Explorer restarted, re-add the tray icon
     HICON m_trayIcon = nullptr;
     struct TraceRun
@@ -320,7 +326,10 @@ private:
     wuc::CompositionSurfaceBrush m_alertBrush{ nullptr };
     wuc::CompositionBackdropBrush m_backdrop{ nullptr };    // what is behind our window, blurred by DWM
     wuc::CompositionDrawingSurface MakePlaceholder(Card const& c);
+    RECT FitFrame();
+    void RunQueued();
     void RestylePlaceholders();
+    void RecoverDevice();
     Audio m_audio;
     std::vector<Audio::Playing> m_playing;
     std::vector<Audio::Media> m_media;
