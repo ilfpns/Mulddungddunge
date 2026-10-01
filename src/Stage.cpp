@@ -2524,13 +2524,7 @@ void Stage::RunTrace(Card& c, bool hover, int countdownMs)
         float r = std::max(0.f, std::min(S(kRadius) / p.scale - inset, std::min(right - left, bottom - top) / 2.f));
         if (!m_d2d)
             winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, m_d2d.put()));
-        auto& brushes = m_traceBrushes;
-        if (brushes.empty())
-        {
-            for (int i = 0; i < kTraceSegments; ++i)
-                brushes.push_back(m_compositor.CreateColorBrush());
-            TintTraces();
-        }
+        auto const& brushes = TraceBrushes(c);
 
         // One half of the outline: top middle, along the top to a corner, down the side, along the
         // bottom to its middle. The left half mirrors the right one.
@@ -2645,10 +2639,50 @@ void Stage::RunTrace(Card& c, bool hover, int countdownMs)
     }
 }
 
-// The card line in the color chosen in Settings, fading toward its tail.
+// The brushes of a card's line: the color chosen in Settings, or its app's logo color.
+std::vector<wuc::CompositionColorBrush> const& Stage::TraceBrushes(Card& c)
+{
+    if (m_traceBrushes.empty())
+    {
+        for (int i = 0; i < kTraceSegments; ++i)
+            m_traceBrushes.push_back(m_compositor.CreateColorBrush());
+        TintTraces();
+    }
+    if (m_cfg.traceColor != kTraceAppColor)
+        return m_traceBrushes;
+    if (!c.logoKnown)
+    {
+        c.logo = m_snap.LogoColor(c.hwnd);
+        c.logoKnown = true;
+        if (g_trace)
+        {
+            wchar_t what[48];
+            swprintf_s(what, L"logo color %06X", c.logo & 0xFFFFFF);
+            Trace(c.logo ? what : L"logo color: none (white)", c.hwnd);
+        }
+    }
+    if (!c.logo)
+        return m_traceBrushes;                      // white (TintTraces), for a logo without a color
+    for (auto& [color, brushes] : m_logoBrushes)
+        if (color == c.logo)
+            return brushes;
+    if (m_logoBrushes.size() >= 48)
+        m_logoBrushes.erase(m_logoBrushes.begin());     // a few hundred bytes each; keep it bounded
+    std::vector<wuc::CompositionColorBrush> brushes;
+    for (int i = 0; i < kTraceSegments; ++i)
+    {
+        float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
+        brushes.push_back(m_compositor.CreateColorBrush({ static_cast<uint8_t>(235 * fade), static_cast<uint8_t>(c.logo >> 16),
+                                                          static_cast<uint8_t>(c.logo >> 8), static_cast<uint8_t>(c.logo) }));
+    }
+    m_logoBrushes.emplace_back(c.logo, std::move(brushes));
+    return m_logoBrushes.back().second;
+}
+
+// The card line in the color chosen in Settings, fading toward its tail (white with "app color").
 void Stage::TintTraces()
 {
-    auto const& rgb = kTraceColors[std::clamp(m_cfg.traceColor, 0, kTraceColorCount - 1)];
+    auto const& rgb = kTraceColors[m_cfg.traceColor == kTraceAppColor ? 0 : std::clamp(m_cfg.traceColor, 0, kTraceColorCount - 1)];
     for (size_t i = 0; i < m_traceBrushes.size(); ++i)
     {
         float fade = std::pow(1.f - static_cast<float>(i) / kTraceSegments, 1.6f);
@@ -2768,7 +2802,10 @@ std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
         card->desktop = m_desktopId;
         // A terminal's card shows the shell of its current tab, which may have changed since.
         if (card->icon && wt::IconFile(hwnd) != wt::ProcessPath(hwnd))
+        {
             card->icon.Surface(m_snap.Icon(hwnd, static_cast<int>(std::lround(S(kBadge)))));
+            card->logoKnown = false;
+        }
         return card;
     }
     auto card = *it;

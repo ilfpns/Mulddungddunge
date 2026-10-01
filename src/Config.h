@@ -7,6 +7,8 @@ inline constexpr uint8_t kTraceColors[][3] = {
     { 255, 255, 255 }, { 255, 149, 0 }, { 10, 132, 255 }, { 48, 209, 88 }, { 191, 90, 242 }, { 255, 55, 95 },
 };
 inline constexpr int kTraceColorCount = static_cast<int>(std::size(kTraceColors));
+// One more choice after those: each card in its app's logo color (white for a logo without one).
+inline constexpr int kTraceAppColor = kTraceColorCount;
 
 // User settings, kept under HKCU\Software\StageManager\Settings. Read once at startup, written on change.
 struct Config
@@ -16,7 +18,7 @@ struct Config
     bool iconsOnly = false;         // no window pictures, app icon cards only: least GPU memory, no captures
     bool hoverTrace = true;         // a thin line runs around the card the pointer is on
     int cardStyle = 1;              // stand-in cards (no picture of the window): 0 gray, 1 frosted glass
-    int traceColor = 0;             // the card line's color, one for all its uses (index into kTraceColors)
+    int traceColor = 0;             // the card line's color, one for all its uses (index into kTraceColors, or kTraceAppColor)
     int traceWidth = 2;             // the card line's thickness in px on screen, 1..5
     bool alerts = true;             // a card whose app flashes its taskbar button gets an orange dot
     bool sounds = true;             // a card whose app plays sound gets a speaker (click: mute)

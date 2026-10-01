@@ -22,6 +22,9 @@ public:
     void CaptureMinimized(HWND hwnd, Done done);
     // The window's app icon rendered at `px` x `px`.
     wuc::CompositionDrawingSurface Icon(HWND hwnd, int px);
+    // The main color of the window's app icon, made a little more vivid so a thin line in it shows:
+    // 0xFFRRGGBB, or 0 for a logo without a clear color (black, white, gray). Worked out once per app.
+    uint32_t LogoColor(HWND hwnd);
     // Stand-in for a window we could not photograph (it was minimized): app icon and title on a dark
     // card, with the same aspect ratio as the window.
     // `displayWidth` is the width to draw at in pixels (the card's on-screen width, or a multiple of it).
@@ -57,6 +60,7 @@ private:
     // part of making a card.
     winrt::com_ptr<IWICFormatConverter> CachedIcon(HWND hwnd);
     std::vector<std::pair<std::wstring, winrt::com_ptr<IWICFormatConverter>>> m_icons;
+    std::vector<std::pair<std::wstring, uint32_t>> m_logoColors;
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_device{ nullptr };
     wuc::CompositionGraphicsDevice m_graphics{ nullptr };
 };

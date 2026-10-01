@@ -54,7 +54,7 @@ void Config::Load()
     iconsOnly = ReadInt(L"IconsOnly", iconsOnly, 0, 1) != 0;
     hoverTrace = ReadInt(L"HoverTrace", hoverTrace, 0, 1) != 0;
     cardStyle = ReadInt(L"CardStyle", cardStyle, 0, 1);
-    traceColor = ReadInt(L"TraceColor", traceColor, 0, kTraceColorCount - 1);
+    traceColor = ReadInt(L"TraceColor", traceColor, 0, kTraceAppColor);
     traceWidth = ReadInt(L"TraceWidth", traceWidth, 1, 5);
     alerts = ReadInt(L"Alerts", alerts, 0, 1) != 0;
     sounds = ReadInt(L"Sounds", sounds, 0, 1) != 0;

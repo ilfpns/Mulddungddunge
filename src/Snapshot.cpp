@@ -334,6 +334,113 @@ winrt::com_ptr<IWICFormatConverter> Snapshot::CachedIcon(HWND hwnd)
     return source;
 }
 
+namespace
+{
+    void ToHsv(float r, float g, float b, float& h, float& s, float& v)
+    {
+        float hi = std::max({ r, g, b }), lo = std::min({ r, g, b }), d = hi - lo;
+        v = hi;
+        s = hi > 0.f ? d / hi : 0.f;
+        if (d <= 0.f)
+            h = 0.f;
+        else if (hi == r)
+            h = 60.f * std::fmod((g - b) / d + 6.f, 6.f);
+        else if (hi == g)
+            h = 60.f * ((b - r) / d + 2.f);
+        else
+            h = 60.f * ((r - g) / d + 4.f);
+    }
+
+    void FromHsv(float h, float s, float v, float& r, float& g, float& b)
+    {
+        float c = v * s, x = c * (1.f - std::fabs(std::fmod(h / 60.f, 2.f) - 1.f)), m = v - c;
+        int k = static_cast<int>(h / 60.f) % 6;
+        float rgb[6][3] = { { c, x, 0 }, { x, c, 0 }, { 0, c, x }, { 0, x, c }, { x, 0, c }, { c, 0, x } };
+        r = rgb[k][0] + m;
+        g = rgb[k][1] + m;
+        b = rgb[k][2] + m;
+    }
+
+    // The hue most of the logo's colorful pixels share (a many-colored logo gives its biggest color,
+    // not a muddy mix), averaged over those pixels, then made more saturated and bright.
+    uint32_t MainColor(IWICBitmapSource* icon)
+    {
+        UINT w = 0, h = 0;
+        if (!icon || FAILED(icon->GetSize(&w, &h)) || !w || !h || w > 256 || h > 256)
+            return 0;
+        std::vector<BYTE> px(static_cast<size_t>(w) * h * 4);
+        if (FAILED(icon->CopyPixels(nullptr, w * 4, static_cast<UINT>(px.size()), px.data())))
+            return 0;
+        constexpr int kBins = 36;                   // 10 degrees of hue each
+        float weight[kBins]{}, sum[kBins][3]{};
+        int opaque = 0, colorful = 0;
+        for (size_t i = 0; i < px.size(); i += 4)
+        {
+            BYTE a = px[i + 3];
+            if (a < 128)
+                continue;
+            ++opaque;
+            // Premultiplied BGRA.
+            float b = px[i] / static_cast<float>(a), g = px[i + 1] / static_cast<float>(a), r = px[i + 2] / static_cast<float>(a);
+            float hue, sat, val;
+            ToHsv(r, g, b, hue, sat, val);
+            if (sat < 0.3f || val < 0.35f)
+                continue;                           // gray, white, black, shadow, dark tints
+            ++colorful;
+            int bin = std::min(kBins - 1, static_cast<int>(hue / (360.f / kBins)));
+            float wgt = sat * val;
+            weight[bin] += wgt;
+            sum[bin][0] += r * wgt;
+            sum[bin][1] += g * wgt;
+            sum[bin][2] += b * wgt;
+        }
+        if (!opaque || colorful < opaque / 12)
+            return 0;                               // hardly any color: a black/white/gray logo
+        int best = 0;
+        float bestWeight = -1.f;
+        for (int k = 0; k < kBins; ++k)
+        {
+            float around = weight[(k + kBins - 1) % kBins] + weight[k] + weight[(k + 1) % kBins];
+            if (around > bestWeight)
+                best = k, bestWeight = around;
+        }
+        float total = 0.f, r = 0.f, g = 0.f, b = 0.f;
+        for (int k : { (best + kBins - 1) % kBins, best, (best + 1) % kBins })
+        {
+            total += weight[k];
+            r += sum[k][0];
+            g += sum[k][1];
+            b += sum[k][2];
+        }
+        if (total <= 0.f)
+            return 0;
+        float hue, sat, val;
+        ToHsv(r / total, g / total, b / total, hue, sat, val);
+        sat = std::min(1.f, sat + 0.15f);           // a little more vivid
+        val = std::max(val, 0.9f);                  // and bright enough to show as a hairline
+        FromHsv(hue, sat, val, r, g, b);
+        auto to8 = [](float c) { return static_cast<uint32_t>(std::lround(std::clamp(c, 0.f, 1.f) * 255.f)); };
+        return 0xFF000000u | to8(r) << 16 | to8(g) << 8 | to8(b);
+    }
+}
+
+uint32_t Snapshot::LogoColor(HWND hwnd)
+{
+    auto path = wt::AppId(hwnd);
+    bool cacheable = !path.empty() && !IsFrameHost(wt::ProcessPath(hwnd));
+    if (cacheable && path.find(L'#') == std::wstring::npos)
+        path = wt::IconFile(hwnd);
+    if (cacheable)
+        for (auto& [app, color] : m_logoColors)
+            if (_wcsicmp(app.c_str(), path.c_str()) == 0)
+                return color;
+    auto source = CachedIcon(hwnd);
+    uint32_t color = MainColor(source.get());
+    if (cacheable && source)
+        m_logoColors.emplace_back(path, color);
+    return color;
+}
+
 wuc::CompositionDrawingSurface Snapshot::Icon(HWND hwnd, int px)
 {
     auto source = CachedIcon(hwnd);

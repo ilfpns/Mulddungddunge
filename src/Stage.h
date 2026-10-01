@@ -38,6 +38,8 @@ struct Card
     bool hasSnapshot = false;   // a real picture of the window (otherwise a placeholder, or nothing if released)
     bool hasPicture = false;    // snapshot or placeholder currently loaded
     bool placeholder = false;   // the loaded picture is a stand-in (icon and title), not the window
+    uint32_t logo = 0;          // its app's logo color for the card line (Snapshot::LogoColor), once known
+    bool logoKnown = false;
     bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
     std::wstring pinKey;    // the saved pin entry it was pinned with (its desktop may change later)
     bool alert = false;     // flashed its taskbar button since it was last looked at
@@ -333,6 +335,8 @@ private:
     // Head to tail, shared by every card line (hover, file held over, alert): recoloring them
     // recolors the lines already running.
     std::vector<wuc::CompositionColorBrush> m_traceBrushes;
+    std::vector<std::pair<uint32_t, std::vector<wuc::CompositionColorBrush>>> m_logoBrushes;   // per logo color
+    std::vector<wuc::CompositionColorBrush> const& TraceBrushes(Card& c);
     void TintTraces();
     void RedrawTraces();                            // after the line's thickness changed
     wuc::CompositionSurfaceBrush m_soundBrush[2]{ nullptr, nullptr };

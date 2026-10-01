@@ -337,14 +337,34 @@ void Stage::PaintSettings()
         // Round color samples; the chosen one gets a ring.
         auto swatches = [&](float cy, int current, int what) {
             float gap = S(34), radius = S(10);
-            float first = x1 - gap * (kTraceColorCount - 1) - S(14);
-            for (int i = 0; i < kTraceColorCount; ++i)
+            float first = x1 - gap * kTraceColorCount - S(14);
+            for (int i = 0; i <= kTraceColorCount; ++i)
             {
                 D2D1_POINT_2F c{ first + gap * i, cy };
                 bool over = hit({ c.x - gap / 2, cy - S(17), c.x + gap / 2, cy + S(17) }, HitChoice, what * 16 + i);
-                winrt::com_ptr<ID2D1SolidColorBrush> fill;
-                dc->CreateSolidColorBrush(D2D1::ColorF(kTraceColors[i][0] / 255.f, kTraceColors[i][1] / 255.f, kTraceColors[i][2] / 255.f), fill.put());
-                dc->FillEllipse(D2D1::Ellipse(c, radius, radius), fill.get());
+                winrt::com_ptr<ID2D1Brush> fill;
+                if (i == kTraceAppColor)
+                {
+                    // "App color": a rainbow, each card takes its own logo's color.
+                    D2D1_GRADIENT_STOP stops[] = {
+                        { 0.f, D2D1::ColorF(1.f, 0.23f, 0.19f) }, { 0.3f, D2D1::ColorF(1.f, 0.8f, 0.f) },
+                        { 0.55f, D2D1::ColorF(0.19f, 0.82f, 0.35f) }, { 0.8f, D2D1::ColorF(0.04f, 0.52f, 1.f) },
+                        { 1.f, D2D1::ColorF(0.75f, 0.35f, 0.95f) },
+                    };
+                    winrt::com_ptr<ID2D1GradientStopCollection> collection;
+                    winrt::com_ptr<ID2D1LinearGradientBrush> rainbow;
+                    if (SUCCEEDED(dc->CreateGradientStopCollection(stops, ARRAYSIZE(stops), collection.put())) &&
+                        SUCCEEDED(dc->CreateLinearGradientBrush({ { c.x - radius, c.y - radius }, { c.x + radius, c.y + radius } }, collection.get(), rainbow.put())))
+                        fill = rainbow.as<ID2D1Brush>();
+                }
+                else
+                {
+                    winrt::com_ptr<ID2D1SolidColorBrush> solid;
+                    dc->CreateSolidColorBrush(D2D1::ColorF(kTraceColors[i][0] / 255.f, kTraceColors[i][1] / 255.f, kTraceColors[i][2] / 255.f), solid.put());
+                    fill = solid.as<ID2D1Brush>();
+                }
+                if (fill)
+                    dc->FillEllipse(D2D1::Ellipse(c, radius, radius), fill.get());
                 if (i == current)
                     dc->DrawEllipse(D2D1::Ellipse(c, radius + S(4), radius + S(4)), ink.get(), S(2));
                 else if (over)
@@ -413,7 +433,7 @@ void Stage::PaintSettings()
             toggle(row(L"마우스 올리면 테두리 빛내기", L"카드에 마우스를 올리면 얇은 빛이 테두리를 따라 흐릅니다", S(44)), m_cfg.hoverTrace, OptTrace);
             swprintf_s(buf, L"%dpx", m_cfg.traceWidth);
             stepper(row(L"테두리 빛 굵기", L"잘 안 보이면 굵게 해 주세요 (1~5px)", S(132)), buf, OptTraceWidth, m_cfg.traceWidth > 1, m_cfg.traceWidth < 5);
-            swatches(row(L"테두리 빛 색", L"마우스 올릴 때, 파일을 올릴 때, 새 알림 때 도는 빛의 색", S(34) * kTraceColorCount), m_cfg.traceColor, OptTraceColor);
+            swatches(row(L"테두리 빛 색", L"마우스·파일을 올릴 때, 새 알림 때 도는 빛의 색. 무지개: 앱 로고 색", S(34) * (kTraceColorCount + 1)), m_cfg.traceColor, OptTraceColor);
             choice(row(L"대체 카드 모양", L"창 화면을 보여 줄 수 없을 때(최소화 등) 쓰는 카드", S(152)), { L"회색", L"유리" }, m_cfg.cardStyle, OptCardStyle, S(76));
             break;
         }
@@ -848,7 +868,7 @@ void Stage::SettingsClick(POINT pt)
         case OptSpeed: m_cfg.speed = value; break;
         case OptQuality: m_cfg.quality = value; break;
         case OptCardStyle: m_cfg.cardStyle = value; break;
-        case OptTraceColor: m_cfg.traceColor = std::clamp(value, 0, kTraceColorCount - 1); break;
+        case OptTraceColor: m_cfg.traceColor = std::clamp(value, 0, kTraceAppColor); break;
         case OptMonitor:
             if (value >= static_cast<int>(m.monitors.size()))
                 return;
@@ -1033,6 +1053,7 @@ void Stage::ApplySetting(int what)
         break;
     case OptTraceColor:
         TintTraces();                               // lines already running change color too
+        RedrawTraces();                             // ...including to or from each app's own color
         break;
     case OptTraceWidth:
         RedrawTraces();
