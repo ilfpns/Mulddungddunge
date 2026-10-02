@@ -398,10 +398,10 @@ void Stage::PaintSettings()
         case 0:     // General
         {
             toggle(row(L"컴퓨터 켤 때 자동 실행", L"Windows에 로그인하면 알아서 켜집니다", S(44)), StartsWithWindows(), OptAutostart);
-            toggle(row(L"단축키로 카드 열기", L"Alt + 숫자키(1~6)를 누르면 사이드바의 그 순서 카드가 바로 열립니다", S(44)), m_cfg.hotkeys, OptHotkeys);
+            toggle(row(L"단축키로 카드 열기", L"Alt + 숫자키(1~9)를 누르면 사이드바의 그 순서 카드가 바로 열립니다 (폴더는 펼쳐집니다)", S(44)), m_cfg.hotkeys, OptHotkeys);
             choice(row(L"단축키에 같이 누를 키", L"다른 프로그램의 단축키와 겹치면 바꿔 주세요", S(252)), { L"Alt", L"Ctrl+Alt", L"Shift+Alt" }, m_cfg.hotkeyMod, OptHotkeyMod, S(84));
             swprintf_s(buf, L"%d장", m_cfg.cards);
-            stepper(row(L"카드 개수", L"사이드바에 보여 줄 최근 창의 수 (1~6개)", S(132)), buf, OptCards, m_cfg.cards > 1, m_cfg.cards < 6);
+            stepper(row(L"카드 개수", L"사이드바에 보여 줄 카드 수 (1~9장, 폴더는 1장)", S(132)), buf, OptCards, m_cfg.cards > 1, m_cfg.cards < 9);
             choice(row(L"사이드바 위치", L"카드 목록을 화면의 어느 쪽에 둘지 고릅니다", S(152)), { L"왼쪽", L"오른쪽" }, m_cfg.right ? 1 : 0, OptSide, S(76));
             std::vector<std::wstring> names;
             int current = 0;
@@ -513,13 +513,16 @@ void Stage::PaintSettings()
                         if (wt::SameApp(c->app, app))
                             sample = c->hwnd;
                     D2D1_RECT_F iconRect{ x0, cy - S(14), x0 + S(28), cy + S(14) };
-                    if (sample && IsWindow(sample))
+                    bool folder = entry.rfind(L"folder#", 0) == 0;     // a pinned folder (this session)
+                    if (folder)
+                        text(L"\xE8B7", iconRect, m.icon.get(), dim.get());
+                    else if (sample && IsWindow(sample))
                         m_snap.DrawAppIcon(dc, sample, iconRect);
                     else
                         text(L"\xE718", iconRect, m.icon.get(), dim.get());
-                    text(wt::AppLabel(app, sample), { x0 + S(42), cy - S(20), x1 - S(90), cy + S(2) }, m.body.get(), ink.get());
-                    std::wstring where = L"모든 데스크톱";
-                    if (bar != std::wstring::npos)
+                    text(folder ? std::wstring(L"폴더") : wt::AppLabel(app, sample), { x0 + S(42), cy - S(20), x1 - S(90), cy + S(2) }, m.body.get(), ink.get());
+                    std::wstring where = folder ? L"이번 실행 동안" : L"모든 데스크톱";
+                    if (bar != std::wstring::npos && !folder)
                     {
                         GUID id{};
                         int n = SUCCEEDED(CLSIDFromString(entry.substr(0, bar).c_str(), &id)) ? DesktopNumber(id) : 0;
@@ -884,7 +887,7 @@ void Stage::SettingsClick(POINT pt)
     {
         int what = target.arg / 16, dir = target.arg % 16 ? 1 : -1;
         if (what == OptCards)
-            m_cfg.cards = std::clamp(m_cfg.cards + dir, 1, 6);
+            m_cfg.cards = std::clamp(m_cfg.cards + dir, 1, 9);
         else if (what == OptTilt)
             m_cfg.tilt = std::clamp(m_cfg.tilt + dir * 6, 0, 60);
         else if (what == OptSize)
@@ -1081,6 +1084,13 @@ void Stage::Rebuild()
     for (auto& c : m_cards)
         if (c->side.holder)
             m_sideContent.Children().Remove(c->side.holder);
+    for (auto& f : m_folders)
+        if (f->card && f->card->side.holder)
+        {
+            m_sideContent.Children().Remove(f->card->side.holder);
+            f->card->side = {};
+        }
+    m_openFolder = nullptr;
     m_cards.clear();
     m_visible.clear();
     m_offstage.clear();
@@ -1097,6 +1107,12 @@ void Stage::Rebuild()
 
 void Stage::UnpinEntry(std::wstring entry)
 {
+    for (auto& f : m_folders)
+        if (f->card && f->card->pinned && f->card->pinKey == entry)
+        {
+            SetPinned(*f->card, false);
+            return;
+        }
     for (auto& c : m_cards)
     {
         if (c->pinned && (PinMatches(entry, *c) || _wcsicmp(c->pinKey.c_str(), entry.c_str()) == 0))

@@ -13,7 +13,7 @@ inline constexpr int kTraceAppColor = kTraceColorCount;
 // User settings, kept under HKCU\Software\StageManager\Settings. Read once at startup, written on change.
 struct Config
 {
-    int cards = 4;                  // sidebar cards, 1..6
+    int cards = 4;                  // sidebar cards, 1..9 (a folder is one)
     int quality = 1;                // window pictures: 0 low, 1 normal, 2 high detail
     bool iconsOnly = false;         // no window pictures, app icon cards only: least GPU memory, no captures
     bool hoverTrace = true;         // a thin line runs around the card the pointer is on

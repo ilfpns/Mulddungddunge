@@ -49,7 +49,7 @@ namespace
 
 void Config::Load()
 {
-    cards = ReadInt(L"Cards", cards, 1, 6);
+    cards = ReadInt(L"Cards", cards, 1, 9);
     quality = ReadInt(L"Quality", quality, 0, 2);
     iconsOnly = ReadInt(L"IconsOnly", iconsOnly, 0, 1) != 0;
     hoverTrace = ReadInt(L"HoverTrace", hoverTrace, 0, 1) != 0;

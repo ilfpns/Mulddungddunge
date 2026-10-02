@@ -15,6 +15,7 @@ namespace
     constexpr UINT ID_AUTOSTART = 5;
     constexpr UINT ID_QUIT = 7;
     constexpr UINT ID_FIT = 8;                // the card's window takes the saved place and size
+    constexpr UINT ID_UNFOLD = 9;             // a folder's windows go back to cards of their own
     // Where "크기 맞추기" puts a window: the visible frame of the Orca window as it was on 2026-09-30,
     // in screen pixels (left, top, right, bottom). Fixed on purpose.
     constexpr RECT kFitFrame = { 252, 52, 2228, 1377 };
@@ -48,7 +49,7 @@ namespace
     constexpr float kMenuIcon = 24.f;
     constexpr float kMenuPad = 5.f;
     constexpr float kMenuRadius = 10.f;
-    constexpr int kHotkeyBase = 100;     // hotkey ids 100..103 = Alt+1..4
+    constexpr int kHotkeyBase = 100;     // hotkey ids 100..108 = Alt+1..9
     constexpr UINT_PTR kTimerPopulate = 1;
     constexpr UINT_PTR kTimerActiveSnap = 2;
     constexpr UINT kActiveSnapDelayMs = 500;
@@ -75,6 +76,10 @@ namespace
     constexpr UINT_PTR kTimerQueued = 18;     // a click held back by a transition: carry it out now
     constexpr UINT_PTR kTimerDropOpen = 19;   // a file held over a card this long: its window opens
     constexpr int kDropOpenMs = 2000;
+    constexpr UINT_PTR kTimerGroup = 20;      // a dragged card held over another this long: one folder
+    constexpr int kGroupMs = 2000;
+    constexpr UINT_PTR kTimerFolderClose = 21;    // an opened folder the pointer left closes again
+    constexpr size_t kFolderMax = 4;          // windows in a folder: its card shows them 2 x 2
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -93,7 +98,7 @@ namespace
     // Placeholders are drawn at twice their on-screen size: the tilt magnifies the near edge, and the
     // far edge gets a clean 2:1 average instead of skipped pixels.
     constexpr float kPlaceholderScale = 2.f;
-    constexpr int kMaxHotkeys = 6;       // as many as the most cards the sidebar can show
+    constexpr int kMaxHotkeys = 9;       // as many as the most cards the sidebar can show
     constexpr UINT_PTR kTimerFit = 13;   // a stage window moved: snapped next to the sidebar?
     constexpr int kSlideMs = 260;
     constexpr int kFlyMs = 300;
@@ -145,6 +150,47 @@ namespace
             QueryPerformanceFrequency(&freq);
             fwprintf(g_trace, L"%llu   %s took %.1f ms\n", GetTickCount64(), what, (end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart);
             fflush(g_trace);
+        }
+    };
+
+    // A slow response broken into its steps (trace only): "  slow: take=31.2 layout=4.0 ...".
+    struct Laps
+    {
+        LARGE_INTEGER last{}, start{};
+        std::wstring parts;
+        Laps()
+        {
+            if (g_trace)
+                QueryPerformanceCounter(&start), last = start;
+        }
+        static double Ms(LARGE_INTEGER a, LARGE_INTEGER b)
+        {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+        }
+        void Mark(wchar_t const* step)
+        {
+            if (!g_trace)
+                return;
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            wchar_t part[48];
+            swprintf_s(part, L" %s=%.1f", step, Ms(last, now));
+            parts += part;
+            last = now;
+        }
+        ~Laps()
+        {
+            if (!g_trace)
+                return;
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            if (Ms(start, now) >= 15.0)
+            {
+                fwprintf(g_trace, L"%llu   slow:%s\n", GetTickCount64(), parts.c_str());
+                fflush(g_trace);
+            }
         }
     };
 
@@ -470,7 +516,8 @@ void Stage::SavePins() const
 {
     std::wstring buffer;
     for (auto& app : m_pinnedApps)
-        buffer.append(app).push_back(L'\0');
+        if (app.rfind(L"folder#", 0) != 0)          // folders last for the session
+            buffer.append(app).push_back(L'\0');
     buffer.push_back(L'\0');
     RegSetKeyValueW(HKEY_CURRENT_USER, kStateKey, L"Pinned", REG_MULTI_SZ, buffer.data(),
         static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
@@ -522,7 +569,15 @@ void Stage::OpenCardMenu(int index, int anchorY)
     m_menu = {};
     m_menu.open = true;
     m_menu.card = card;
-    if (card)
+    if (card && card->isFolder)
+    {
+        m_menu.items = {
+            card->pinned ? MenuItem{ ID_UNPIN, L"\xE77A", L"고정 해제" } : MenuItem{ ID_PIN, L"\xE718", L"폴더 고정" },
+            MenuItem{ ID_UNFOLD, L"\xE8B7", L"폴더 풀기" },
+            MenuItem{ 0, nullptr, nullptr },
+        };
+    }
+    else if (card)
     {
         m_menu.items = {
             card->pinned ? MenuItem{ ID_UNPIN, L"\xE77A", L"고정 해제" } : MenuItem{ ID_PIN, L"\xE718", L"탭 고정" },
@@ -843,6 +898,28 @@ void Stage::RunMenuItem(int item)
     UINT command = m_menu.items[item].command;
     auto card = m_menu.card;
     CloseCardMenu();
+    if (card && card->isFolder && (command == ID_PIN || command == ID_UNPIN))
+    {
+        SetPinned(*card, command == ID_PIN);
+        return;
+    }
+    if (command == ID_UNFOLD)
+    {
+        if (auto f = card ? card->folderOf.lock() : nullptr)
+        {
+            Trace(L"folder unfolded");
+            float2 center{};
+            bool from = f->card && f->card->side.holder;
+            if (from)
+                center = f->card->side.at;
+            auto cards = InSidebar(*f);
+            Dissolve(f);
+            Relayout(true);
+            if (from)
+                SpreadFrom(center, cards);          // its windows come out of where it was
+        }
+        return;
+    }
     if (command != ID_SETTINGS && (!card || !IsWindow(card->hwnd)))
         return;                                     // its window closed while the menu was open
     if (command == ID_SETTINGS)
@@ -962,6 +1039,8 @@ bool Stage::QuitsOnClose(HWND hwnd) const
 // A stage window the app hid (closed to the tray): kept as a card it can be brought back from.
 void Stage::PutAwayHidden(HWND h)
 {
+    if (auto c = CardOf(h); c && c->pinned && !OnStage(h))
+        Relayout(true);                             // a pinned card is back in view once its window left
     if (!m_cfg.keepTray || !IsWindow(h) || IsWindowVisible(h) || OnStage(h) ||
         std::any_of(m_cards.begin(), m_cards.end(), [h](auto& c) { return c->hwnd == h; }))
         return;
@@ -1043,6 +1122,9 @@ wuc::CompositionSurfaceBrush Stage::AlertBrush()
 
 void Stage::UpdateBadges(Card& c)
 {
+    if (!c.isFolder)
+        if (auto f = FolderOf(c.hwnd); f && f->shown && f != m_openFolder)
+            RefreshFolderBadges(*f);
     auto& v = c.side;
     if (!v.alert)
         return;
@@ -1136,6 +1218,16 @@ void Stage::OnAudioChanged()
 // When nothing tells, only the app's most recent card shows it.
 int Stage::SoundOf(Card const& c) const
 {
+    if (c.isFolder)
+    {
+        // Any of its windows: muted only if every one playing is.
+        int sound = 0;
+        if (auto f = c.folderOf.lock())
+            for (HWND h : f->members)
+                if (auto m = CardOf(h); m && m->sound)
+                    sound = sound == 1 ? 1 : m->sound;
+        return sound;
+    }
     auto playing = std::find_if(m_playing.begin(), m_playing.end(), [&](auto& p) { return wt::IsCardApp(c.app, p.app, p.model); });
     if (playing == m_playing.end())
         return 0;
@@ -1336,6 +1428,31 @@ void Stage::SetPinned(Card& c, bool pinned)
     Trace(pinned ? L"pinned" : L"unpinned", c.hwnd);
     if (c.pinned == pinned)
         return;
+    if (c.isFolder)
+    {
+        // A folder: its place among the pinned cards, for this session (folders aren't saved).
+        auto f = c.folderOf.lock();
+        if (!f)
+            return;
+        c.pinned = pinned;
+        if (pinned)
+        {
+            c.pinKey = L"folder#" + std::to_wstring(f->id);
+            m_pinnedApps.push_back(c.pinKey);
+        }
+        else
+        {
+            std::erase(m_pinnedApps, c.pinKey);
+            c.pinKey.clear();
+        }
+        if (c.side.pin)
+            c.side.pin.IsVisible(pinned);
+        m_hover = -1;
+        Relayout(true);
+        return;
+    }
+    if (pinned)
+        LeaveFolder(c.hwnd);                        // pinned cards keep their own place at the top
     c.pinned = pinned;
     if (!c.app.empty())
     {
@@ -1649,6 +1766,8 @@ void Stage::OnForeground(HWND hwnd)
         hwnd = owner;
     ClearAlert(hwnd);
     CloseCardMenu();
+    if (m_openFolder && !m_busy && !m_tracking)
+        CloseFolder();
     // Another window took focus (Alt+Tab...): the settings panel steps aside, like a menu.
     // (Focus handed back to the stage window, as after the tray menu, doesn't count.)
     if (m_settings.open && hwnd != m_active)
@@ -1709,6 +1828,8 @@ void Stage::OnForeground(HWND hwnd)
         RemoveCard(hwnd);
         m_stage.push_back(hwnd);
         m_active = hwnd;
+        if (auto c = CardOf(hwnd); c && c->pinned)
+            Relayout(true);                         // its pinned card steps out while it is on stage
         SnapActiveSoon();
         StageChanged();
         if (m_cfg.fitSnapped && FitsBeside(hwnd))
@@ -1748,7 +1869,7 @@ void Stage::OnMinimizeStart(HWND hwnd)
     LeaveStage(hwnd);
     auto card = TakeCard(hwnd);
     if (!card->pinned)
-        m_cards.insert(m_cards.begin(), card);
+        InsertReturning(card);
     bool standIn = false;
     if (!picture && m_cfg.iconsOnly)
     {
@@ -1757,6 +1878,17 @@ void Stage::OnMinimizeStart(HWND hwnd)
         picture = MakePlaceholder(*card);
         standIn = true;
     }
+    else if (!picture && card->hasPicture)
+    {
+        // Minimized before it was photographed (right after it came up, a quick swipe down): its card
+        // still flies in, with the picture it had, rather than the window just vanishing.
+        if (auto old = card->snapshot.Surface().try_as<wuc::CompositionDrawingSurface>())
+        {
+            picture = old;
+            frame = card->frame;
+            standIn = card->placeholder;
+        }
+    }
     if (picture)
         SetSnapshot(*card, frame, picture, standIn);
     Relayout(true);
@@ -1764,7 +1896,7 @@ void Stage::OnMinimizeStart(HWND hwnd)
 
     // It flies into its slot from where it was, unless something else is animating, or its card is
     // out of view (e.g. while Windows is still moving the window between desktops).
-    if (!picture || m_busy || !card->side.holder)
+    if (!picture || m_busy || SlotOf(*card) < 0)
         return;
     m_busy = true;
     SetTimer(m_sidebar, kTimerWatchdog, kWatchdogMs, nullptr);
@@ -1773,7 +1905,8 @@ void Stage::OnMinimizeStart(HWND hwnd)
     flight->card = card;
     m_outs = { flight };
     m_pending = 1;
-    card->side.holder.Opacity(0.f);
+    if (card->side.holder)
+        card->side.holder.Opacity(0.f);
     GrowView();
     OnOutCaptured(flight, frame, picture);
 }
@@ -1979,12 +2112,26 @@ void Stage::Adopt(HWND hwnd)
 // gone for good (`evenIfPinned`: destroyed windows lose their pinned card too).
 void Stage::RemoveCard(HWND hwnd, bool evenIfPinned)
 {
+    bool folderChanged = false;
     if (evenIfPinned)
+    {
         std::erase_if(m_offstage, [&](auto& c) { return c->hwnd == hwnd; });
+        folderChanged = FolderOf(hwnd) != nullptr;
+        LeaveFolder(hwnd);
+    }
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
     if (it == m_cards.end() || ((*it)->pinned && !evenIfPinned))
+    {
+        // E.g. a folder's window closed while on stage: the folder changed (or is gone) all the same.
+        if (folderChanged)
+        {
+            m_hover = -1;
+            Relayout(true);
+        }
         return;
+    }
     auto card = *it;
+    card->homeIndex = static_cast<int>(it - m_cards.begin());
     m_cards.erase(it);
     if (evenIfPinned)
     {
@@ -2092,6 +2239,9 @@ wuc::CompositionDrawingSurface Stage::MakePlaceholder(Card const& c)
 // The stand-in style changed in Settings: stand-ins are drawn again, glass shown or hidden.
 void Stage::RestylePlaceholders()
 {
+    for (auto& f : m_folders)
+        if (f->card)
+            f->card->snapshot.Surface(FolderBackground(*f->card));
     for (auto& c : m_cards)
     {
         if (!c->hasPicture || !c->placeholder)
@@ -2125,6 +2275,10 @@ void Stage::RecoverDevice()
     for (auto& c : m_offstage)
         if (IsWindow(c->hwnd))
             redraw(*c);
+    for (auto& f : m_folders)
+        if (f->card)
+            f->card->snapshot.Surface(FolderBackground(*f->card));
+    Relayout(false);                                // folder grids drawn again
     m_activeSnap = m_prefetch = nullptr;
     SnapActiveSoon();
 }
@@ -2173,6 +2327,12 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
 
     ApplySize(v, c);
     v.holder.Children().InsertAtTop(v.sprite);
+    if (c.isFolder)
+    {
+        v.grid = m_compositor.CreateContainerVisual();
+        v.sprite.Children().InsertAtTop(v.grid);
+        FillFolderGrid(v, const_cast<Card&>(c));  // a new grid: drawn, not yet remembered
+    }
 
     if (withBadge)
     {
@@ -2211,6 +2371,7 @@ void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
     Crop k = CropFor(c, p.thumb);
     float2 mid = k.offset + k.size / 2.f;
     v.holder.Offset({ p.center.x, p.center.y, 0.f });
+    v.at = p.center;
     v.sprite.Offset({ -mid.x, -mid.y, 0.f });
     v.sprite.CenterPoint({ mid.x, mid.y, 0.f });
     v.sprite.Scale({ p.scale, p.scale, 1.f });
@@ -2258,6 +2419,7 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
     };
 
     vec3(v.holder, L"Offset", { from.center.x, from.center.y, 0.f }, { to.center.x, to.center.y, 0.f });
+    v.at = to.center;
     vec3(v.sprite, L"Offset", { -mid0.x, -mid0.y, 0.f }, { -mid1.x, -mid1.y, 0.f });
     vec3(v.sprite, L"CenterPoint", { mid0.x, mid0.y, 0.f }, { mid1.x, mid1.y, 0.f });
     vec3(v.sprite, L"Scale", { from.scale, from.scale, 1.f }, { to.scale, to.scale, 1.f });
@@ -2302,9 +2464,18 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
 
 void Stage::Relayout(bool animate)
 {
-    auto pinnedEnd = std::stable_partition(m_cards.begin(), m_cards.end(), [](auto& c) { return c->pinned; });
+    PruneFolders();
+    // A pinned folder's windows sit with the pinned cards, in the folder's pin place.
+    auto pinKeyOf = [&](Card const& c) -> std::wstring const* {
+        if (c.pinned)
+            return &c.pinKey;
+        auto f = FolderOf(c.hwnd);
+        return f && f->card && f->card->pinned ? &f->card->pinKey : nullptr;
+    };
+    auto pinnedEnd = std::stable_partition(m_cards.begin(), m_cards.end(), [&](auto& c) { return pinKeyOf(*c) != nullptr; });
     auto rank = [&](Card const& c) {
-        auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto& e) { return _wcsicmp(e.c_str(), c.pinKey.c_str()) == 0; });
+        auto key = pinKeyOf(c);
+        auto it = std::find_if(m_pinnedApps.begin(), m_pinnedApps.end(), [&](auto& e) { return key && _wcsicmp(e.c_str(), key->c_str()) == 0; });
         return it - m_pinnedApps.begin();
     };
     std::stable_sort(m_cards.begin(), pinnedEnd, [&](auto& a, auto& b) { return rank(*a) < rank(*b); });
@@ -2312,12 +2483,62 @@ void Stage::Relayout(bool animate)
     // Every desktop's sidebar shows its 4 most recent cards; a card pushed out of its own desktop's
     // top 4 can never be seen again, so its snapshot is released.
     std::vector<std::pair<GUID, size_t>> perDesktop;
+    // A folder takes one slot, where its first window in the list is; opened, its windows are
+    // listed there instead (in the folder's order) and still count as that one slot.
+    for (auto& f : m_folders)
+        f->shown = false;
+    std::vector<CardFolder*> placed;
+    size_t slots = 0;
     for (auto& c : m_cards)
     {
+        // A pinned card keeps its place, but its window on stage takes it out of the sidebar like any
+        // other; it comes back to that place when the window leaves.
+        if (c->pinned && OnStage(c->hwnd))
+        {
+            if (c->side.holder)
+                c->side.holder.IsVisible(false);
+            continue;
+        }
         bool here = Here(*c);
-        if (here && m_visible.size() < static_cast<size_t>(m_cfg.cards))
+        if (auto f = here && !c->pinned ? FolderOf(c->hwnd) : nullptr)
+        {
+            bool first = std::find(placed.begin(), placed.end(), f.get()) == placed.end();
+            if (first)
+            {
+                placed.push_back(f.get());
+                f->shown = slots < static_cast<size_t>(m_cfg.cards);
+                if (f->shown)
+                {
+                    ++slots;
+                    if (f == m_openFolder)
+                    {
+                        for (auto& m : InSidebar(*f))
+                            if (Here(*m))
+                                m_visible.push_back(m);
+                    }
+                    else
+                    {
+                        m_visible.push_back(f->card);
+                        if (f->card->side.holder)
+                            f->card->side.holder.IsVisible(true);
+                    }
+                }
+            }
+            if (f->shown && f == m_openFolder)
+                continue;                           // listed above
+            // Inside the folder's card: no visuals of its own; its picture stays for the folder's grid.
+            if (c->side.holder)
+            {
+                m_sideContent.Children().Remove(c->side.holder);
+                c->side = {};
+            }
+            if (f->shown)
+                continue;
+        }
+        if (here && slots < static_cast<size_t>(m_cfg.cards) && !FolderOf(c->hwnd))
         {
             m_visible.push_back(c);
+            ++slots;
             continue;
         }
         if (c->side.holder)
@@ -2354,6 +2575,16 @@ void Stage::Relayout(bool animate)
         Pose target = SlotPose(c, i);
         if (m_cfg.sounds)
             c.sound = SoundOf(c);
+        if (c.isFolder)
+        {
+            if (auto f = c.folderOf.lock())
+            {
+                c.alert = std::any_of(f->members.begin(), f->members.end(), [&](HWND h) { auto m = CardOf(h); return m && m->alert; });
+                c.desktop = m_desktopId;
+            }
+            if (c.side.holder)
+                FillFolderGrid(c.side, c);          // its windows may have changed
+        }
         if (!c.side.holder)
         {
             c.side = MakeVis(c, true);
@@ -2363,12 +2594,518 @@ void Stage::Relayout(bool animate)
             continue;
         }
         c.side.holder.IsVisible(true);
-        float2 now{ c.side.holder.Offset().x, c.side.holder.Offset().y };
+        if (c.isFolder)
+            UpdateBadges(c);
+        float2 now = c.side.at;                     // where it was last sent (see CardVis::at)
         if (animate && (now.x != target.center.x || now.y != target.center.y))
             AnimatePose(c.side, c, { now, target.scale, target.angle, true }, target, m_cfg.Ms(kSlideMs));
         else
             ApplyPose(c.side, c, target);
     }
+    // Folders not in view lose their card's visuals; an opened one out of view closes.
+    for (auto& f : m_folders)
+        if (f->card && f->card->side.holder && (!f->shown || f == m_openFolder))
+        {
+            m_sideContent.Children().Remove(f->card->side.holder);
+            f->card->side = {};
+        }
+    if (m_openFolder && !m_openFolder->shown)
+        m_openFolder = nullptr;
+    // An opened folder: a soft panel behind its windows' cards, so they read as one group.
+    int firstIn = -1, lastIn = -1;
+    for (int i = 0; m_openFolder && i < static_cast<int>(m_visible.size()); ++i)
+        if (FolderOf(m_visible[i]->hwnd) == m_openFolder)
+        {
+            if (firstIn < 0)
+                firstIn = i;
+            lastIn = i;
+        }
+    if (firstIn >= 0)
+    {
+        if (!m_folderPanel)
+        {
+            m_folderPanel = m_compositor.CreateSpriteVisual();
+            m_folderPanel.Brush(m_compositor.CreateColorBrush({ 30, 255, 255, 255 }));
+            auto round = m_compositor.CreateRoundedRectangleGeometry();
+            round.CornerRadius({ S(14), S(14) });
+            m_folderPanel.Clip(m_compositor.CreateGeometricClip(round));
+            m_sideContent.Children().InsertAtBottom(m_folderPanel);
+        }
+        float top = SlotCenter(firstIn).y - ThumbH() / 2.f - S(10), bottom = SlotCenter(lastIn).y + ThumbH() / 2.f + S(10);
+        m_folderPanel.Offset({ S(6), top, 0.f });
+        m_folderPanel.Size({ BarW() - S(12), bottom - top });
+        m_folderPanel.Clip().as<wuc::CompositionGeometricClip>().Geometry().as<wuc::CompositionRoundedRectangleGeometry>().Size({ BarW() - S(12), bottom - top });
+        m_folderPanel.IsVisible(true);
+    }
+    else if (m_folderPanel)
+        m_folderPanel.IsVisible(false);
+    // Alt+number keys follow what is in the sidebar now.
+    if (m_hotkeysOn && HotkeyCount() != m_hotkeyN)
+        RegisterHotkeys();
+    if (g_trace)
+    {
+        // What the sidebar shows, when it changes: "layout: Spotify | [folder] | Chrome  (of 9)".
+        std::wstring line;
+        for (auto& c : m_visible)
+        {
+            wchar_t title[24]{};
+            if (c->isFolder)
+                wcscpy_s(title, L"[folder]");
+            else
+                GetWindowTextW(c->hwnd, title, ARRAYSIZE(title));
+            line += (line.empty() ? L"" : L" | ") + std::wstring(title) + (c->side.holder ? L"" : L" (no visual)");
+        }
+        line += L"  (of " + std::to_wstring(m_cards.size()) + L")";
+        static std::wstring last;
+        if (line != last)
+        {
+            last = line;
+            Trace((L"layout: " + line).c_str());
+        }
+    }
+}
+
+std::vector<std::shared_ptr<Card>> Stage::InSidebar(CardFolder const& f) const
+{
+    std::vector<std::shared_ptr<Card>> out;
+    for (HWND h : f.members)
+        if (auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }); it != m_cards.end())
+            out.push_back(*it);
+    return out;
+}
+
+int Stage::HotkeyCount() const
+{
+    // Without folders that is the number of cards; folders add their other windows.
+    size_t n = 0;
+    for (auto& c : m_visible)
+        n += c->isFolder ? HotkeyOrderOf(*c) : 1;
+    return std::clamp(std::max(m_cfg.cards, static_cast<int>(n)), 1, kMaxHotkeys);
+}
+
+size_t Stage::HotkeyOrderOf(Card const& folderCard) const
+{
+    size_t n = 0;
+    if (auto f = folderCard.folderOf.lock())
+        for (auto& m : InSidebar(*f))
+            n += Here(*m);
+    return n;
+}
+
+std::vector<std::shared_ptr<Card>> Stage::HotkeyOrder() const
+{
+    std::vector<std::shared_ptr<Card>> order;
+    for (auto& c : m_visible)
+    {
+        if (!c->isFolder)
+            order.push_back(c);
+        else if (auto f = c->folderOf.lock())
+            for (auto& m : InSidebar(*f))
+                if (Here(*m))
+                    order.push_back(m);
+    }
+    return order;
+}
+
+// The opened folder's cards, taken off the layout (but still drawn) so they can gather into its card.
+Stage::Detached Stage::DetachOpened(Card const* except)
+{
+    Detached out;
+    for (auto& c : m_visible)
+        if (c.get() != except && m_openFolder && FolderOf(c->hwnd) == m_openFolder && c->side.holder)
+        {
+            out.push_back({ c, c->side });
+            c->side = {};
+        }
+    return out;
+}
+
+// They shrink into the folder's card (laid out by now) and go; the folder's card fades back in.
+void Stage::GatherInto(Detached leaving, std::shared_ptr<CardFolder> f)
+{
+    int slot = f && f->card ? SlotOf(*f->card) : -1;
+    if (leaving.empty())
+        return;
+    if (slot < 0 || !f->card->side.holder)
+    {
+        for (auto& [card, vis] : leaving)
+            m_sideContent.Children().Remove(vis.holder);
+        return;
+    }
+    Pose into = SlotPose(*f->card, slot);
+    int ms = m_cfg.Ms(kSlideMs);
+    auto batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
+    for (auto& [card, vis] : leaving)
+    {
+        Pose from = SlotPose(*card, 0);
+        from.center = vis.at;
+        Pose to = from;
+        to.center = into.center;
+        to.scale = from.scale * 0.45f;
+        AnimatePose(vis, *card, from, to, ms);
+        auto fade = m_compositor.CreateScalarKeyFrameAnimation();
+        fade.InsertKeyFrame(1.f, 0.f);
+        fade.Duration(std::chrono::milliseconds(ms));
+        vis.holder.StartAnimation(L"Opacity", fade);
+    }
+    batch.End();
+    batch.Completed([this, leaving](auto&&, auto&&) {
+        for (auto& [card, vis] : leaving)
+            m_sideContent.Children().Remove(vis.holder);
+    });
+    auto appear = m_compositor.CreateScalarKeyFrameAnimation();
+    appear.InsertKeyFrame(0.f, 0.f);
+    appear.InsertKeyFrame(1.f, 1.f);
+    appear.Duration(std::chrono::milliseconds(ms));
+    f->card->side.holder.StartAnimation(L"Opacity", appear);
+}
+
+// Cards just laid out come out of `center` (a folder's card): small and faint, growing into place.
+void Stage::SpreadFrom(float2 center, std::vector<std::shared_ptr<Card>> const& cards)
+{
+    int ms = m_cfg.Ms(kSlideMs);
+    for (auto& c : cards)
+    {
+        auto at = std::find(m_visible.begin(), m_visible.end(), c);
+        if (at == m_visible.end() || !c->side.holder)
+            continue;
+        Pose to = SlotPose(*c, static_cast<size_t>(at - m_visible.begin()));
+        Pose from = to;
+        from.center = center;
+        from.scale = to.scale * 0.45f;
+        AnimatePose(c->side, *c, from, to, ms);
+        auto fade = m_compositor.CreateScalarKeyFrameAnimation();
+        fade.InsertKeyFrame(0.f, 0.f);
+        fade.InsertKeyFrame(1.f, 1.f);
+        fade.Duration(std::chrono::milliseconds(ms));
+        c->side.holder.StartAnimation(L"Opacity", fade);
+    }
+}
+
+// ---- folders and moving cards ----------------------------------------------
+
+std::shared_ptr<CardFolder> Stage::FolderOf(HWND hwnd) const
+{
+    if (!hwnd)
+        return nullptr;
+    for (auto& f : m_folders)
+        if (std::find(f->members.begin(), f->members.end(), hwnd) != f->members.end())
+            return f;
+    return nullptr;
+}
+
+std::shared_ptr<Card> Stage::CardOf(HWND hwnd) const
+{
+    for (auto* list : { &m_cards, &m_offstage })
+        if (auto it = std::find_if(list->begin(), list->end(), [&](auto& c) { return c->hwnd == hwnd; }); it != list->end())
+            return *it;
+    return nullptr;
+}
+
+int Stage::SlotOf(Card const& c) const
+{
+    for (size_t i = 0; i < m_visible.size(); ++i)
+        if (m_visible[i].get() == &c)
+            return static_cast<int>(i);
+    if (auto f = FolderOf(c.hwnd))
+        for (size_t i = 0; i < m_visible.size(); ++i)
+            if (m_visible[i] == f->card)
+                return static_cast<int>(i);
+    return -1;
+}
+
+// Without moves by hand the most recent card goes on top. With them, a card back from the stage takes
+// the place it had; one in a folder goes next to the folder's other windows (the folder stays put).
+void Stage::InsertReturning(std::shared_ptr<Card> card)
+{
+    if (auto f = FolderOf(card->hwnd))
+    {
+        auto last = m_cards.end();
+        for (auto it = m_cards.begin(); it != m_cards.end(); ++it)
+            if (FolderOf((*it)->hwnd) == f)
+                last = it;
+        if (last != m_cards.end())
+        {
+            m_cards.insert(last + 1, card);
+            return;
+        }
+    }
+    if (m_manualOrder && card->homeIndex >= 0)
+    {
+        m_cards.insert(m_cards.begin() + std::min<size_t>(card->homeIndex, m_cards.size()), card);
+        return;
+    }
+    m_cards.insert(m_cards.begin(), card);
+}
+
+bool Stage::CanGroup(Card const& dragged, Card const& target) const
+{
+    if (&dragged == &target || dragged.isFolder || dragged.pinned || (target.pinned && !target.isFolder) || !IsWindow(dragged.hwnd))
+        return false;
+    auto into = target.isFolder ? target.folderOf.lock() : FolderOf(target.hwnd);
+    if (into && (into == FolderOf(dragged.hwnd) || into->members.size() >= kFolderMax))
+        return false;
+    return into || IsWindow(target.hwnd);
+}
+
+// The dragged card joins the target's folder, or the two make a new one where the target is.
+bool Stage::Group(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target)
+{
+    if (!CanGroup(*dragged, *target) || std::find(m_cards.begin(), m_cards.end(), dragged) == m_cards.end())
+        return false;
+    auto f = target->isFolder ? target->folderOf.lock() : FolderOf(target->hwnd);
+    if (FolderOf(dragged->hwnd))
+        LeaveFolder(dragged->hwnd);
+    if (!f)
+    {
+        if (std::find(m_cards.begin(), m_cards.end(), target) == m_cards.end())
+            return false;
+        f = std::make_shared<CardFolder>();
+        f->id = ++m_folderIds;
+        f->members = { target->hwnd };
+        f->card = MakeFolderCard();
+        f->card->folderOf = f;
+        m_folders.push_back(f);
+    }
+    f->members.push_back(dragged->hwnd);
+    m_cards.erase(std::find(m_cards.begin(), m_cards.end(), dragged));
+    InsertReturning(dragged);                       // next to the folder's other windows
+    if (dragged->side.holder)
+    {
+        m_sideContent.Children().Remove(dragged->side.holder);
+        dragged->side = {};
+    }
+    Trace(L"grouped into a folder", dragged->hwnd);
+    m_hover = -1;
+    Relayout(true);
+    return true;
+}
+
+void Stage::LeaveFolder(HWND hwnd)
+{
+    auto f = FolderOf(hwnd);
+    if (!f)
+        return;
+    std::erase(f->members, hwnd);
+    if (f->members.size() <= 1)
+        Dissolve(f);                                // a folder of one is just that card
+}
+
+void Stage::Dissolve(std::shared_ptr<CardFolder> f)
+{
+    if (f->card && f->card->pinned)
+        std::erase(m_pinnedApps, f->card->pinKey);
+    if (f->card && f->card->side.holder)
+        m_sideContent.Children().Remove(f->card->side.holder);
+    if (f->card)
+        f->card->side = {};
+    if (m_openFolder == f)
+        m_openFolder = nullptr;
+    f->members.clear();
+    std::erase(m_folders, f);
+}
+
+void Stage::PruneFolders()
+{
+    std::vector<std::shared_ptr<CardFolder>> gone;
+    for (auto& f : m_folders)
+    {
+        std::erase_if(f->members, [](HWND h) { return !IsWindow(h); });
+        if (f->members.size() <= 1)
+            gone.push_back(f);
+    }
+    for (auto& f : gone)
+        Dissolve(f);
+}
+
+void Stage::OpenFolder(std::shared_ptr<CardFolder> f, bool byKey)
+{
+    if (!f || m_busy)
+        return;
+    Trace(byKey ? L"folder opened (key)" : L"folder opened");
+    KillTimer(m_sidebar, kTimerFolderClose);
+    if (m_dock == DockState::Tucked)
+    {
+        m_revealed = true;
+        SetDock(DockState::Shown);
+    }
+    ClearTrace();
+    m_hover = -1;
+    float2 center{};
+    bool from = f->card && f->card->side.holder;
+    if (from)
+        center = f->card->side.at;
+    m_openFolder = f;
+    Relayout(true);
+    if (from)
+        SpreadFrom(center, InSidebar(*f));         // its cards come out of the folder's card
+    // Opened from the keyboard the pointer may never come: it closes by itself after a while.
+    if (byKey)
+        SetTimer(m_sidebar, kTimerFolderClose, 6000, nullptr);
+}
+
+void Stage::CloseFolder()
+{
+    KillTimer(m_sidebar, kTimerFolderClose);
+    if (!m_openFolder)
+        return;
+    Trace(L"folder closed");
+    auto f = m_openFolder;
+    auto leaving = DetachOpened(nullptr);
+    m_openFolder = nullptr;
+    m_hover = -1;
+    Relayout(true);
+    GatherInto(std::move(leaving), f);              // its cards go back into the folder's card
+    if (m_revealed && !m_tracking)
+        SetTimer(m_sidebar, kTimerTuck, 350, nullptr);
+}
+
+// Dropped on another card: it takes that card's place, which moves one along (down when coming from
+// above, up when coming from below). A folder moves with all of its windows; a window dropped
+// outside its folder leaves it. From then on the order is kept (see InsertReturning).
+void Stage::MoveCard(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target)
+{
+    auto from = dragged->isFolder ? dragged->folderOf.lock() : FolderOf(dragged->hwnd);
+    auto to = target->isFolder ? target->folderOf.lock() : FolderOf(target->hwnd);
+    if (!dragged->isFolder && from && from == to)
+    {
+        // Within an opened folder: its order (the grid's) changes.
+        auto& m = from->members;
+        auto a = std::find(m.begin(), m.end(), dragged->hwnd), b = std::find(m.begin(), m.end(), target->hwnd);
+        if (a != m.end() && b != m.end() && a != b)
+        {
+            bool down = a < b;
+            HWND h = *a;
+            m.erase(a);
+            b = std::find(m.begin(), m.end(), target->hwnd);
+            m.insert(down ? b + 1 : b, h);
+        }
+        Relayout(true);
+        return;
+    }
+    if (!dragged->isFolder && from)
+        LeaveFolder(dragged->hwnd);
+    auto inDragged = [&](auto& c) { return dragged->isFolder ? (from && FolderOf(c->hwnd) == from) : c == dragged; };
+    auto inTarget = [&](auto& c) { return target->isFolder ? (to && FolderOf(c->hwnd) == to) : c == target; };
+    auto firstOf = [&](auto pred) {
+        return static_cast<int>(std::find_if(m_cards.begin(), m_cards.end(), pred) - m_cards.begin());
+    };
+    int fromAt = firstOf(inDragged), toAt = firstOf(inTarget);
+    if (fromAt >= static_cast<int>(m_cards.size()) || toAt >= static_cast<int>(m_cards.size()))
+        return;
+    std::vector<std::shared_ptr<Card>> block;
+    for (auto& c : m_cards)
+        if (inDragged(c))
+            block.push_back(c);
+    std::erase_if(m_cards, inDragged);
+    auto first = std::find_if(m_cards.begin(), m_cards.end(), inTarget);
+    if (first == m_cards.end())
+        return;
+    auto at = first;
+    if (fromAt < toAt)                              // coming from above: after the target
+        for (auto it = first; it != m_cards.end(); ++it)
+            if (inTarget(*it))
+                at = it + 1;
+    m_cards.insert(at, block.begin(), block.end());
+    m_manualOrder = true;
+    Trace(L"card moved", dragged->hwnd);
+    m_hover = -1;
+    Relayout(true);
+}
+
+std::shared_ptr<Card> Stage::MakeFolderCard()
+{
+    auto c = std::make_shared<Card>();
+    c->isFolder = true;
+    c->w = kThumbW * 2.f;                           // the sidebar card shape exactly: nothing is cropped
+    c->h = kThumbH * 2.f;
+    c->desktop = m_desktopId;
+    c->snapshot = m_compositor.CreateSurfaceBrush(FolderBackground(*c));
+    c->snapshot.Stretch(wuc::CompositionStretch::Fill);
+    c->hasPicture = c->hasSnapshot = c->placeholder = true;     // a stand-in: glass behind it in that style
+    return c;
+}
+
+wuc::CompositionDrawingSurface Stage::FolderBackground(Card const& c)
+{
+    bool glass = m_cfg.cardStyle == 1;
+    return m_snap.Paint(c.w, c.h, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> fill;
+        dc->CreateSolidColorBrush(glass ? D2D1::ColorF(1.f, 1.f, 1.f, 0.10f) : D2D1::ColorF(0.23f, 0.23f, 0.25f, 0.95f), fill.put());
+        dc->FillRectangle({ 0.f, 0.f, c.w, c.h }, fill.get());
+    });
+}
+
+// The folder's windows, 1 2 / 3 4, each its picture cropped from the top like a sidebar card, with
+// its app icon. The pictures are the windows' own brushes: a new picture of one shows here at once.
+void Stage::FillFolderGrid(CardVis const& v, Card& folderCard)
+{
+    if (!v.grid)
+        return;
+    auto f = folderCard.folderOf.lock();
+    std::vector<int64_t> key;
+    if (f)
+        for (auto& m : InSidebar(*f))
+            key.insert(key.end(), { reinterpret_cast<int64_t>(m->hwnd), static_cast<int64_t>(m->w), static_cast<int64_t>(m->h),
+                                    m->icon ? reinterpret_cast<int64_t>(winrt::get_abi(m->icon)) : 0, m->hasPicture });
+    if (v.grid == folderCard.gridOf && key == folderCard.gridKey)
+        return;                                     // unchanged (the pictures themselves update live)
+    v.grid.Children().RemoveAll();
+    if (v.grid == folderCard.side.grid)             // the sidebar card's grid (not a lifted copy)
+    {
+        folderCard.gridOf = v.grid;
+        folderCard.gridKey = key;
+    }
+    if (!f)
+        return;
+    float w = folderCard.w, h = folderCard.h, pad = w * 0.045f;
+    float cw = (w - 3.f * pad) / 2.f, ch = (h - 3.f * pad) / 2.f;
+    float k = ThumbScale(folderCard);               // folder px -> sidebar px
+    size_t i = 0;
+    for (auto& m : InSidebar(*f))                   // one on stage is not shown: the others move up
+    {
+        if (i >= kFolderMax)
+            break;
+        if (!m->hasPicture)
+        {
+            m->snapshot.Surface(MakePlaceholder(*m));
+            m->hasPicture = m->placeholder = true;
+        }
+        float x = pad + (i % 2) * (cw + pad), y = pad + (i / 2) * (ch + pad);
+        auto cell = m_compositor.CreateContainerVisual();
+        cell.Offset({ x, y, 0.f });
+        cell.Size({ cw, ch });
+        auto round = m_compositor.CreateRoundedRectangleGeometry();
+        round.Size({ cw, ch });
+        round.CornerRadius({ S(5) / k, S(5) / k });
+        cell.Clip(m_compositor.CreateGeometricClip(round));
+        auto pic = m_compositor.CreateSpriteVisual();
+        float s = std::max(cw / std::max(1.f, m->w), ch / std::max(1.f, m->h));
+        pic.Size({ m->w * s, m->h * s });
+        pic.Offset({ (cw - m->w * s) / 2.f, 0.f, 0.f });
+        pic.Brush(m->snapshot);
+        cell.Children().InsertAtTop(pic);
+        if (m->icon)
+        {
+            float is = S(15) / k, gap = S(3) / k;
+            auto icon = m_compositor.CreateSpriteVisual();
+            icon.Size({ is, is });
+            icon.Offset({ gap, ch - is - gap, 0.f });
+            icon.Brush(m->icon);
+            cell.Children().InsertAtTop(icon);
+        }
+        v.grid.Children().InsertAtTop(cell);
+        ++i;
+    }
+}
+
+void Stage::RefreshFolderBadges(CardFolder& f)
+{
+    if (!f.card)
+        return;
+    f.card->alert = std::any_of(f.members.begin(), f.members.end(), [&](HWND h) { auto m = CardOf(h); return m && m->alert; });
+    f.card->sound = SoundOf(*f.card);
+    UpdateBadges(*f.card);
 }
 
 int Stage::HitTest(POINT pt) const
@@ -2416,6 +3153,8 @@ void Stage::SetHover(int index)
             return;
         auto& c = *m_visible[i];
         auto& v = c.side;
+        if (!v.holder)
+            return;                                 // not drawn (yet)
         Pose p = HoverPose(c, i, hovered);
         std::chrono::milliseconds dur(m_cfg.Ms(hovered ? 200 : 170));
         auto vec = [&](auto const& target, wchar_t const* prop, float3 to) {
@@ -2493,7 +3232,7 @@ void Stage::StartTrace(int index)
         return;
     // A file held over the card: the line counts down to its window opening (shown even with the
     // hover line turned off, since it tells what is about to happen).
-    if (m_fileDrag && m_dropHwnd == m_visible[index]->hwnd)
+    if (m_fileDrag && m_dropCard == m_visible[index])
         RunTrace(*m_visible[index], true, kDropOpenMs);
     else if (m_cfg.hoverTrace)
         RunTrace(*m_visible[index], true);
@@ -2515,7 +3254,7 @@ void Stage::RunTrace(Card& c, bool hover, int countdownMs)
         // Drawn inside the card's sprite, in its own (unscaled window) pixels: the line tilts, turns
         // and grows with the card. Sizes that should look fixed on screen are divided by its scale.
         int index = static_cast<int>(it - m_visible.begin());
-        Pose p = hover ? HoverPose(c, index, true) : SlotPose(c, index);
+        Pose p = hover && m_hover == index ? HoverPose(c, index, true) : SlotPose(c, index);
         Crop k = CropFor(c, true);
         // The thickness chosen in Settings, in screen px (scaled by the display's DPI).
         float width = S(static_cast<float>(std::clamp(m_cfg.traceWidth, 1, 5))) / p.scale, inset = width / 2.f;  // inside the card's clip
@@ -2648,7 +3387,7 @@ std::vector<wuc::CompositionColorBrush> const& Stage::TraceBrushes(Card& c)
             m_traceBrushes.push_back(m_compositor.CreateColorBrush());
         TintTraces();
     }
-    if (m_cfg.traceColor != kTraceAppColor)
+    if (m_cfg.traceColor != kTraceAppColor || c.isFolder)
         return m_traceBrushes;
     if (!c.logoKnown)
     {
@@ -2706,7 +3445,8 @@ void Stage::SweepTraces()
     std::vector<wuc::ContainerVisual> freed;        // cards whose hover run ended
     // An attention loop on a picture that is no longer any card's (its visuals were made again) goes.
     for (auto& t : m_traces)
-        if (!t.hover && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->side.sprite == t.parent; }))
+        if (!t.hover && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->side.sprite == t.parent; }) &&
+            std::none_of(m_visible.begin(), m_visible.end(), [&](auto& c) { return c->side.sprite == t.parent; }))
             t.until = 0;
     std::erase_if(m_traces, [&](TraceRun& t) {
         if (t.until > now)
@@ -2818,6 +3558,25 @@ void Stage::SwitchTo(size_t index)
 {
     ClearTrace();
     auto next = m_visible[index];
+    if (next->isFolder)
+    {
+        if (m_openFolder == next->folderOf.lock())
+            CloseFolder();
+        else
+            OpenFolder(next->folderOf.lock(), false);
+        return;
+    }
+    Pose from = SlotPose(*next, index);
+    from.center = SideToAnim(from.center);
+    if (m_hover == static_cast<int>(index))
+        from = HoverPose(*next, index, true), from.center = SideToAnim(from.center);
+    SwitchToCard(next, from);
+}
+
+// `from`: where the flight starts (its card in the sidebar, or the folder's card it is in).
+void Stage::SwitchToCard(std::shared_ptr<Card> next, Pose from)
+{
+    ClearTrace();
     if (wt::IsCloaked(next->hwnd))
     {
         // On another desktop: activating it makes Windows switch there (with its own animation);
@@ -2827,33 +3586,42 @@ void Stage::SwitchTo(size_t index)
         ForceForeground(next->hwnd);
         return;
     }
-    Pose from = SlotPose(*next, index);
-    from.center = SideToAnim(from.center);
-    if (m_hover == static_cast<int>(index))
-        from = HoverPose(*next, index, true), from.center = SideToAnim(from.center);
     if (next->hwnd == m_active)
     {
         SetHover(-1);                               // already on stage: the card just settles back
+        CloseFolder();
         return;
     }
     m_hover = -1;
+    KillTimer(m_sidebar, kTimerFolderClose);
+    // A window picked from an opened folder: the folder closes, its other cards gathering back in.
+    auto folder = m_openFolder;
+    auto leaving = DetachOpened(next.get());
+    m_openFolder = nullptr;
     if (!next->pinned)
     {
-        m_cards.erase(std::find(m_cards.begin(), m_cards.end(), next));
+        if (auto it = std::find(m_cards.begin(), m_cards.end(), next); it != m_cards.end())
+        {
+            next->homeIndex = static_cast<int>(it - m_cards.begin());
+            m_cards.erase(it);
+        }
         Park(next);
     }
 
     if (!IsWindow(next->hwnd))
     {
         Relayout(true);
+        GatherInto(std::move(leaving), folder);
         return;
     }
     BeginTransition(next->hwnd, next, from);
+    GatherInto(std::move(leaving), folder);
 }
 
 void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose const& nextFrom)
 {
     Took took(L"switch start");
+    Laps laps;
     ULONGLONG begun = GetTickCount64();
     Trace(L"switch begin", next);
     ClearTrace();
@@ -2872,7 +3640,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
             // Minimized or hidden without us noticing in time: no flight, but it keeps its card.
             auto card = TakeCard(h);
             if (!card->pinned)
-                m_cards.insert(m_cards.begin(), card);
+                InsertReturning(card);
         }
     }
     m_stage = { next };
@@ -2881,6 +3649,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     m_inCard = nextCard;
     m_outs.clear();
     m_pending = 0;
+    laps.Mark(L"prep");
 
     // Most recently focused ends up on top of the sidebar.
     for (HWND h : leaving)
@@ -2888,14 +3657,17 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         auto flight = std::make_shared<OutFlight>();
         flight->card = TakeCard(h);
         if (!flight->card->pinned)
-            m_cards.insert(m_cards.begin(), flight->card);
+            InsertReturning(flight->card);
         m_outs.push_back(flight);
     }
+    laps.Mark(L"take");
     Relayout(true);
+    laps.Mark(L"layout");
 
-    // A leaving window whose card is not in view has nowhere to land: it is just minimized.
-    std::erase_if(m_outs, [](auto& flight) {
-        if (flight->card->side.holder)
+    // A leaving window whose card is not in view has nowhere to land: it is just minimized. One in a
+    // folder lands on the folder's card.
+    std::erase_if(m_outs, [this](auto& flight) {
+        if (SlotOf(*flight->card) >= 0)
             return false;
         Minimize(flight->card->hwnd);
         return true;
@@ -2905,7 +3677,8 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         // The sidebar copy stays hidden until the flying copy lands on it. The outgoing window stays
         // visible until its fresh snapshot is ready, so the incoming one can start moving right away.
         ++m_pending;
-        flight->card->side.holder.Opacity(0.f);
+        if (flight->card->side.holder)
+            flight->card->side.holder.Opacity(0.f);
         HWND h = flight->card->hwnd;
         RECT frame = wt::FrameRect(h);
         bool fresh = m_prefetch && m_prefetchHwnd == h && GetTickCount64() - m_prefetchAt < kPrefetchMaxAge &&
@@ -2934,6 +3707,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         else
             m_snap.CaptureAsync(h, frame, [this, flight, frame](auto const& surface) { OnOutCaptured(flight, frame, surface); });
     }
+    laps.Mark(L"outgoing");
     if (m_inCard)
     {
         ++m_pending;
@@ -2954,6 +3728,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         int spent = static_cast<int>(GetTickCount64() - begun);
         SetTimer(m_sidebar, kTimerEarlyShow, static_cast<UINT>(std::max(1, m_cfg.Ms(kFlyMs) / 3 - spent)), nullptr);
     }
+    laps.Mark(L"incoming");
     if (!m_pending)
     {
         FinishTransition();
@@ -2961,6 +3736,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     }
     GrowView();
     SetDock(DockState::Shown);                      // the cards fly to and from the sidebar
+    laps.Mark(L"view");
 }
 
 // The view's origin stays at the monitor's top-left, so resizing never moves any content.
@@ -3119,12 +3895,21 @@ void Stage::SetHotkeys(bool on)
     if (on == m_hotkeysOn)
         return;
     m_hotkeysOn = on;
+    RegisterHotkeys();
+}
+
+// Alt+1.. for every card, a folder's windows each counting (1 2 [3 4] 5: Alt+4 is the folder's second
+// window). Only as many as there are, so other apps keep the rest of the Alt+number keys.
+void Stage::RegisterHotkeys()
+{
+    int n = HotkeyCount();
     for (int i = 0; i < kMaxHotkeys; ++i)
     {
         UnregisterHotKey(m_sidebar, kHotkeyBase + i);
-        if (on && i < m_cfg.cards && !RegisterHotKey(m_sidebar, kHotkeyBase + i, m_cfg.HotkeyModifiers() | MOD_NOREPEAT, '1' + i))
+        if (m_hotkeysOn && i < n && !RegisterHotKey(m_sidebar, kHotkeyBase + i, m_cfg.HotkeyModifiers() | MOD_NOREPEAT, '1' + i))
             LogError(WM_HOTKEY, HRESULT_FROM_WIN32(GetLastError()), L"hotkey already registered by another app");
     }
+    m_hotkeyN = n;
 }
 
 void Stage::Prefetch()
@@ -3167,8 +3952,8 @@ void Stage::OnOutCaptured(std::shared_ptr<OutFlight> flight, RECT const& frame, 
     flight->vis = MakeVis(*card, false);
     m_animStage.Children().InsertAtBottom(flight->vis.holder);
     Pose from = PoseForRect(frame, m_monitor, card->w);
-    size_t slot = static_cast<size_t>(std::find(m_visible.begin(), m_visible.end(), card) - m_visible.begin());
-    Pose to = SlotPose(*card, std::min(slot, m_visible.empty() ? 0 : m_visible.size() - 1));
+    int slot = SlotOf(*card);                       // its own, or its folder's
+    Pose to = SlotPose(*card, slot >= 0 ? static_cast<size_t>(slot) : 0);
     to.center = SideToAnim(to.center);
     ApplyPose(flight->vis, *card, from);
     flight->batch = m_compositor.CreateScopedBatch(wuc::CompositionBatchTypes::Animation);
@@ -3300,11 +4085,11 @@ void Stage::DragHover(POINTL screen)
     int index = HitTest(ViewToSide(MAKELPARAM(screen.x - m_monitor.left, screen.y - m_monitor.top)));
     if (index < 0)
         m_dropHold = false;                         // off the cards: the next one held may open
-    HWND h = index >= 0 && !m_dropHold ? m_visible[index]->hwnd : nullptr;
-    if (h == m_dropHwnd && index == m_hover)
+    auto h = index >= 0 && !m_dropHold ? m_visible[index] : nullptr;
+    if (h == m_dropCard && index == m_hover)
         return;
-    bool changed = h != m_dropHwnd;
-    m_dropHwnd = h;
+    bool changed = h != m_dropCard;
+    m_dropCard = h;
     if (index == m_hover)
     {
         // Already the hovered card (the pointer was there before the drag): just restart its line.
@@ -3317,7 +4102,7 @@ void Stage::DragHover(POINTL screen)
         return;
     if (h)
     {
-        Trace(L"file drag over card", h);
+        Trace(L"file drag over card", h->hwnd);
         SetTimer(m_sidebar, kTimerDropOpen, static_cast<UINT>(kDropOpenMs), nullptr);
     }
     else
@@ -3329,11 +4114,13 @@ void Stage::DragEnd()
     if (!m_fileDrag)
         return;
     m_fileDrag = false;
-    m_dropHwnd = nullptr;
+    m_dropCard = nullptr;
     m_dropHold = false;
     KillTimer(m_sidebar, kTimerDropOpen);
     if (!m_busy)
         SetHover(-1);
+    if (m_openFolder && !m_tracking && !m_busy)
+        CloseFolder();                              // opened by the drag
     if (m_revealed)
         SetTimer(m_sidebar, kTimerTuck, 350, nullptr);
 }
@@ -3341,18 +4128,18 @@ void Stage::DragEnd()
 // A click or right-click that came while a transition ran, carried out now that it is over.
 void Stage::RunQueued()
 {
-    HWND sw = m_queuedSwitch, menu = m_queuedMenu;
+    auto sw = m_queuedSwitch, menu = m_queuedMenu;
     m_queuedSwitch = m_queuedMenu = nullptr;
     if (m_busy || m_dragging || GetTickCount64() - m_queuedAt > kQueuedMaxAge)
         return;
-    HWND h = sw ? sw : menu;
-    auto at = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& c) { return c->hwnd == h; });
-    if (at == m_visible.end() || !IsWindow(h))
+    auto card = sw ? sw : menu;
+    auto at = std::find(m_visible.begin(), m_visible.end(), card);
+    if (at == m_visible.end() || (!card->isFolder && !IsWindow(card->hwnd)))
         return;                                     // its card left the sidebar meanwhile
     size_t index = static_cast<size_t>(at - m_visible.begin());
     if (sw)
     {
-        Trace(L"queued click run", h);
+        Trace(L"queued click run", card->hwnd);
         SwitchTo(index);
     }
     else
@@ -3444,6 +4231,22 @@ void Stage::MoveDrag(POINT viewPt)
     m_dragPose.center = { static_cast<float>(viewPt.x), static_cast<float>(viewPt.y) };
     m_dragVis.holder.StopAnimation(L"Offset");
     m_dragVis.holder.Offset({ m_dragPose.center.x, m_dragPose.center.y, 0.f });
+    // Held over another card: its line fills; full, the two become one folder (kTimerGroup).
+    int t = HitTest(ViewToSide(MAKELPARAM(viewPt.x, viewPt.y)));
+    auto target = t >= 0 ? m_visible[t] : nullptr;
+    if (target && (!m_dragCard || !CanGroup(*m_dragCard, *target)))
+        target = nullptr;
+    if (target == m_groupTarget)
+        return;
+    ClearTrace();
+    KillTimer(m_sidebar, kTimerGroup);
+    m_groupTarget = target;
+    if (target)
+    {
+        Trace(L"dragged card held over a card", target->hwnd);
+        RunTrace(*target, true, kGroupMs);
+        SetTimer(m_sidebar, kTimerGroup, static_cast<UINT>(kGroupMs), nullptr);
+    }
 }
 
 void Stage::EndDrag(POINT viewPt, bool cancel)
@@ -3452,14 +4255,34 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
     m_pressIndex = -1;
     auto card = m_dragCard;
     m_dragCard = nullptr;
+    bool grouped = m_groupDone;
+    m_groupDone = false;
+    m_groupTarget = nullptr;
+    KillTimer(m_sidebar, kTimerGroup);
+    ClearTrace();
     // The card may have been taken away mid-drag (its window came to the front, a hotkey...).
-    bool stillOurs = std::find(m_cards.begin(), m_cards.end(), card) != m_cards.end();
+    bool stillOurs = card->isFolder ? !card->folderOf.expired()
+                                    : std::find(m_cards.begin(), m_cards.end(), card) != m_cards.end();
     bool pastBar = Right() ? viewPt.x < m_bar.left - m_monitor.left : viewPt.x > m_bar.right - m_monitor.left;
-    bool onStage = !cancel && stillOurs && pastBar && IsWindow(card->hwnd);
+    bool onStage = !cancel && !grouped && stillOurs && pastBar && !card->isFolder && IsWindow(card->hwnd);
     if (onStage && !m_busy)
     {
         JoinStage(card, viewPt);
         return;
+    }
+    // Dropped (not held) on another card: it takes that card's place. Dropped on empty sidebar
+    // space, a window from an opened folder leaves the folder.
+    if (!cancel && !grouped && stillOurs && !card->pinned && !pastBar)
+    {
+        int target = HitTest(ViewToSide(MAKELPARAM(viewPt.x, viewPt.y)));
+        if (target >= 0 && m_visible[target] != card && !m_visible[target]->pinned)
+            MoveCard(card, m_visible[target]);
+        else if (target < 0 && !card->isFolder && FolderOf(card->hwnd))
+        {
+            Trace(L"dragged out of its folder", card->hwnd);
+            LeaveFolder(card->hwnd);
+            Relayout(true);
+        }
     }
     // Dropped on another pinned card: it takes that place (and keeps it after a restart).
     if (!cancel && stillOurs && card->pinned && !card->pinKey.empty())
@@ -3472,9 +4295,9 @@ void Stage::EndDrag(POINT viewPt, bool cancel)
             Relayout(true);
         }
     }
-    // Dropped back on the sidebar: return to its slot.
-    size_t slot = static_cast<size_t>(std::find(m_visible.begin(), m_visible.end(), card) - m_visible.begin());
-    Pose home = SlotPose(*card, std::min(slot, m_visible.empty() ? 0 : m_visible.size() - 1));
+    // Dropped back on the sidebar: return to its slot (or its folder's).
+    int slot = SlotOf(*card);
+    Pose home = SlotPose(*card, slot >= 0 ? static_cast<size_t>(slot) : (m_visible.empty() ? 0 : m_visible.size() - 1));
     home.center = SideToAnim(home.center);
     auto vis = m_dragVis;
     m_dragVis = {};
@@ -3525,15 +4348,20 @@ void Stage::JoinStage(std::shared_ptr<Card> card, POINT viewPt)
 
     if (!card->pinned)
     {
-        m_cards.erase(std::find(m_cards.begin(), m_cards.end(), card));
+        if (auto it = std::find(m_cards.begin(), m_cards.end(), card); it != m_cards.end())
+        {
+            card->homeIndex = static_cast<int>(it - m_cards.begin());
+            m_cards.erase(it);
+        }
         Park(card);
     }
-    Relayout(true);
+    m_openFolder = nullptr;
 
     RECT frame{ target.left + card->border.left, target.top + card->border.top,
                 target.right - card->border.right, target.bottom - card->border.bottom };
     std::erase(m_stage, h);                         // e.g. a pinned card of a window already on stage
     m_stage.push_back(h);
+    Relayout(true);                                 // after: a pinned card steps out while on stage
     m_active = h;
     m_inCard = card;
     m_flyIn = m_dragVis;
@@ -3648,6 +4476,8 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         return MA_NOACTIVATE;
     case WM_MOUSEMOVE:
         KillTimer(m_sidebar, kTimerTuck);
+        if (m_openFolder)
+            KillTimer(m_sidebar, kTimerFolderClose);
         if (m_dock == DockState::Tucked && !m_busy)
         {
             m_revealed = true;
@@ -3698,12 +4528,23 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             if (!m_busy && s < static_cast<int>(m_visible.size()) && SoundAt(ViewToSide(lp)) == s)
             {
                 auto& c = *m_visible[s];
-                m_audio.SetMute(c.app, c.sound != 2);
+                if (c.isFolder)
+                {
+                    // Every window of it that plays.
+                    if (auto f = c.folderOf.lock())
+                        for (HWND h : f->members)
+                            if (auto m = CardOf(h); m && m->sound)
+                                m_audio.SetMute(m->app, c.sound != 2);
+                }
+                else
+                    m_audio.SetMute(c.app, c.sound != 2);
             }
             return 0;
         }
         int pressed = m_pressIndex;
         m_pressIndex = -1;
+        if (!m_dragging && !m_busy && pressed < 0 && m_openFolder && HitTest(ViewToSide(lp)) < 0)
+            CloseFolder();
         if (m_dragging)
             EndDrag(pt, false);
         else if (pressed >= 0 && HitTest(ViewToSide(lp)) == pressed && pressed < static_cast<int>(m_visible.size()))
@@ -3714,10 +4555,10 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             else
             {
                 // Clicked while another card is still flying: the switch follows once it lands.
-                m_queuedSwitch = m_visible[pressed]->hwnd;
+                m_queuedSwitch = m_visible[pressed];
                 m_queuedMenu = nullptr;
                 m_queuedAt = GetTickCount64();
-                Trace(L"  queued: mid-transition", m_queuedSwitch);
+                Trace(L"  queued: mid-transition", m_queuedSwitch->hwnd);
             }
         }
         return 0;
@@ -3735,7 +4576,7 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (index >= 0)
         {
             // Mid-transition: the menu opens once it ends (for the same card, wherever it is then).
-            m_queuedMenu = m_visible[index]->hwnd;
+            m_queuedMenu = m_visible[index];
             m_queuedMenuY = GET_Y_LPARAM(lp);
             m_queuedSwitch = nullptr;
             m_queuedAt = GetTickCount64();
@@ -3744,6 +4585,8 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_MOUSELEAVE:
         m_tracking = false;
+        if (m_openFolder && !m_dragging)
+            SetTimer(m_sidebar, kTimerFolderClose, 700, nullptr);   // the pointer left an opened folder
         if (m_revealed)
             SetTimer(m_sidebar, kTimerTuck, 350, nullptr);     // brief grace period before tucking back
         if (!m_busy)
@@ -3787,10 +4630,23 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     {
         size_t index = static_cast<size_t>(wp - kHotkeyBase);
         CloseCardMenu();
-        if (!m_busy && !m_dragging && !m_settings.open && m_dock != DockState::Hidden && index < m_visible.size())
+        if (m_busy || m_dragging || m_settings.open || m_dock == DockState::Hidden)
+            return 0;
+        // Numbered top to bottom with a folder's windows each counted: 1 2 [3 4] 5.
+        auto order = HotkeyOrder();
+        if (index >= order.size())
+            return 0;
+        auto card = order[index];
+        Prefetch();     // no hover happened; the outgoing window is captured on the way
+        if (auto at = std::find(m_visible.begin(), m_visible.end(), card); at != m_visible.end())
+            SwitchTo(static_cast<size_t>(at - m_visible.begin()));
+        else if (int slot = SlotOf(*card); slot >= 0)
         {
-            Prefetch();     // no hover happened; the outgoing window is captured on the way
-            SwitchTo(index);
+            // Inside a closed folder: it flies out of the folder's card.
+            Pose from = SlotPose(*card, static_cast<size_t>(slot));
+            from.center = SideToAnim(from.center);
+            from.scale *= 0.45f;
+            SwitchToCard(card, from);
         }
         return 0;
     }
@@ -3882,18 +4738,45 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == kTimerDropOpen)
         {
             KillTimer(m_sidebar, kTimerDropOpen);
-            auto at = std::find_if(m_visible.begin(), m_visible.end(), [&](auto& c) { return c->hwnd == m_dropHwnd; });
-            if (!m_fileDrag || !m_dropHwnd || at == m_visible.end() || !IsWindow(m_dropHwnd))
+            auto at = std::find(m_visible.begin(), m_visible.end(), m_dropCard);
+            if (!m_fileDrag || !m_dropCard || at == m_visible.end() || (!m_dropCard->isFolder && !IsWindow(m_dropCard->hwnd)))
                 ;                                   // the drag ended or its card went away
             else if (m_busy || m_dragging || m_menu.open || m_settings.open)
                 SetTimer(m_sidebar, kTimerDropOpen, 100, nullptr);  // once that is over
+            else if (m_dropCard->isFolder)
+            {
+                // A folder opens; holding the file over one of its windows then opens that one.
+                Trace(L"file drag: opening a folder");
+                auto f = m_dropCard->folderOf.lock();
+                m_dropCard = nullptr;
+                OpenFolder(f, false);
+            }
             else
             {
-                Trace(L"file drag: opening", m_dropHwnd);
-                m_dropHwnd = nullptr;
+                Trace(L"file drag: opening", m_dropCard->hwnd);
+                m_dropCard = nullptr;
                 m_dropHold = true;
                 SwitchTo(static_cast<size_t>(at - m_visible.begin()));
             }
+        }
+        else if (wp == kTimerGroup)
+        {
+            KillTimer(m_sidebar, kTimerGroup);
+            auto target = m_groupTarget;
+            m_groupTarget = nullptr;
+            if (m_dragging && m_dragCard && target && std::find(m_visible.begin(), m_visible.end(), target) != m_visible.end() &&
+                Group(m_dragCard, target))
+            {
+                // Done while the button is still down: the lifted card settles into the folder.
+                m_groupDone = true;
+                EndDrag({ static_cast<LONG>(m_dragPose.center.x), static_cast<LONG>(m_dragPose.center.y) }, false);
+            }
+        }
+        else if (wp == kTimerFolderClose)
+        {
+            KillTimer(m_sidebar, kTimerFolderClose);
+            if (m_openFolder && !m_tracking && !m_fileDrag && !m_dragging && !m_busy && !m_menu.open)
+                CloseFolder();
         }
         else if (wp == kTimerQueued)
         {

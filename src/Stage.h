@@ -15,9 +15,14 @@ struct CardVis
     wuc::SpriteVisual alert{ nullptr };     // orange dot: its app asked for attention
     wuc::SpriteVisual glass{ nullptr };     // blurred backdrop under a glass stand-in; follows the sprite
     wuc::SpriteVisual sound{ nullptr };     // speaker: its app is playing sound
+    wuc::ContainerVisual grid{ nullptr };   // a folder card: its windows' pictures, 2 x 2
+    // Where the holder was last sent (set or animated to). Reading Offset back gives the last value
+    // set, not where an animation took it, so a card that had slid would jump back and slide again.
+    mutable float2 at{ -1e9f, -1e9f };
 };
 
 struct Card;
+struct CardFolder;
 
 // One window leaving the stage for its sidebar slot.
 struct OutFlight
@@ -40,7 +45,7 @@ struct Card
     bool placeholder = false;   // the loaded picture is a stand-in (icon and title), not the window
     uint32_t logo = 0;          // its app's logo color for the card line (Snapshot::LogoColor), once known
     bool logoKnown = false;
-    bool pinned = false;    // stays in the sidebar, at the top, even while its window is on stage
+    bool pinned = false;    // keeps a fixed place at the top (out of the sidebar while its window is on stage)
     std::wstring pinKey;    // the saved pin entry it was pinned with (its desktop may change later)
     bool alert = false;     // flashed its taskbar button since it was last looked at
     ULONGLONG alertTraceAt = 0;
@@ -49,6 +54,25 @@ struct Card
     wuc::CompositionSurfaceBrush snapshot{ nullptr };
     wuc::CompositionSurfaceBrush icon{ nullptr };
     CardVis side;           // visuals in the sidebar
+    int homeIndex = -1;     // its place in the list when it went on stage (cards moved by hand keep it)
+    // A folder's own card (no window): stands for the windows grouped in it, in one slot.
+    bool isFolder = false;
+    std::weak_ptr<CardFolder> folderOf;
+    // What its sidebar grid shows now (window, size, icon): drawn again only when that changes, since
+    // rebuilding it blanked the folder for a frame on every layout.
+    std::vector<int64_t> gridKey;
+    wuc::ContainerVisual gridOf{ nullptr };
+};
+
+// Windows grouped into one sidebar card by holding a dragged card over another. Their cards stay in
+// m_cards like any other; the sidebar shows the folder's card in their place (or, opened, each of
+// them). Kept by window, so a card made again for one of them (after it was on stage) still belongs.
+struct CardFolder
+{
+    int id = 0;                     // names its pin entry ("folder#<id>") while it is pinned
+    std::vector<HWND> members;      // in the order its grid shows them, at most kFolderMax
+    std::shared_ptr<Card> card;     // what the sidebar shows for it
+    bool shown = false;             // has a slot in the current layout
 };
 
 // Where a card sits: center in target coords, uniform scale, Y rotation.
@@ -279,6 +303,15 @@ private:
     // Cards of windows that went on stage. Kept (without sidebar visuals) so a window minimized before
     // it could be photographed again still comes back with its last picture instead of a placeholder.
     std::vector<std::shared_ptr<Card>> m_offstage;
+    // Folders, and the one opened (its windows listed in the sidebar to pick from).
+    std::vector<std::shared_ptr<CardFolder>> m_folders;
+    std::shared_ptr<CardFolder> m_openFolder;
+    wuc::SpriteVisual m_folderPanel{ nullptr };     // behind an opened folder's cards
+    bool m_manualOrder = false;                     // cards were moved by hand: they keep their places
+    int m_folderIds = 0;
+    int m_hotkeyN = 0;                              // Alt+1..N registered (cards and folders' windows)
+    std::shared_ptr<Card> m_groupTarget;            // the card a dragged one is held over (kTimerGroup)
+    bool m_groupDone = false;
     std::vector<std::pair<HWND, RECT>> m_borders;   // invisible borders of windows seen on stage (for 크기 맞추기)
     winrt::com_ptr<IVirtualDesktopManager> m_desktops;
     GUID m_desktopId{};
@@ -316,10 +349,10 @@ private:
     // rather than dropped (kTimerQueued).
     winrt::com_ptr<IDropTarget> m_dropTarget;       // the view, as a place things can be dragged over
     bool m_fileDrag = false;                        // a drag from another app is over the sidebar
-    HWND m_dropHwnd = nullptr;                      // ...held over this window's card (kTimerDropOpen)
+    std::shared_ptr<Card> m_dropCard;               // ...held over this card (kTimerDropOpen)
     bool m_dropHold = false;                        // a card was opened: none opens again until the pointer leaves the cards
-    HWND m_queuedSwitch = nullptr;
-    HWND m_queuedMenu = nullptr;
+    std::shared_ptr<Card> m_queuedSwitch;
+    std::shared_ptr<Card> m_queuedMenu;
     int m_queuedMenuY = 0;
     ULONGLONG m_queuedAt = 0;
     UINT m_taskbarMsg = 0;                          // "TaskbarCreated": Explorer restarted, re-add the tray icon
@@ -345,6 +378,35 @@ private:
     wuc::CompositionDrawingSurface MakePlaceholder(Card const& c);
     RECT FitFrame();
     void RunQueued();
+    // Folders and moving cards by hand.
+    std::shared_ptr<CardFolder> FolderOf(HWND hwnd) const;
+    std::shared_ptr<Card> CardOf(HWND hwnd) const;  // in the sidebar's list, or parked while on stage
+    int SlotOf(Card const& c) const;                // its slot, or its folder's; -1 if not in view
+    void InsertReturning(std::shared_ptr<Card> card);   // a card back from the stage: where it belongs
+    bool CanGroup(Card const& dragged, Card const& target) const;
+    bool Group(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target);
+    void LeaveFolder(HWND hwnd);
+    void Dissolve(std::shared_ptr<CardFolder> f);
+    void PruneFolders();
+    void OpenFolder(std::shared_ptr<CardFolder> f, bool byKey);
+    void CloseFolder();
+    void MoveCard(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target);
+    std::shared_ptr<Card> MakeFolderCard();
+    wuc::CompositionDrawingSurface FolderBackground(Card const& c);
+    void FillFolderGrid(CardVis const& v, Card& folderCard);
+    void RefreshFolderBadges(CardFolder& f);
+    // A folder's windows in the sidebar (not the one on stage), in its order: its grid, its numbers.
+    std::vector<std::shared_ptr<Card>> InSidebar(CardFolder const& f) const;
+    std::vector<std::shared_ptr<Card>> HotkeyOrder() const;    // Alt+1.. targets: a folder's windows each count
+    int HotkeyCount() const;                        // how many Alt+number keys that needs (at least the card count)
+    size_t HotkeyOrderOf(Card const& folderCard) const;
+    void RegisterHotkeys();
+    void SwitchToCard(std::shared_ptr<Card> next, Pose from);
+    // Opening and closing animations: cards spread out of a folder's card, or gather into it.
+    using Detached = std::vector<std::pair<std::shared_ptr<Card>, CardVis>>;
+    Detached DetachOpened(Card const* except);
+    void GatherInto(Detached leaving, std::shared_ptr<CardFolder> f);
+    void SpreadFrom(float2 center, std::vector<std::shared_ptr<Card>> const& cards);
     void RestylePlaceholders();
     void RecoverDevice();
     Audio m_audio;

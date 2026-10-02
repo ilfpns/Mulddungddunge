@@ -1,4 +1,5 @@
 #include "WindowTracker.h"
+#include <mutex>
 
 namespace wt
 {
@@ -51,8 +52,12 @@ namespace wt
         if (GetWindow(hwnd, GW_OWNER) || ModalOwner(hwnd))
             return false;
         LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        // Always-on-top windows (desktop pets, PiP players, overlays) stay where they are.
-        if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST))
+        // Always-on-top windows (desktop pets, PiP players, overlays) stay where they are. Not an app's
+        // ordinary window the user made stay on top (Spotify's option): it has a full frame (title bar,
+        // system menu, resizable border), which pets and overlays don't.
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        bool framed = (style & WS_CAPTION) == WS_CAPTION && (style & WS_SYSMENU) && (style & WS_THICKFRAME);
+        if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || ((ex & WS_EX_TOPMOST) && !framed))
             return false;
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
@@ -438,6 +443,11 @@ namespace wt
         return PathOf(pid);
     }
 
+    namespace
+    {
+        std::wstring TerminalIconFile(HWND hwnd, std::wstring const& exe);
+    }
+
     std::wstring IconFile(HWND hwnd)
     {
         auto exe = ProcessPath(hwnd);
@@ -445,6 +455,38 @@ namespace wt
         if (_wcsicmp(name.c_str(), L"WindowsTerminal.exe") != 0 && _wcsicmp(name.c_str(), L"OpenConsole.exe") != 0 &&
             _wcsicmp(name.c_str(), L"conhost.exe") != 0)
             return exe;
+        // Working it out lists every process on the machine (tens of ms, hundreds when memory is short),
+        // and it is asked each time a terminal's card comes back: remembered per window for a while,
+        // as long as the kind of shell its title names stays the same (titles change all the time).
+        wchar_t raw[256]{};
+        GetWindowTextW(hwnd, raw, ARRAYSIZE(raw));
+        std::wstring title = raw;
+        CharLowerBuffW(title.data(), static_cast<DWORD>(title.size()));
+        auto has = [&](wchar_t const* s) { return title.find(s) != std::wstring::npos; };
+        int kind = has(L"mingw") || has(L"msys") || has(L"bash") ? 1
+                 : has(L"명령 프롬프트") || has(L"command prompt") || has(L"cmd.exe") ? 2 : 0;
+        struct Known { HWND hwnd; int kind; ULONGLONG at; std::wstring file; };
+        static std::vector<Known> known;
+        static std::mutex lock;
+        ULONGLONG now = GetTickCount64();
+        {
+            std::lock_guard guard(lock);
+            for (auto& k : known)
+                if (k.hwnd == hwnd && k.kind == kind && now - k.at < 30000)
+                    return k.file;
+        }
+        auto file = TerminalIconFile(hwnd, exe);
+        std::lock_guard guard(lock);
+        std::erase_if(known, [&](auto& k) { return k.hwnd == hwnd || now - k.at >= 30000; });
+        if (known.size() < 64)
+            known.push_back({ hwnd, kind, now, file });
+        return file;
+    }
+
+    namespace
+    {
+    std::wstring TerminalIconFile(HWND hwnd, std::wstring const& exe)
+    {
         // One terminal process hosts every tab of every window, so which shell a window shows is told
         // by its title (the current tab's); the shells running under the terminal give their paths.
         DWORD pid = 0;
@@ -496,6 +538,7 @@ namespace wt
             return powershell;
         auto fallback = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
         return exists(fallback) ? fallback : exe;
+    }
     }
 
     std::wstring ModelOf(DWORD pid)
