@@ -405,6 +405,11 @@ private:
     // Clicking the empty desktop (like macOS): every stage window flies into its card.
     bool DesktopClicked(HWND foreground);
     void PutStageAway();
+    // At rest the view takes clicks only where the cards are (top card to bottom card); above and
+    // below, clicks reach the desktop and windows underneath. settle: drop the old span too.
+    void UpdateHitRegion(bool settle = false);
+    LONG m_hitTop = 0, m_hitBottom = 0;             // the span the region allows now (window coords)
+    bool m_hitRegion = false;                       // a region is set (else the whole view takes clicks)
     winrt::com_ptr<IUIAutomation> m_uia;            // tells a desktop icon from the empty desktop
     // Opening and closing animations: cards spread out of a folder's card, or gather into it.
     using Detached = std::vector<std::pair<std::shared_ptr<Card>, CardVis>>;

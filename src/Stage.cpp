@@ -80,6 +80,7 @@ namespace
     constexpr int kGroupMs = 2000;
     constexpr UINT_PTR kTimerFolderClose = 21;    // an opened folder the pointer left closes again
     constexpr size_t kFolderMax = 4;          // windows in a folder: its card shows them 2 x 2
+    constexpr UINT_PTR kTimerHitRegion = 22;  // cards have finished sliding: the click region shrinks to them
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -2647,6 +2648,7 @@ void Stage::Relayout(bool animate)
     // Alt+number keys follow what is in the sidebar now.
     if (m_hotkeysOn && HotkeyCount() != m_hotkeyN)
         RegisterHotkeys();
+    UpdateHitRegion();
     if (g_trace)
     {
         // What the sidebar shows, when it changes: "layout: Spotify | [folder] | Chrome  (of 9)".
@@ -3825,6 +3827,57 @@ void Stage::PlaceView(LONG left, LONG right, LONG height, bool grown)
         m_viewX = left;
         m_root.Offset({ -static_cast<float>(left), 0.f, 0.f });
     }
+    UpdateHitRegion();
+}
+
+void Stage::UpdateHitRegion(bool settle)
+{
+    // The whole view takes clicks while it is grown or in use (a transition, a drag, a menu, the
+    // settings), and while tucked (its thin strip is what calls the sidebar back).
+    bool atRest = !m_busy && !m_dragging && !m_menu.open && !m_settings.open && m_dock == DockState::Shown;
+    if (!atRest)
+    {
+        KillTimer(m_sidebar, kTimerHitRegion);
+        if (m_hitRegion)
+        {
+            SetWindowRgn(m_view, nullptr, FALSE);
+            m_hitRegion = false;
+        }
+        return;
+    }
+    // From the top of the first card to the bottom of the last (hovered size, badges, an opened
+    // folder's panel included), across the whole width.
+    LONG top = 0, bottom = 0;
+    if (!m_visible.empty())
+    {
+        float reach = ThumbH() * kHoverGrow / 2.f + S(16);
+        float offset = static_cast<float>(m_bar.top - m_monitor.top);
+        top = static_cast<LONG>(std::floor(SlotCenter(0).y - reach + offset));
+        bottom = static_cast<LONG>(std::ceil(SlotCenter(m_visible.size() - 1).y + reach + offset));
+    }
+    if (!settle && m_hitRegion && m_hitBottom > m_hitTop)
+    {
+        // Cards may still be sliding in from where they were: keep that span until they have landed.
+        if (bottom > top)
+        {
+            top = std::min(top, m_hitTop);
+            bottom = std::max(bottom, m_hitBottom);
+        }
+        else
+            top = m_hitTop, bottom = m_hitBottom;
+        SetTimer(m_sidebar, kTimerHitRegion, static_cast<UINT>(m_cfg.Ms(kSlideMs)) + 90, nullptr);
+    }
+    if (m_hitRegion && top == m_hitTop && bottom == m_hitBottom)
+        return;
+    HRGN rgn = CreateRectRgn(0, std::max(0L, top), 32767, std::max(0L, bottom));
+    if (SetWindowRgn(m_view, rgn, TRUE))           // the window owns the region from here
+    {
+        m_hitRegion = true;
+        m_hitTop = top;
+        m_hitBottom = bottom;
+    }
+    else
+        DeleteObject(rgn);
 }
 
 void Stage::ShrinkView()
@@ -4829,6 +4882,11 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             KillTimer(m_sidebar, kTimerFolderClose);
             if (m_openFolder && !m_tracking && !m_fileDrag && !m_dragging && !m_busy && !m_menu.open)
                 CloseFolder();
+        }
+        else if (wp == kTimerHitRegion)
+        {
+            KillTimer(m_sidebar, kTimerHitRegion);
+            UpdateHitRegion(true);
         }
         else if (wp == kTimerQueued)
         {
