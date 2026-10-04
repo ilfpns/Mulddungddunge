@@ -472,12 +472,12 @@ namespace wt
         {
             std::lock_guard guard(lock);
             for (auto& k : known)
-                if (k.hwnd == hwnd && k.kind == kind && now - k.at < 30000)
+                if (k.hwnd == hwnd && k.kind == kind && now - k.at < 600000)
                     return k.file;
         }
         auto file = TerminalIconFile(hwnd, exe);
         std::lock_guard guard(lock);
-        std::erase_if(known, [&](auto& k) { return k.hwnd == hwnd || now - k.at >= 30000; });
+        std::erase_if(known, [&](auto& k) { return k.hwnd == hwnd || now - k.at >= 600000; });
         if (known.size() < 64)
             known.push_back({ hwnd, kind, now, file });
         return file;

@@ -405,6 +405,13 @@ private:
     // Clicking the empty desktop (like macOS): every stage window flies into its card.
     bool DesktopClicked(HWND foreground);
     void PutStageAway();
+    // A new action while a transition runs (Alt+Tab to another window, Alt+number, a card click, a
+    // desktop swipe) is not held back until it ends: the transition is cut short and the new one starts.
+    void AbortTransition(HWND keep);                // keep: the window the user went to (left as it is)
+    bool UserSwitchedMidTransition(HWND hwnd) const;
+    std::vector<HWND> m_leaving;                    // windows put away by the current/last transition
+    ULONGLONG m_begunAt = 0, m_shownAt = 0;         // transition start, its window brought up
+    bool m_fastShow = false;                        // the next switch is from a hotkey: window up sooner
     // At rest the view takes clicks only where the cards are (top card to bottom card); above and
     // below, clicks reach the desktop and windows underneath. settle: drop the old span too.
     void UpdateHitRegion(bool settle = false);

@@ -1773,6 +1773,17 @@ void Stage::OnForeground(HWND hwnd)
     // (Focus handed back to the stage window, as after the tray menu, doesn't count.)
     if (m_settings.open && hwnd != m_active)
         CloseSettings();
+    if (m_ready && m_busy && !m_syncing && !m_dragging)
+    {
+        // Another desktop (a three/four-finger swipe) or a window the user went to (Alt+Tab, the
+        // taskbar): acted on now rather than once the animation is over.
+        if (CurrentDesktopId() != m_desktopId || UserSwitchedMidTransition(hwnd))
+        {
+            Trace(L"  interrupts the transition", hwnd);
+            AbortTransition(hwnd);
+            m_quietUntil = 0;
+        }
+    }
     if (!m_ready || m_busy || m_syncing)
     {
         Trace(m_busy ? L"  ignored: mid-transition" : L"  ignored: not ready / syncing", hwnd);
@@ -1785,6 +1796,11 @@ void Stage::OnForeground(HWND hwnd)
         SyncDesktop();
         return;
     }
+    // Just after a transition, focus churn from our own minimize/restore is ignored; a real app window
+    // that isn't one we just put away is the user's switch and is acted on at once.
+    if (hwnd != m_active && GetTickCount64() < m_quietUntil && wt::IsManageable(hwnd, m_mon) && IsWindowVisible(hwnd) &&
+        !IsIconic(hwnd) && std::find(m_leaving.begin(), m_leaving.end(), hwnd) == m_leaving.end())
+        m_quietUntil = 0;
     if (hwnd == m_active || GetTickCount64() < m_quietUntil)
     {
         if (hwnd != m_active)
@@ -3580,6 +3596,39 @@ void Stage::SwitchTo(size_t index)
     SwitchToCard(next, from);
 }
 
+// A foreground change mid-transition that is the user's, not ours: our own churn comes before the
+// incoming window is brought up (Windows activating the next window when the outgoing one is
+// minimized) or is the incoming window itself.
+bool Stage::UserSwitchedMidTransition(HWND hwnd) const
+{
+    if (!hwnd || hwnd == m_active || (m_inCard && hwnd == m_inCard->hwnd))
+        return false;
+    ULONGLONG now = GetTickCount64();
+    bool settled = m_inCard ? (m_shownAt && now - m_shownAt >= 30) : now - m_begunAt >= 30;
+    return settled && wt::IsManageable(hwnd, m_mon) && IsWindowVisible(hwnd) && !IsIconic(hwnd);
+}
+
+// Ends the running transition where it is: the incoming window is up, the leaving ones go down (not
+// `keep`, the one the user just went to), the flying copies go.
+void Stage::AbortTransition(HWND keep)
+{
+    if (!m_busy)
+        return;
+    if (m_inCard && m_inCard->hwnd != keep && IsWindow(m_inCard->hwnd) &&
+        (!IsWindowVisible(m_inCard->hwnd) || IsIconic(m_inCard->hwnd)))
+        BringBack(m_inCard->hwnd);
+    for (auto& flight : m_outs)
+    {
+        HWND h = flight->card->hwnd;
+        if (h != keep && IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !OnStage(h))
+            Minimize(h);
+    }
+    std::erase_if(m_toMinimize, [&](HWND h) { return h == keep; });
+    FinishTransition();
+    KillTimer(m_sidebar, kTimerRecheck);            // acted on by the caller now
+    ShrinkView();
+}
+
 // The desktop took focus from a left click on its empty space, on this monitor. Not Win+D or the
 // taskbar's show-desktop corner (no click on the desktop itself), and not a click on a desktop icon
 // (opening or picking a file).
@@ -3675,6 +3724,8 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
     Took took(L"switch start");
     Laps laps;
     ULONGLONG begun = GetTickCount64();
+    m_begunAt = begun;
+    m_shownAt = 0;
     Trace(L"switch begin", next);
     ClearTrace();
     ClearAlert(next);
@@ -3695,6 +3746,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
                 InsertReturning(card);
         }
     }
+    m_leaving = leaving;
     m_stage.clear();
     if (next)                                       // none: everything leaves (PutStageAway)
         m_stage.push_back(next);
@@ -3779,8 +3831,12 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
         // Counted from the click: setting up the flight (a capture to start, say) can itself take tens
         // of milliseconds, which must not push the window's arrival out.
         m_shownEarly = false;
+        // From a hotkey nothing was hovered first (no picture taken ahead), and the window takes the
+        // longest to come up: it starts at a sixth of the flight instead.
         int spent = static_cast<int>(GetTickCount64() - begun);
-        SetTimer(m_sidebar, kTimerEarlyShow, static_cast<UINT>(std::max(1, m_cfg.Ms(kFlyMs) / 3 - spent)), nullptr);
+        int at = m_cfg.Ms(kFlyMs) / (m_fastShow ? 6 : 3);
+        m_fastShow = false;
+        SetTimer(m_sidebar, kTimerEarlyShow, static_cast<UINT>(std::max(1, at - spent)), nullptr);
     }
     laps.Mark(L"incoming");
     if (!m_pending)
@@ -4657,12 +4713,21 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
         else if (pressed >= 0 && HitTest(ViewToSide(lp)) == pressed && pressed < static_cast<int>(m_visible.size()))
         {
             Trace(L"card clicked", m_visible[pressed]->hwnd);
-            if (!m_busy)
-                SwitchTo(static_cast<size_t>(pressed));
-            else
+            auto clicked = m_visible[pressed];
+            if (m_busy && !clicked->isFolder)
             {
-                // Clicked while another card is still flying: the switch follows once it lands.
-                m_queuedSwitch = m_visible[pressed];
+                // Mid-animation: it is cut short and this switch starts now.
+                AbortTransition(nullptr);
+                m_quietUntil = 0;
+                if (auto at = std::find(m_visible.begin(), m_visible.end(), clicked); at != m_visible.end())
+                    pressed = static_cast<int>(at - m_visible.begin());
+            }
+            if (!m_busy && std::find(m_visible.begin(), m_visible.end(), clicked) != m_visible.end())
+                SwitchTo(static_cast<size_t>(pressed));
+            else if (m_busy)
+            {
+                // A folder clicked mid-animation: it opens once the animation is over.
+                m_queuedSwitch = clicked;
                 m_queuedMenu = nullptr;
                 m_queuedAt = GetTickCount64();
                 Trace(L"  queued: mid-transition", m_queuedSwitch->hwnd);
@@ -4736,15 +4801,23 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_HOTKEY:
     {
         size_t index = static_cast<size_t>(wp - kHotkeyBase);
+        Trace(L"hotkey pressed");
         CloseCardMenu();
-        if (m_busy || m_dragging || m_settings.open || m_dock == DockState::Hidden)
+        if (m_dragging || m_settings.open || m_dock == DockState::Hidden)
             return 0;
+        if (m_busy)
+        {
+            Trace(L"  hotkey interrupts the transition");
+            AbortTransition(nullptr);               // the new switch starts now, not after the animation
+            m_quietUntil = 0;
+        }
         // Numbered top to bottom with a folder's windows each counted: 1 2 [3 4] 5.
         auto order = HotkeyOrder();
         if (index >= order.size())
             return 0;
         auto card = order[index];
         Prefetch();     // no hover happened; the outgoing window is captured on the way
+        m_fastShow = true;
         if (auto at = std::find(m_visible.begin(), m_visible.end(), card); at != m_visible.end())
             SwitchTo(static_cast<size_t>(at - m_visible.begin()));
         else if (int slot = SlotOf(*card); slot >= 0)
@@ -4755,6 +4828,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             from.scale *= 0.45f;
             SwitchToCard(card, from);
         }
+        m_fastShow = false;                         // (used by the switch above, if one started)
         return 0;
     }
     case WM_TRAY:
@@ -4901,6 +4975,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             if (m_busy && m_inCard && !m_shownEarly)
             {
                 m_shownEarly = true;
+                m_shownAt = GetTickCount64();
                 BringBack(m_inCard->hwnd);
                 ForceForeground(m_inCard->hwnd);
                 Trace(L"early show", m_inCard->hwnd);
@@ -4978,21 +5053,9 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             // completed). Never leave input blocked or the view covering the screen.
             LogError(WM_TIMER, E_FAIL, L"transition watchdog fired");
             RecoverDevice();
-            // The clicked window comes up (hidden or still minimized), the leaving ones go down, as the
-            // transition would have left them.
             if (m_inCard && IsWindow(m_inCard->hwnd) && (!IsWindowVisible(m_inCard->hwnd) || IsIconic(m_inCard->hwnd)))
-            {
-                BringBack(m_inCard->hwnd);
-                ForceForeground(m_inCard->hwnd);
-            }
-            for (auto& flight : m_outs)
-            {
-                HWND h = flight->card->hwnd;
-                if (IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !OnStage(h))
-                    Minimize(h);
-            }
-            FinishTransition();
-            ShrinkView();
+                ForceForeground(m_inCard->hwnd);    // (brought back by AbortTransition)
+            AbortTransition(nullptr);
         }
         else if (wp == kTimerRecheck)
         {
