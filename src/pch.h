@@ -11,6 +11,7 @@
 #include <propkey.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
+#include <UIAutomation.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <appmodel.h>

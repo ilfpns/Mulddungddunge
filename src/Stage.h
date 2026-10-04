@@ -402,6 +402,10 @@ private:
     size_t HotkeyOrderOf(Card const& folderCard) const;
     void RegisterHotkeys();
     void SwitchToCard(std::shared_ptr<Card> next, Pose from);
+    // Clicking the empty desktop (like macOS): every stage window flies into its card.
+    bool DesktopClicked(HWND foreground);
+    void PutStageAway();
+    winrt::com_ptr<IUIAutomation> m_uia;            // tells a desktop icon from the empty desktop
     // Opening and closing animations: cards spread out of a folder's card, or gather into it.
     using Detached = std::vector<std::pair<std::shared_ptr<Card>, CardVis>>;
     Detached DetachOpened(Card const* except);

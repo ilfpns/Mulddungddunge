@@ -19,7 +19,7 @@ namespace
     {
         OptAutostart, OptHotkeys, OptHotkeyMod, OptCards, OptSide, OptMonitor, OptTilt, OptSize, OptSpeed,
         OptQuality, OptIcons, OptAutoTuck, OptEdge, OptFit, OptTray, OptTrace, OptAlerts, OptSounds, OptCardStyle,
-        OptTraceColor, OptTraceWidth,
+        OptTraceColor, OptTraceWidth, OptDesktopClick,
     };
 
     wchar_t const* const kTabs[] = { L"일반", L"모양", L"동작", L"앱", L"고정", L"정보" };
@@ -444,6 +444,7 @@ void Stage::PaintSettings()
             toggle(row(L"숨는 앱도 카드 남기기", L"카카오톡처럼 X를 눌러도 꺼지지 않고 숨는 앱도 카드로 남깁니다", S(44)), m_cfg.keepTray, OptTray);
             toggle(row(L"새 알림 표시", L"새 메시지가 와서 작업 표시줄이 깜빡이면 그 카드에 주황 점과 빛나는 테두리가 생깁니다", S(44)), m_cfg.alerts, OptAlerts);
             toggle(row(L"소리 나는 앱 표시", L"소리가 나는 카드에 스피커가 뜹니다. 누르면 그 앱의 소리만 끄고 켭니다", S(44)), m_cfg.sounds, OptSounds);
+            toggle(row(L"바탕화면 누르면 창 모두 넣기", L"바탕화면 빈 곳을 누르면 떠 있는 창들이 모두 카드로 날아 들어갑니다", S(44)), m_cfg.desktopClick, OptDesktopClick);
             break;
         case 3:     // Apps
         case 4:     // Pins
@@ -858,6 +859,7 @@ void Stage::SettingsClick(POINT pt)
         case OptTrace: m_cfg.hoverTrace = !m_cfg.hoverTrace; break;
         case OptAlerts: m_cfg.alerts = !m_cfg.alerts; break;
         case OptSounds: m_cfg.sounds = !m_cfg.sounds; break;
+        case OptDesktopClick: m_cfg.desktopClick = !m_cfg.desktopClick; break;
         }
         ApplySetting(target.arg);
         break;

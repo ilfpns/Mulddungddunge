@@ -1800,6 +1800,11 @@ void Stage::OnForeground(HWND hwnd)
         UpdateDock();
         return;
     }
+    if (m_cfg.desktopClick && DesktopClicked(hwnd))
+    {
+        PutStageAway();
+        return;
+    }
     if (!wt::IsManageable(hwnd, m_mon))
     {
         UpdateDock();                               // e.g. a fullscreen game came to the front
@@ -3573,6 +3578,51 @@ void Stage::SwitchTo(size_t index)
     SwitchToCard(next, from);
 }
 
+// The desktop took focus from a left click on its empty space, on this monitor. Not Win+D or the
+// taskbar's show-desktop corner (no click on the desktop itself), and not a click on a desktop icon
+// (opening or picking a file).
+bool Stage::DesktopClicked(HWND foreground)
+{
+    auto isDesktop = [](HWND h) {
+        wchar_t cls[32]{};
+        GetClassNameW(h, cls, ARRAYSIZE(cls));
+        return wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0;
+    };
+    if (!foreground || !isDesktop(foreground) || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+        return false;
+    POINT pt;
+    GetCursorPos(&pt);
+    if (MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) != m_mon || !isDesktop(GetAncestor(WindowFromPoint(pt), GA_ROOT)))
+        return false;
+    try
+    {
+        if (!m_uia)
+            m_uia = winrt::create_instance<IUIAutomation>(__uuidof(CUIAutomation));
+        winrt::com_ptr<IUIAutomationElement> at;
+        CONTROLTYPEID type = 0;
+        if (SUCCEEDED(m_uia->ElementFromPoint(pt, at.put())) && at && SUCCEEDED(at->get_CurrentControlType(&type)) &&
+            (type == UIA_ListItemControlTypeId || type == UIA_EditControlTypeId))
+            return false;                           // an icon (or its name being edited)
+    }
+    catch (...)
+    {
+    }
+    return true;
+}
+
+void Stage::PutStageAway()
+{
+    bool any = std::any_of(m_stage.begin(), m_stage.end(), [](HWND h) {
+        return IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !wt::IsCloaked(h);
+    });
+    if (!any)
+        return;
+    Trace(L"desktop clicked: putting the stage away");
+    CloseCardMenu();
+    m_hover = -1;
+    BeginTransition(nullptr, nullptr, {});         // they fly to their cards, nothing comes in
+}
+
 // `from`: where the flight starts (its card in the sidebar, or the folder's card it is in).
 void Stage::SwitchToCard(std::shared_ptr<Card> next, Pose from)
 {
@@ -3643,7 +3693,9 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
                 InsertReturning(card);
         }
     }
-    m_stage = { next };
+    m_stage.clear();
+    if (next)                                       // none: everything leaves (PutStageAway)
+        m_stage.push_back(next);
     m_active = next;
     m_flyIn = {};
     m_inCard = nextCard;

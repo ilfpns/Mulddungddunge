@@ -58,6 +58,7 @@ void Config::Load()
     traceWidth = ReadInt(L"TraceWidth", traceWidth, 1, 5);
     alerts = ReadInt(L"Alerts", alerts, 0, 1) != 0;
     sounds = ReadInt(L"Sounds", sounds, 0, 1) != 0;
+    desktopClick = ReadInt(L"DesktopClick", desktopClick, 0, 1) != 0;
     hotkeys = ReadInt(L"Hotkeys", hotkeys, 0, 1) != 0;
     hotkeyMod = ReadInt(L"HotkeyModifier", hotkeyMod, 0, 2);
     speed = ReadInt(L"Speed", speed, 0, 3);
@@ -103,6 +104,7 @@ void Config::Save() const
     WriteInt(L"TraceWidth", traceWidth);
     WriteInt(L"Alerts", alerts);
     WriteInt(L"Sounds", sounds);
+    WriteInt(L"DesktopClick", desktopClick);
     WriteInt(L"Hotkeys", hotkeys);
     WriteInt(L"HotkeyModifier", hotkeyMod);
     WriteInt(L"Speed", speed);

@@ -22,6 +22,7 @@ struct Config
     int traceWidth = 2;             // the card line's thickness in px on screen, 1..5
     bool alerts = true;             // a card whose app flashes its taskbar button gets an orange dot
     bool sounds = true;             // a card whose app plays sound gets a speaker (click: mute)
+    bool desktopClick = true;       // clicking the empty desktop sends every stage window into its card
     bool hotkeys = true;            // modifier + 1..N switches to that card
     int hotkeyMod = 0;              // 0 Alt, 1 Ctrl+Alt, 2 Shift+Alt
     int speed = 1;                  // animations: 0 fast, 1 normal, 2 slow, 3 off
