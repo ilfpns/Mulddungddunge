@@ -3850,7 +3850,9 @@ void Stage::UpdateHitRegion(bool settle)
     LONG top = 0, bottom = 0;
     if (!m_visible.empty())
     {
-        float reach = ThumbH() * kHoverGrow / 2.f + S(16);
+        // Generous: a tilted card's near edge stands taller than its middle (perspective), and the
+        // app icon hangs below its bottom corner.
+        float reach = ThumbH() * kHoverGrow * 0.75f + S(40);
         float offset = static_cast<float>(m_bar.top - m_monitor.top);
         top = static_cast<LONG>(std::floor(SlotCenter(0).y - reach + offset));
         bottom = static_cast<LONG>(std::ceil(SlotCenter(m_visible.size() - 1).y + reach + offset));
