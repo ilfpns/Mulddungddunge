@@ -81,6 +81,7 @@ namespace
     constexpr UINT_PTR kTimerFolderClose = 21;    // an opened folder the pointer left closes again
     constexpr size_t kFolderMax = 4;          // windows in a folder: its card shows them 2 x 2
     constexpr UINT_PTR kTimerHitRegion = 22;  // cards have finished sliding: the click region shrinks to them
+    constexpr UINT_PTR kTimerDesktopCheck = 23;   // did the virtual desktop change? (see CheckDesktop)
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -1744,6 +1745,10 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
         break;
     case EVENT_OBJECT_CLOAKED:
     case EVENT_OBJECT_UNCLOAKED:
+        // Switching virtual desktops cloaks the old desktop's windows and uncloaks the new one's, as
+        // the switch completes: looked at once these events have settled (one check for them all).
+        if (event == EVENT_OBJECT_UNCLOAKED && m_ready && !wt::IsInputPanel(hwnd) && !GetWindow(hwnd, GW_OWNER))
+            SetTimer(m_sidebar, kTimerDesktopCheck, 1, nullptr);
         if (wt::IsInputPanel(hwnd))
         {
             std::erase(m_inputPanels, hwnd);
@@ -1762,6 +1767,16 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
 void Stage::OnForeground(HWND hwnd)
 {
     Trace(L"foreground", hwnd);
+    {
+        // The desktop switching preview comes up before the switch is done; look again shortly.
+        wchar_t title[64]{};
+        GetWindowTextW(hwnd, title, ARRAYSIZE(title));
+        if (wcscmp(title, L"Virtual desktop switching preview") == 0)
+        {
+            m_desktopChecks = 25;                   // every 40 ms for a second
+            SetTimer(m_sidebar, kTimerDesktopCheck, 40, nullptr);
+        }
+    }
     // A dialog stands in for the window it blocks (a file picker in front of its chat window).
     if (HWND owner = wt::ModalOwner(hwnd); owner && (OnStage(owner) || !IsIconic(owner)))
         hwnd = owner;
@@ -3596,6 +3611,24 @@ void Stage::SwitchTo(size_t index)
     SwitchToCard(next, from);
 }
 
+void Stage::CheckDesktop()
+{
+    if (!m_ready || m_syncing || m_dragging)
+        return;
+    GUID desktop = CurrentDesktopId();
+    if (desktop == GUID_NULL || desktop == m_desktopId)
+    {
+        if (m_desktopChecks-- > 0)
+            SetTimer(m_sidebar, kTimerDesktopCheck, 40, nullptr);
+        return;
+    }
+    m_desktopChecks = 0;
+    if (m_busy)
+        AbortTransition(nullptr);                   // the cards are about to be another desktop's
+    m_desktopId = desktop;
+    SyncDesktop();
+}
+
 // A foreground change mid-transition that is the user's, not ours: our own churn comes before the
 // incoming window is brought up (Windows activating the next window when the outgoing one is
 // minimized) or is the incoming window itself.
@@ -4958,6 +4991,11 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             KillTimer(m_sidebar, kTimerFolderClose);
             if (m_openFolder && !m_tracking && !m_fileDrag && !m_dragging && !m_busy && !m_menu.open)
                 CloseFolder();
+        }
+        else if (wp == kTimerDesktopCheck)
+        {
+            KillTimer(m_sidebar, kTimerDesktopCheck);
+            CheckDesktop();
         }
         else if (wp == kTimerHitRegion)
         {
