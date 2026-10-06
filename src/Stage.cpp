@@ -82,6 +82,8 @@ namespace
     constexpr size_t kFolderMax = 4;          // windows in a folder: its card shows them 2 x 2
     constexpr UINT_PTR kTimerHitRegion = 22;  // cards have finished sliding: the click region shrinks to them
     constexpr UINT_PTR kTimerDesktopCheck = 23;   // did the virtual desktop change? (see CheckDesktop)
+    constexpr UINT_PTR kTimerReconcile = 24;  // after window changes we have no direct event for (Reconcile)
+    constexpr UINT kReconcileMs = 30;         // lets a burst of events (a desktop switch) settle into one check
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -1731,6 +1733,11 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
     case EVENT_SYSTEM_MINIMIZESTART:
         g_stage->OnMinimizeStart(hwnd);
         break;
+    case EVENT_SYSTEM_MINIMIZEEND:
+        // Restored: usually the focus change follows; if not (an app bringing itself back without
+        // activation), Reconcile takes its card off the sidebar.
+        ReconcileSoon();
+        break;
     case EVENT_OBJECT_LOCATIONCHANGE:
         if (g_stage->OnStage(hwnd))
         {
@@ -1747,8 +1754,14 @@ void Stage::OnWinEvent(DWORD event, HWND hwnd)
     case EVENT_OBJECT_UNCLOAKED:
         // Switching virtual desktops cloaks the old desktop's windows and uncloaks the new one's, as
         // the switch completes: looked at once these events have settled (one check for them all).
-        if (event == EVENT_OBJECT_UNCLOAKED && m_ready && !wt::IsInputPanel(hwnd) && !GetWindow(hwnd, GW_OWNER))
-            SetTimer(m_sidebar, kTimerDesktopCheck, 1, nullptr);
+        if (m_ready && !wt::IsInputPanel(hwnd) && !GetWindow(hwnd, GW_OWNER) &&
+            (OnStage(hwnd) || CardOf(hwnd) || wt::IsManageable(hwnd, m_mon, true)))
+        {
+            // An app window of ours or one we would manage (not Start, search, widgets...).
+            if (event == EVENT_OBJECT_UNCLOAKED)
+                SetTimer(m_sidebar, kTimerDesktopCheck, 1, nullptr);
+            ReconcileSoon();                        // a window moved to or from another desktop, too
+        }
         if (wt::IsInputPanel(hwnd))
         {
             std::erase(m_inputPanels, hwnd);
@@ -2137,7 +2150,9 @@ void Stage::Adopt(HWND hwnd)
         return;
     }
     RECT frame = wt::FrameRect(hwnd);
+    card->adopting = true;                          // visible until photographed, then minimized
     m_snap.CaptureAsync(hwnd, frame, [this, card, frame](auto const& surface) {
+        card->adopting = false;
         SetSnapshot(*card, frame, surface);
         TrimMemory();
         if (!OnStage(card->hwnd) && IsWindow(card->hwnd) && IsWindowVisible(card->hwnd))
@@ -2856,6 +2871,7 @@ int Stage::SlotOf(Card const& c) const
 // the place it had; one in a folder goes next to the folder's other windows (the folder stays put).
 void Stage::InsertReturning(std::shared_ptr<Card> card)
 {
+    card->cardedAt = GetTickCount64();
     if (auto f = FolderOf(card->hwnd))
     {
         auto last = m_cards.end();
@@ -3569,6 +3585,14 @@ Pose Stage::TargetPose(Card const& c) const
 // A pinned card stays where it is; callers must not insert it again.
 std::shared_ptr<Card> Stage::TakeCard(HWND hwnd)
 {
+    auto card = TakeCardImpl(hwnd);
+    if (card)
+        card->cardedAt = GetTickCount64();          // back in the sidebar from now (see Reconcile)
+    return card;
+}
+
+std::shared_ptr<Card> Stage::TakeCardImpl(HWND hwnd)
+{
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
     if (it == m_cards.end())
     {
@@ -3629,6 +3653,126 @@ void Stage::CheckDesktop()
     SyncDesktop();
 }
 
+void Stage::ReconcileSoon()
+{
+    if (!m_ready)
+        return;
+    ULONGLONG now = GetTickCount64();
+    if (!m_reconcilePending)
+    {
+        m_reconcilePending = true;
+        m_reconcileFirst = now;
+    }
+    else if (now - m_reconcileFirst > 100)
+        return;                                     // a steady stream of events must not postpone it forever
+    SetTimer(m_sidebar, kTimerReconcile, kReconcileMs, nullptr);
+}
+
+void Stage::Reconcile()
+{
+    if (!m_ready)
+        return;
+    if (m_busy || m_syncing || m_dragging || m_menu.open || m_settings.open)
+    {
+        m_reconcileDue = true;                      // run when that is over (FinishTransition, ...)
+        if (!m_busy)
+            SetTimer(m_sidebar, kTimerReconcile, 250, nullptr);
+        return;
+    }
+    m_reconcileDue = false;
+    // Another desktop altogether: everything is redone there.
+    GUID desktop = CurrentDesktopId();
+    if (desktop != GUID_NULL && desktop != m_desktopId)
+    {
+        m_desktopId = desktop;
+        SyncDesktop();
+        return;
+    }
+    bool changed = false;
+    auto shown = [](HWND h) { return IsWindowVisible(h) && !IsIconic(h) && !wt::IsCloaked(h); };
+
+    // Stage windows that went away without the event we act on: minimized, hidden, or moved to
+    // another desktop. Their cards come back (no flight: the moment has passed).
+    // Cloaked by the shell = moved to another desktop. Cloaked by the app itself is a store app closing
+    // or suspending: that is handled like a hidden window below (closed, or only put away?).
+    auto cloakedBy = [](HWND h) {
+        DWORD c = 0;
+        DwmGetWindowAttribute(h, DWMWA_CLOAKED, &c, sizeof(c));
+        return c;
+    };
+    std::vector<HWND> gone;
+    for (HWND h : m_stage)
+        if (IsWindow(h) && (IsIconic(h) || cloakedBy(h) == DWM_CLOAKED_SHELL))
+            gone.push_back(h);
+    for (HWND h : gone)
+    {
+        Trace(L"reconcile: stage window put away unseen", h);
+        LeaveStage(h);
+        auto card = TakeCard(h);                    // (Here() follows cloaking; no desktop lookup needed)
+        if (!card->pinned)
+            InsertReturning(card);
+        changed = true;
+    }
+    for (HWND h : std::vector<HWND>(m_stage))
+        if (IsWindow(h) && (!IsWindowVisible(h) || (cloakedBy(h) & DWM_CLOAKED_APP)) &&
+            std::find(m_hidden.begin(), m_hidden.end(), h) == m_hidden.end())
+        {
+            Trace(L"reconcile: stage window hidden unseen", h);
+            OnHidden(h);                            // closed or put in the tray: decided there
+            changed = true;
+        }
+
+    // Cards whose window is back on screen here, without the focus change (an app restoring itself
+    // without activation): they join the stage, like a window opened next to it.
+    // Not a card still being set up (photographed, then minimized), a window on another monitor, or
+    // an app that refuses to stay minimized (taken back once, it is left alone for a while).
+    ULONGLONG now = GetTickCount64();
+    std::vector<HWND> back;
+    for (auto& c : m_cards)
+        if (!c->adopting && Here(*c) && IsWindow(c->hwnd) && shown(c->hwnd) && !OnStage(c->hwnd) &&
+            now - c->pulledBackAt > 10000 && wt::IsManageable(c->hwnd, m_mon) &&
+            std::find(m_leaving.begin(), m_leaving.end(), c->hwnd) == m_leaving.end())
+        {
+            // Some apps take a moment to finish minimizing: a card just put in the sidebar is
+            // looked at again a little later rather than taken back now.
+            if (now - c->cardedAt < 1500)
+            {
+                SetTimer(m_sidebar, kTimerReconcile, static_cast<UINT>(1500 - (now - c->cardedAt)) + 20, nullptr);
+                continue;
+            }
+            c->pulledBackAt = now;
+            back.push_back(c->hwnd);
+        }
+    for (HWND h : back)
+    {
+        Trace(L"reconcile: card's window is back on screen", h);
+        RemoveCard(h);
+        m_stage.push_back(h);
+        changed = true;
+    }
+
+    // A window that came up minimized (or was minimized before we saw it) gets its card. (Adopt may
+    // ask Explorer for a pinned app's desktop; focus events arriving meanwhile wait, as in SyncDesktop.)
+    m_syncing = true;
+    for (HWND h : wt::EnumManageable(m_mon))
+        if (IsIconic(h) && !OnStage(h) && !CardOf(h))
+        {
+            Trace(L"reconcile: minimized window without a card", h);
+            Adopt(h);
+            changed = true;
+        }
+    m_syncing = false;
+
+    if (changed)
+    {
+        m_hover = -1;
+        Relayout(true);
+        StageChanged();
+    }
+    if (HWND fg = GetForegroundWindow(); fg && fg != m_active && wt::IsManageable(fg, m_mon))
+        OnForeground(fg);                           // one that came while we were busy here
+}
+
 // A foreground change mid-transition that is the user's, not ours: our own churn comes before the
 // incoming window is brought up (Windows activating the next window when the outgoing one is
 // minimized) or is the incoming window itself.
@@ -3643,11 +3787,11 @@ bool Stage::UserSwitchedMidTransition(HWND hwnd) const
 
 // Ends the running transition where it is: the incoming window is up, the leaving ones go down (not
 // `keep`, the one the user just went to), the flying copies go.
-void Stage::AbortTransition(HWND keep)
+void Stage::AbortTransition(HWND keep, bool restoreIncoming)
 {
     if (!m_busy)
         return;
-    if (m_inCard && m_inCard->hwnd != keep && IsWindow(m_inCard->hwnd) &&
+    if (restoreIncoming && m_inCard && m_inCard->hwnd != keep && IsWindow(m_inCard->hwnd) &&
         (!IsWindowVisible(m_inCard->hwnd) || IsIconic(m_inCard->hwnd)))
         BringBack(m_inCard->hwnd);
     for (auto& flight : m_outs)
@@ -3656,7 +3800,8 @@ void Stage::AbortTransition(HWND keep)
         if (h != keep && IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !OnStage(h))
             Minimize(h);
     }
-    std::erase_if(m_toMinimize, [&](HWND h) { return h == keep; });
+    m_toMinimize.clear();                           // minimized just above (or kept)
+    KillTimer(m_sidebar, kTimerMinimizeOut);
     FinishTransition();
     KillTimer(m_sidebar, kTimerRecheck);            // acted on by the caller now
     ShrinkView();
@@ -4264,6 +4409,8 @@ void Stage::FinishTransition()
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
     if (m_queuedSwitch || m_queuedMenu)
         SetTimer(m_sidebar, kTimerQueued, 1, nullptr);   // after this layout has been applied
+    if (m_reconcileDue)
+        ReconcileSoon();                            // held back by the animation
     TrimMemory();
 }
 
@@ -4749,8 +4896,9 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             auto clicked = m_visible[pressed];
             if (m_busy && !clicked->isFolder)
             {
-                // Mid-animation: it is cut short and this switch starts now.
-                AbortTransition(nullptr);
+                // Mid-animation: it is cut short and this switch starts now (the window asked for,
+                // perhaps the one just leaving, is not put down on the way).
+                AbortTransition(clicked->hwnd, false);
                 m_quietUntil = 0;
                 if (auto at = std::find(m_visible.begin(), m_visible.end(), clicked); at != m_visible.end())
                     pressed = static_cast<int>(at - m_visible.begin());
@@ -4838,17 +4986,18 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         CloseCardMenu();
         if (m_dragging || m_settings.open || m_dock == DockState::Hidden)
             return 0;
-        if (m_busy)
-        {
-            Trace(L"  hotkey interrupts the transition");
-            AbortTransition(nullptr);               // the new switch starts now, not after the animation
-            m_quietUntil = 0;
-        }
-        // Numbered top to bottom with a folder's windows each counted: 1 2 [3 4] 5.
+        // Numbered top to bottom with a folder's windows each counted: 1 2 [3 4] 5. Taken as numbered
+        // now, before an interrupted animation reshuffles the cards.
         auto order = HotkeyOrder();
         if (index >= order.size())
             return 0;
         auto card = order[index];
+        if (m_busy)
+        {
+            Trace(L"  hotkey interrupts the transition");
+            AbortTransition(card->hwnd, false);
+            m_quietUntil = 0;
+        }
         Prefetch();     // no hover happened; the outgoing window is captured on the way
         m_fastShow = true;
         if (auto at = std::find(m_visible.begin(), m_visible.end(), card); at != m_visible.end())
@@ -4898,7 +5047,7 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             m_quietUntil = GetTickCount64() + kQuietMs;
             DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
             m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, flags));
-            m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, nullptr, WinEventProc, 0, 0, flags));
+            m_hooks.push_back(SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, WinEventProc, 0, 0, flags));
             // The emoji panel and touch keyboard are shown and put away by cloaking. Cloak events are
             // rare (desktop switches, UWP windows), unlike object show/hide.
             m_hooks.push_back(SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr, WinEventProc, 0, 0, flags));
@@ -5100,6 +5249,13 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             HWND fg = GetForegroundWindow();
             if (fg && fg != m_active)
                 OnForeground(fg);
+            ReconcileSoon();                        // anything else that changed while we animated
+        }
+        else if (wp == kTimerReconcile)
+        {
+            KillTimer(m_sidebar, kTimerReconcile);
+            m_reconcilePending = false;
+            Reconcile();
         }
         else if (wp == kTimerNewWindow)
         {

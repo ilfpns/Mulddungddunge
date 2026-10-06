@@ -55,6 +55,9 @@ struct Card
     wuc::CompositionSurfaceBrush icon{ nullptr };
     CardVis side;           // visuals in the sidebar
     int homeIndex = -1;     // its place in the list when it went on stage (cards moved by hand keep it)
+    bool adopting = false;  // just found on screen: photographed, then minimized (not "restored by its app")
+    ULONGLONG pulledBackAt = 0;     // Reconcile took it back onto the stage then (no flip-flopping)
+    ULONGLONG cardedAt = 0;         // it came into the sidebar then (its window may still be minimizing)
     // A folder's own card (no window): stands for the windows grouped in it, in one slot.
     bool isFolder = false;
     std::weak_ptr<CardFolder> folderOf;
@@ -247,7 +250,8 @@ private:
     void FadeOutFlyIn();
     void StepDone();
     void FinishTransition();
-    std::shared_ptr<Card> TakeCard(HWND hwnd);
+    std::shared_ptr<Card> TakeCard(HWND hwnd);     // a window leaving the stage: its card (stamped cardedAt)
+    std::shared_ptr<Card> TakeCardImpl(HWND hwnd);
     float2 SideToAnim(float2 p) const;
     Pose FramePose(Card const& c) const;
     Pose TargetPose(Card const& c) const;
@@ -407,13 +411,22 @@ private:
     void PutStageAway();
     // A new action while a transition runs (Alt+Tab to another window, Alt+number, a card click, a
     // desktop swipe) is not held back until it ends: the transition is cut short and the new one starts.
-    void AbortTransition(HWND keep);                // keep: the window the user went to (left as it is)
+    // keep: the window the user went to (left as it is). restoreIncoming: bring up the window that was
+    // coming in (not when another switch follows at once: it would end up on screen next to that one).
+    void AbortTransition(HWND keep, bool restoreIncoming = true);
     bool UserSwitchedMidTransition(HWND hwnd) const;
     std::vector<HWND> m_leaving;                    // windows put away by the current/last transition
     // A desktop switch is seen when it happens (windows uncloaking, the switching preview), not at
     // the next focus change: that one may never come until a click (kTimerDesktopCheck).
     int m_desktopChecks = 0;
     void CheckDesktop();
+    // What the sidebar believes against what the windows are, after events that can change a window
+    // without the focus change we otherwise go by: restored without activation, moved to another
+    // desktop, minimized or hidden unseen, opened minimized. Event-driven (kTimerReconcile), no polling.
+    void Reconcile();
+    void ReconcileSoon();
+    bool m_reconcilePending = false, m_reconcileDue = false;   // timer armed / to run when a transition ends
+    ULONGLONG m_reconcileFirst = 0;                 // first event of the current burst (bounds the wait)
     ULONGLONG m_begunAt = 0, m_shownAt = 0;         // transition start, its window brought up
     bool m_fastShow = false;                        // the next switch is from a hotkey: window up sooner
     // At rest the view takes clicks only where the cards are (top card to bottom card); above and
