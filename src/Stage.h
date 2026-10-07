@@ -413,9 +413,17 @@ private:
     // desktop swipe) is not held back until it ends: the transition is cut short and the new one starts.
     // keep: the window the user went to (left as it is). restoreIncoming: bring up the window that was
     // coming in (not when another switch follows at once: it would end up on screen next to that one).
-    void AbortTransition(HWND keep, bool restoreIncoming = true);
+    // putAwayLeaving: minimize the windows that were leaving (not when the user went to another
+    // desktop: each desktop's windows stay as they were).
+    void AbortTransition(HWND keep, bool restoreIncoming = true, bool putAwayLeaving = true);
+    // The focus moved to another virtual desktop's window, even if Windows hasn't updated its current
+    // desktop yet (a fast swipe announces the new window first). Returns that desktop, or GUID_NULL.
+    GUID DesktopMovedTo(HWND foreground);
     bool UserSwitchedMidTransition(HWND hwnd) const;
     std::vector<HWND> m_leaving;                    // windows put away by the current/last transition
+    // Windows we asked to minimize (ShowWindowAsync: it lands later), and when. A minimize that lands
+    // after the window was picked again is ours and stale, not the user's.
+    std::vector<std::pair<HWND, ULONGLONG>> m_selfMinimized;
     // A desktop switch is seen when it happens (windows uncloaking, the switching preview), not at
     // the next focus change: that one may never come until a click (kTimerDesktopCheck).
     int m_desktopChecks = 0;

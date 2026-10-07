@@ -1805,7 +1805,13 @@ void Stage::OnForeground(HWND hwnd)
     {
         // Another desktop (a three/four-finger swipe) or a window the user went to (Alt+Tab, the
         // taskbar): acted on now rather than once the animation is over.
-        if (CurrentDesktopId() != m_desktopId || UserSwitchedMidTransition(hwnd))
+        if (DesktopMovedTo(hwnd) != GUID_NULL)
+        {
+            Trace(L"  another desktop: transition cut short, windows left as they are", hwnd);
+            AbortTransition(hwnd, false, false);
+            m_quietUntil = 0;
+        }
+        else if (UserSwitchedMidTransition(hwnd))
         {
             Trace(L"  interrupts the transition", hwnd);
             AbortTransition(hwnd);
@@ -1817,9 +1823,9 @@ void Stage::OnForeground(HWND hwnd)
         Trace(m_busy ? L"  ignored: mid-transition" : L"  ignored: not ready / syncing", hwnd);
         return;
     }
-    GUID desktop = CurrentDesktopId();
-    if (desktop != m_desktopId)
+    if (GUID desktop = DesktopMovedTo(hwnd); desktop != GUID_NULL)
     {
+        // Another desktop: its own windows take over (never a switch from this desktop's window).
         m_desktopId = desktop;
         SyncDesktop();
         return;
@@ -1896,8 +1902,26 @@ void Stage::OnMinimizeStart(HWND hwnd)
     Took took(L"minimize response");
     if (m_ready)
         SetTimer(m_sidebar, kTimerDock, 100, nullptr);     // e.g. a fullscreen game minimized by Alt+Tab
+    // One we asked for, landing late: by now the window may have been picked again (a quick second
+    // switch, a desktop swipe cutting an animation short). Then it is undone, not taken as the user's.
+    auto mine = std::find_if(m_selfMinimized.begin(), m_selfMinimized.end(), [&](auto& m) { return m.first == hwnd; });
+    bool ours = mine != m_selfMinimized.end() && GetTickCount64() - mine->second < 1500;
+    if (mine != m_selfMinimized.end())
+        m_selfMinimized.erase(mine);
     if (!m_ready || !OnStage(hwnd))
+    {
+        if (m_ready && !ours && CardOf(hwnd))
+            Trace(L"minimize (not on stage)", hwnd);
         return;
+    }
+    if (ours)
+    {
+        Trace(L"  stale minimize of a stage window: undone", hwnd);
+        BringBack(hwnd);
+        if (hwnd == m_active)
+            ForceForeground(hwnd);
+        return;
+    }
     // Minimized by the user (button, Win+D, four-finger swipe). It can't be photographed any more, so
     // use the picture taken when it became the focused stage window, or the one from a sidebar hover.
     wuc::CompositionDrawingSurface picture{ nullptr };
@@ -2116,10 +2140,28 @@ void Stage::SyncDesktop()
         m_stage.push_back(m_active);
         RemoveCard(m_active);
     }
-    for (HWND h : wt::EnumManageable(m_mon))
+    // The windows up on this desktop are its stage, as they were left (we minimize whatever leaves the
+    // stage): they stay up, whichever window has the focus right now. The focus may still be on the
+    // switching preview, and taking them for new cards minimized the window the user came back to.
+    auto here = wt::EnumManageable(m_mon);          // topmost first
+    for (HWND h : here)
+    {
+        if (OnStage(h) || IsIconic(h) || !IsWindowVisible(h))
+            continue;
+        m_stage.push_back(h);
+        RemoveCard(h);
+        if (!m_active)
+            m_active = h;
+    }
+    if (m_active)
+    {
+        std::erase(m_stage, m_active);              // the focused one last (see m_stage)
+        m_stage.push_back(m_active);
+    }
+    for (HWND h : here)
     {
         if (!OnStage(h) && std::none_of(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == h; }))
-            Adopt(h);
+            Adopt(h);                               // minimized windows not seen before
     }
     AdoptPinnedElsewhere();
     m_hover = -1;
@@ -3648,7 +3690,7 @@ void Stage::CheckDesktop()
     }
     m_desktopChecks = 0;
     if (m_busy)
-        AbortTransition(nullptr);                   // the cards are about to be another desktop's
+        AbortTransition(nullptr, false, false);     // the cards are about to be another desktop's; its windows stay
     m_desktopId = desktop;
     SyncDesktop();
 }
@@ -3773,6 +3815,29 @@ void Stage::Reconcile()
         OnForeground(fg);                           // one that came while we were busy here
 }
 
+GUID Stage::DesktopMovedTo(HWND foreground)
+{
+    GUID now = CurrentDesktopId();
+    if (now != GUID_NULL && now != m_desktopId)
+        return now;
+    // Windows may announce the new desktop's window before updating its current desktop: the window's
+    // own desktop tells. (Windows shown on every desktop report the current one, or nothing.)
+    if (foreground && foreground != m_active && !m_syncing && wt::IsManageable(foreground, m_mon))
+    {
+        // A call into Explorer: events it lets through meanwhile wait (as in SyncDesktop).
+        m_syncing = true;
+        GUID its = DesktopOf(foreground);
+        m_syncing = false;
+        if (its != GUID_NULL && its != m_desktopId)
+        {
+            auto all = vd::Desktops();              // (asked only now: rare, a desktop is changing)
+            if (all.empty() || std::find(all.begin(), all.end(), its) != all.end())   // a real desktop
+                return its;
+        }
+    }
+    return GUID_NULL;
+}
+
 // A foreground change mid-transition that is the user's, not ours: our own churn comes before the
 // incoming window is brought up (Windows activating the next window when the outgoing one is
 // minimized) or is the incoming window itself.
@@ -3787,7 +3852,7 @@ bool Stage::UserSwitchedMidTransition(HWND hwnd) const
 
 // Ends the running transition where it is: the incoming window is up, the leaving ones go down (not
 // `keep`, the one the user just went to), the flying copies go.
-void Stage::AbortTransition(HWND keep, bool restoreIncoming)
+void Stage::AbortTransition(HWND keep, bool restoreIncoming, bool putAwayLeaving)
 {
     if (!m_busy)
         return;
@@ -3797,7 +3862,7 @@ void Stage::AbortTransition(HWND keep, bool restoreIncoming)
     for (auto& flight : m_outs)
     {
         HWND h = flight->card->hwnd;
-        if (h != keep && IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !OnStage(h))
+        if (putAwayLeaving && h != keep && IsWindow(h) && IsWindowVisible(h) && !IsIconic(h) && !OnStage(h))
             Minimize(h);
     }
     m_toMinimize.clear();                           // minimized just above (or kept)
@@ -4510,6 +4575,14 @@ void Stage::BringBack(HWND hwnd)
 // otherwise stay behind on screen with its window gone.
 void Stage::Minimize(HWND hwnd)
 {
+    Trace(L"we minimize", hwnd);
+    if (g_stage)
+    {
+        ULONGLONG now = GetTickCount64();
+        auto& mine = g_stage->m_selfMinimized;
+        std::erase_if(mine, [&](auto& m) { return m.first == hwnd || now - m.second > 3000; });
+        mine.push_back({ hwnd, now });
+    }
     ShowWindowAsync(hwnd, SW_MINIMIZE);
     if (HWND dialog = wt::ModalDialog(hwnd); dialog && !GetWindow(dialog, GW_OWNER) && !IsIconic(dialog))
         ShowWindowAsync(dialog, SW_MINIMIZE);
