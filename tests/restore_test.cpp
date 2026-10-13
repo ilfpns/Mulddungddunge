@@ -495,13 +495,22 @@ static void KakaoTalk()
     Expect("its card brings it back", open(k), k);
     Sleep(1500);
 
-    PostMessageW(k, WM_CLOSE, 0, 0);                // X: signed in, KakaoTalk hides to the tray
+    // Closed as with its X or Alt+F4 (the system close command; a bare WM_CLOSE makes KakaoTalk quit).
+    PostMessageW(k, WM_SYSCOMMAND, SC_CLOSE, 0);
     waitFor([&] { return !IsWindow(k) || !IsWindowVisible(k) || IsIconic(k); }, 3000);
     Sleep(1500);
     if (!IsWindow(k))
     {
-        // Its sign-in window closes for good on X (nothing in the tray to come back from).
-        printf("  [SKIP] %-62s\n", "closed with X: this window was destroyed (signed out?), no tray case");
+        // It quit, or its sign-in window closed for good: nothing in the tray to come back from.
+        printf("  [SKIP] %-62s\n", "closed: the window was destroyed (it quit), no tray case");
+        if (wasRunning && kakaoPids().empty())
+        {
+            // It was running before the test: started again, as the user had it.
+            wchar_t exe[MAX_PATH];
+            ExpandEnvironmentStringsW(L"%ProgramFiles%\\Kakao\\KakaoTalk\\KakaoTalk.exe", exe, MAX_PATH);
+            ShellExecuteW(nullptr, L"open", exe, nullptr, nullptr, SW_SHOWMINNOACTIVE);
+            puts("  (KakaoTalk had quit: started again)");
+        }
     }
     else
     {

@@ -5498,8 +5498,18 @@ LRESULT Stage::OnViewMessage(UINT msg, WPARAM wp, LPARAM lp)
             KillTimer(m_sidebar, kTimerFolderClose);
         if (m_dock == DockState::Tucked && !m_busy)
         {
-            m_revealed = true;
-            SetDock(DockState::Shown);
+            // Only the pointer at the screen edge brings it out. Just after a switch the view still
+            // covers the whole monitor for a moment, and the pointer resting anywhere on it gets a
+            // move message as the windows change under it: that had the sidebar slide out and back
+            // in again after every switch to a maximized window.
+            POINT at{};
+            GetCursorPos(&at);
+            LONG strip = static_cast<LONG>(S(kEdgeStrip)) + 1;
+            if (Right() ? at.x >= m_bar.right - strip : at.x < m_bar.left + strip)
+            {
+                m_revealed = true;
+                SetDock(DockState::Shown);
+            }
         }
         if (!m_tracking)
         {

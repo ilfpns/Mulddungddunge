@@ -13,6 +13,7 @@
 //     --uwp    only: switch start times with Calculator (UWP) leaving, and closing as a switch begins
 //              (opens Calculator and closes it again)
 //     --late   only: a stage window gone unannounced as a switch starts gets its card after the switch
+//     --dock   only: a switch to a maximized window tucks the sidebar once (no slide back out)
 //     (all skipped while the PC is locked)
 #include <windows.h>
 #include <dwmapi.h>
@@ -428,6 +429,46 @@ static void GoneUnseenCase()
     Sleep(500);
 }
 
+// A switch to a maximized window tucks the sidebar away once, whatever the pointer rests on: it used to
+// slide back out and in again (the pointer anywhere on the still full-screen view counted as at the edge).
+static void DockCase()
+{
+    puts("switch to a maximized window: the sidebar tucks away once");
+    HWND a = MakeWindow(L"dock test maximized", RGB(200, 120, 60));
+    WaitFor([&] { return IsIconic(a); }, 3000);
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    GetWindowPlacement(a, &wp);
+    wp.flags |= WPF_RESTORETOMAXIMIZED;             // its card opens it maximized
+    wp.showCmd = SW_SHOWMINNOACTIVE;
+    SetWindowPlacement(a, &wp);
+    Sleep(1500);
+    POINT was{};
+    GetCursorPos(&was);
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(Sidebar(), MONITOR_DEFAULTTONEAREST), &mi);
+    SetCursorPos((mi.rcWork.left + mi.rcWork.right) / 2, (mi.rcWork.top + mi.rcWork.bottom) / 2);  // resting mid-screen
+    for (int round = 1; round <= 2; ++round)
+    {
+        long long t = TraceSize();
+        Command(ID_TEST_OPEN, a);
+        bool up = WaitFor([&] { return IsZoomed(a) && !IsIconic(a); }, 3000) && TraceHas(t, L"switch end", 2000);
+        Sleep(1500);                                // a slide back out would have come and gone by now
+        auto s = TraceSince(t);
+        auto end = s.rfind(L"switch end");
+        bool tucked = end != std::wstring::npos && s.find(L"dock tucked", end) != std::wstring::npos;
+        bool bounced = end != std::wstring::npos && s.find(L"dock shown", end) != std::wstring::npos;
+        char name[96];
+        sprintf_s(name, "round %d: maximized, sidebar tucked and stays tucked", round);
+        Expect(name, up && tucked && !bounced, bounced ? "slid back out" : tucked ? "" : "not tucked");
+        ShowWindow(a, SW_MINIMIZE);                 // back to its card for the next round
+        WaitFor([&] { return IsIconic(a); }, 3000);
+        Sleep(1500);
+    }
+    SetCursorPos(was.x, was.y);
+    PostMessageW(a, kDestroy, 0, 0);
+    Sleep(500);
+}
+
 // Locked (the lock screen in front) nothing can take the focus: the cases that need it can't run.
 static bool Locked()
 {
@@ -448,7 +489,7 @@ int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::wstring shots;
-    bool force = false, tray = false, uwp = false, late = false;
+    bool force = false, tray = false, uwp = false, late = false, dock = false;
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"--shots") == 0 && i + 1 < argc)
@@ -457,6 +498,7 @@ int wmain(int argc, wchar_t** argv)
         tray |= wcscmp(argv[i], L"--tray") == 0;
         uwp |= wcscmp(argv[i], L"--uwp") == 0;
         late |= wcscmp(argv[i], L"--late") == 0;
+        dock |= wcscmp(argv[i], L"--dock") == 0;
     }
     // It sends keys, takes the focus and restarts the app: not while someone is using the PC.
     LASTINPUTINFO last{ sizeof(last) };
@@ -477,7 +519,7 @@ int wmain(int argc, wchar_t** argv)
     }
     std::wstring app = AppPath();
     HWND user = GetForegroundWindow();
-    if (tray || uwp || late)
+    if (tray || uwp || late || dock)
     {
         if (tray)
             TrayCase();
@@ -485,6 +527,8 @@ int wmain(int argc, wchar_t** argv)
             UwpCase();
         if (late)
             GoneUnseenCase();
+        if (dock)
+            DockCase();
         GiveBack(user);
         printf("\n%d checks, %d failed\n", g_run, g_failed);
         return g_failed ? 1 : 0;
