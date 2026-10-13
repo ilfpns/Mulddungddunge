@@ -257,6 +257,7 @@ private:
     Pose TargetPose(Card const& c) const;
     static void ForceForeground(HWND hwnd);
     static void BringBack(HWND hwnd);
+    static void RestoreDirectly(HWND hwnd);
     static void Minimize(HWND hwnd);
     void OnHidden(HWND hwnd);
     void GrowView();                                // whole monitor, for a transition
@@ -424,6 +425,8 @@ private:
     // Windows we asked to minimize (ShowWindowAsync: it lands later), and when. A minimize that lands
     // after the window was picked again is ours and stale, not the user's.
     std::vector<std::pair<HWND, ULONGLONG>> m_selfMinimized;
+    // Windows sent the restore command (see BringBack), checked once more in case the app ignored it.
+    std::vector<HWND> m_restoreChecks;
     // A desktop switch is seen when it happens (windows uncloaking, the switching preview), not at
     // the next focus change: that one may never come until a click (kTimerDesktopCheck).
     int m_desktopChecks = 0;
