@@ -448,3 +448,4 @@
 - 결론: Windows의 프로세스별 GPU 메모리 카운터 오류(Microsoft KB4490156: "세부 정보 탭의 전용 GPU 메모리가 누수처럼 보이지만 성능 탭·WPA는 정상"). 실제 GPU 메모리는 늘지 않음. 앱 코드 변경 없음
 - 반영: 시험은 DXGI(`QueryVideoMemoryInfo`)로 판정(사진 40장 0.00MB/장), README의 GPU 메모리 설명과 AGENTS.md 성능 기준에 측정 방법 명시, `run-tests.bat`이 캡처 메모리 시험도 실행
 - 이전 기록의 "기능 업데이트 제안 5(캡처 장치·프레임 풀 재사용)"는 필요 없음. 실험에서 프레임 풀 재사용은 두 번째 캡처부터 프레임이 오지 않아(1/40 성공) 쓸 수도 없음
+- 완료 기준 5(설치 프로그램): `packaging\package.ps1`로 `StageManager-1.1.0-win64.exe`(500KB)·portable zip(`stage-manager.exe` 1.1.0, `README.txt`) 생성 확인. 실제 설치·제거는 사용 중인 앱을 바꾸므로 하지 않음
