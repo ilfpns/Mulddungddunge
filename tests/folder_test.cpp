@@ -548,6 +548,8 @@ static void DockCase()
     Sleep(500);
 }
 
+static bool g_killUwp = false;                      // --uwp-kill: the apps end abruptly instead of closing
+
 // Real UWP apps closed (as with their X) just as a switch starts, no test hook: which of them let their
 // frame go unannounced, and so take the "card made after the switch" way, and how fast the switch starts.
 static void UwpAppsCase()
@@ -586,7 +588,18 @@ static void UwpAppsCase()
         GiveBack(f);
         Sleep(3000);                                // on stage, photographed
         long long t = TraceSize();
-        PostMessageW(f, WM_SYSCOMMAND, SC_CLOSE, 0);    // its X
+        HWND core = FindWindowExW(f, nullptr, L"Windows.UI.Core.CoreWindow", nullptr);
+        DWORD appPid = 0;
+        if (core)
+            GetWindowThreadProcessId(core, &appPid);
+        HANDLE appProc = g_killUwp && appPid ? OpenProcess(PROCESS_TERMINATE, FALSE, appPid) : nullptr;
+        if (appProc)
+        {
+            TerminateProcess(appProc, 1);           // the app ends abruptly (a crash), no closing of its own
+            CloseHandle(appProc);
+        }
+        else
+            PostMessageW(f, WM_SYSCOMMAND, SC_CLOSE, 0);    // its X
         WaitFor([&] {
             DWORD cloaked = 0;
             DwmGetWindowAttribute(f, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
@@ -647,6 +660,8 @@ int wmain(int argc, wchar_t** argv)
         dock |= wcscmp(argv[i], L"--dock") == 0;
         onecard |= wcscmp(argv[i], L"--onecard") == 0;
         uwpapps |= wcscmp(argv[i], L"--uwp-apps") == 0;
+        if (wcscmp(argv[i], L"--uwp-kill") == 0)
+            uwpapps = g_killUwp = true;
     }
     // It sends keys, takes the focus and restarts the app: not while someone is using the PC.
     LASTINPUTINFO last{ sizeof(last) };
