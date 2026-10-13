@@ -548,6 +548,73 @@ static void DockCase()
     Sleep(500);
 }
 
+// Real UWP apps closed (as with their X) just as a switch starts, no test hook: which of them let their
+// frame go unannounced, and so take the "card made after the switch" way, and how fast the switch starts.
+static void UwpAppsCase()
+{
+    puts("real UWP apps closing as a switch starts");
+    struct App { wchar_t const* uri; wchar_t const* name; };
+    App apps[] = { { L"calculator:", L"Calculator" }, { L"ms-settings:", L"Settings" }, { L"ms-clock:", L"Clock" },
+                   { L"ms-photos:", L"Photos" }, { L"ms-windows-store:", L"Store" } };
+    auto frames = [] {
+        std::vector<HWND> list;
+        for (HWND h = FindWindowW(L"ApplicationFrameWindow", nullptr); h; h = FindWindowExW(nullptr, h, L"ApplicationFrameWindow", nullptr))
+            if (IsWindowVisible(h))
+                list.push_back(h);
+        return list;
+    };
+    HWND card = MakeWindow(L"uwp apps test card", RGB(120, 160, 220));
+    WaitFor([&] { return IsIconic(card); }, 3000);
+    Sleep(1500);
+    int unannounced = 0;
+    for (auto& app : apps)
+    {
+        auto before = frames();
+        ShellExecuteW(nullptr, L"open", app.uri, nullptr, nullptr, SW_SHOWNORMAL);
+        HWND f = nullptr;
+        WaitFor([&] {
+            for (HWND h : frames())
+                if (std::find(before.begin(), before.end(), h) == before.end())
+                    f = h;
+            return f != nullptr;
+        }, 10000);
+        if (!f)
+        {
+            printf("  [INFO] %-10s did not open\n", Narrow(app.name).c_str());
+            continue;
+        }
+        GiveBack(f);
+        Sleep(3000);                                // on stage, photographed
+        long long t = TraceSize();
+        PostMessageW(f, WM_SYSCOMMAND, SC_CLOSE, 0);    // its X
+        WaitFor([&] {
+            DWORD cloaked = 0;
+            DwmGetWindowAttribute(f, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            return !IsWindow(f) || !IsWindowVisible(f) || cloaked;
+        }, 3000);
+        Command(ID_TEST_OPEN, card);
+        bool up = WaitFor([&] { return IsWindowVisible(card) && !IsIconic(card); }, 3000);
+        TraceHas(t, L"switch end", 2000);
+        Sleep(800);
+        auto s = TraceSince(t);
+        double took = -1;
+        if (auto at = s.find(L"switch start took "); at != std::wstring::npos)
+            took = _wtof(s.c_str() + at + 18);
+        bool late = s.find(L"made after the switch") != std::wstring::npos;
+        unannounced += late;
+        char name[120];
+        sprintf_s(name, "%s: switch start %.1f ms (< 170)%s", Narrow(app.name).c_str(), took,
+            late ? ", frame went unannounced: card made after the switch" : "");
+        Expect(name, up && took >= 0 && took < 170.0);
+        ShowWindow(card, SW_MINIMIZE);              // back to a card for the next app
+        WaitFor([&] { return IsIconic(card); }, 3000);
+        Sleep(1500);
+    }
+    printf("  [INFO] apps whose frame went unannounced: %d of %zu\n", unannounced, std::size(apps));
+    PostMessageW(card, kDestroy, 0, 0);
+    Sleep(500);
+}
+
 // Locked (the lock screen in front) nothing can take the focus: the cases that need it can't run.
 static bool Locked()
 {
@@ -568,7 +635,7 @@ int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::wstring shots;
-    bool force = false, tray = false, uwp = false, late = false, dock = false, onecard = false;
+    bool force = false, tray = false, uwp = false, late = false, dock = false, onecard = false, uwpapps = false;
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"--shots") == 0 && i + 1 < argc)
@@ -579,6 +646,7 @@ int wmain(int argc, wchar_t** argv)
         late |= wcscmp(argv[i], L"--late") == 0;
         dock |= wcscmp(argv[i], L"--dock") == 0;
         onecard |= wcscmp(argv[i], L"--onecard") == 0;
+        uwpapps |= wcscmp(argv[i], L"--uwp-apps") == 0;
     }
     // It sends keys, takes the focus and restarts the app: not while someone is using the PC.
     LASTINPUTINFO last{ sizeof(last) };
@@ -599,7 +667,7 @@ int wmain(int argc, wchar_t** argv)
     }
     std::wstring app = AppPath();
     HWND user = GetForegroundWindow();
-    if (tray || uwp || late || dock || onecard)
+    if (tray || uwp || late || dock || onecard || uwpapps)
     {
         if (tray)
             TrayCase();
@@ -611,6 +679,8 @@ int wmain(int argc, wchar_t** argv)
             DockCase();
         if (onecard)
             OneCardCase(app);
+        if (uwpapps)
+            UwpAppsCase();
         GiveBack(user);
         printf("\n%d checks, %d failed\n", g_run, g_failed);
         return g_failed ? 1 : 0;
