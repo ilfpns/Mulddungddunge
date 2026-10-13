@@ -9,8 +9,12 @@
 //   folder-test.exe [--shots <folder>] [--force]
 //     --shots  sidebar screenshots (name tag, numbers, alert) as BMP files there
 //     --force  run even if the PC was used within the last minute (otherwise skipped)
+//     --tray   only: a window hiding itself on X (as KakaoTalk signed in) keeps its card and comes back
+//     --uwp    only: switch start times with Calculator (UWP) leaving, and closing as a switch begins
+//              (opens Calculator and closes it again)
 #include <windows.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -138,8 +142,20 @@ static void WriteStrings(wchar_t const* name, std::vector<std::wstring> const& s
 
 // ---- test windows ---------------------------------------------------------------
 
+constexpr UINT kDestroy = WM_APP + 2;             // a test window goes for good (from another thread)
+
 static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_CLOSE && GetPropW(h, L"hidesOnClose"))
+    {
+        ShowWindow(h, SW_HIDE);                     // X: to the tray, as KakaoTalk or Discord signed in
+        return 0;
+    }
+    if (m == kDestroy)
+    {
+        DestroyWindow(h);
+        return 0;
+    }
     if (m == WM_PAINT)
     {
         PAINTSTRUCT ps;
@@ -155,10 +171,10 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
-static HWND MakeWindow(wchar_t const* title, COLORREF color)
+static HWND MakeWindow(wchar_t const* title, COLORREF color, bool minimized = true)
 {
     std::atomic<HWND> made{ nullptr };
-    std::thread([&made, title, color] {
+    std::thread([&made, title, color, minimized] {
         WNDCLASSW wc{};
         wc.lpfnWndProc = Proc;
         wc.hInstance = GetModuleHandleW(nullptr);
@@ -167,7 +183,7 @@ static HWND MakeWindow(wchar_t const* title, COLORREF color)
         HWND h = CreateWindowW(wc.lpszClassName, title, WS_OVERLAPPEDWINDOW, 300, 200, 900, 640, nullptr, nullptr,
             wc.hInstance, nullptr);
         SetWindowLongPtrW(h, GWLP_USERDATA, color);
-        ShowWindow(h, SW_SHOWMINNOACTIVE);          // straight into the sidebar, no focus taken
+        ShowWindow(h, minimized ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL);  // minimized: straight into the sidebar
         made = h;
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0)
@@ -272,16 +288,113 @@ static std::wstring AppPath()
     return path;
 }
 
+constexpr UINT ID_TEST_OPEN = 33;
+
+// A window that hides itself on X (as KakaoTalk or Discord signed in) keeps its card, and its card shows
+// it again.
+static void TrayCase()
+{
+    puts("closing to the tray");
+    HWND w = MakeWindow(L"tray test", RGB(250, 200, 40), false);
+    SetPropW(w, L"hidesOnClose", reinterpret_cast<HANDLE>(1));
+    GiveBack(w);                                    // focused: on stage
+    Sleep(2000);
+    long long t = TraceSize();
+    PostMessageW(w, WM_CLOSE, 0, 0);
+    bool hidden = WaitFor([&] { return !IsWindowVisible(w); }, 2000);
+    Expect("X hides it (still a window)", hidden && IsWindow(w));
+    bool carded = TraceHas(t, L"minimize (", 3000) && TraceSince(t).find(L"'tray test'") != std::wstring::npos;
+    Sleep(800);
+    Expect("hidden to the tray, it goes into a card", carded);
+    Command(ID_TEST_OPEN, w);
+    Expect("its card shows it again", WaitFor([&] { return IsWindowVisible(w) && !IsIconic(w); }, 3000));
+    Sleep(1000);
+    PostMessageW(w, kDestroy, 0, 0);
+    Sleep(500);
+}
+
+// Switch start times around a UWP window (Calculator): one leaving the stage, and one closing just as a
+// switch begins (its card is made after the switch, not in its way). All must stay under 170 ms.
+static void UwpCase()
+{
+    puts("UWP window (Calculator)");
+    auto findCalc = [] {
+        for (HWND h = FindWindowW(L"ApplicationFrameWindow", nullptr); h; h = FindWindowExW(nullptr, h, L"ApplicationFrameWindow", nullptr))
+        {
+            wchar_t title[64]{};
+            GetWindowTextW(h, title, ARRAYSIZE(title));
+            if ((wcscmp(title, L"계산기") == 0 || wcscmp(title, L"Calculator") == 0) && IsWindowVisible(h))
+                return h;
+        }
+        return static_cast<HWND>(nullptr);
+    };
+    auto tookSince = [](long long t) {
+        double worst = -1;
+        auto s = TraceSince(t);
+        for (size_t at = 0; (at = s.find(L"switch start took ", at)) != std::wstring::npos; ++at)
+            worst = (std::max)(worst, _wtof(s.c_str() + at + 18));
+        return worst;
+    };
+    HWND m = MakeWindow(L"uwp test card", RGB(120, 120, 220));
+    WaitFor([&] { return IsIconic(m); }, 3000);
+    Sleep(1500);
+    for (int round = 0; round < 2; ++round)
+    {
+        bool closing = round == 1;
+        ShellExecuteW(nullptr, L"open", L"calc.exe", nullptr, nullptr, SW_SHOWNORMAL);
+        HWND calc = nullptr;
+        WaitFor([&] { return (calc = findCalc()) != nullptr; }, 10000);
+        if (!calc)
+        {
+            Expect("Calculator opened", false);
+            break;
+        }
+        GiveBack(calc);
+        Sleep(3000);                                // on stage, photographed
+        long long t = TraceSize();
+        if (closing)
+        {
+            // Hidden, and the switch asked for at once: a sent message is handled before the queued
+            // notice of the hiding, so the switch finds it gone unseen (with no card yet).
+            PostMessageW(calc, WM_CLOSE, 0, 0);
+            WaitFor([&] { return !IsWindowVisible(calc); }, 3000);
+        }
+        Command(ID_TEST_OPEN, m);
+        bool up = WaitFor([&] { return IsWindowVisible(m) && !IsIconic(m); }, 3000);
+        TraceHas(t, L"switch end", 2000);
+        double took = tookSince(t);
+        char name[96];
+        sprintf_s(name, closing ? "switch as Calculator closes: start %.1f ms (< 170)" : "Calculator leaving the stage: start %.1f ms (< 170)", took);
+        Expect(name, up && took >= 0 && took < 170.0);
+        if (closing)
+            Expect("  (it was the gone-unseen path, card made after the switch)",
+                TraceSince(t).find(L"made after the switch") != std::wstring::npos);
+        Sleep(1000);
+        if (!closing)
+        {
+            if (HWND c = findCalc())
+                PostMessageW(c, WM_CLOSE, 0, 0);
+            ShowWindow(m, SW_MINIMIZE);             // back to a card for the next round
+            WaitFor([&] { return IsIconic(m); }, 3000);
+            Sleep(1500);
+        }
+    }
+    PostMessageW(m, kDestroy, 0, 0);
+    Sleep(500);
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::wstring shots;
-    bool force = false;
+    bool force = false, tray = false, uwp = false;
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"--shots") == 0 && i + 1 < argc)
             shots = argv[i + 1];
         force |= wcscmp(argv[i], L"--force") == 0;
+        tray |= wcscmp(argv[i], L"--tray") == 0;
+        uwp |= wcscmp(argv[i], L"--uwp") == 0;
     }
     // It sends keys, takes the focus and restarts the app: not while someone is using the PC.
     LASTINPUTINFO last{ sizeof(last) };
@@ -297,6 +410,16 @@ int wmain(int argc, wchar_t** argv)
     }
     std::wstring app = AppPath();
     HWND user = GetForegroundWindow();
+    if (tray || uwp)
+    {
+        if (tray)
+            TrayCase();
+        if (uwp)
+            UwpCase();
+        GiveBack(user);
+        printf("\n%d checks, %d failed\n", g_run, g_failed);
+        return g_failed ? 1 : 0;
+    }
     bool hadFolders = false, hadOrder = false;
     auto savedFolders = ReadStrings(L"Folders", &hadFolders), savedOrder = ReadStrings(L"Order", &hadOrder);
     long long start = TraceSize();

@@ -30,7 +30,7 @@ cl /Fe:bin\capture-memory-test.exe tests\capture_memory_test.cpp src\Snapshot.cp
    /link /SUBSYSTEM:CONSOLE ^
    user32.lib gdi32.lib shell32.lib ole32.lib dwmapi.lib shcore.lib d3d11.lib dxgi.lib d2d1.lib dwrite.lib ^
    windowscodecs.lib windowsapp.lib CoreMessaging.lib advapi32.lib version.lib || exit /b 1
-cl /Fe:bin\folder-test.exe tests\folder_test.cpp /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib dwmapi.lib advapi32.lib || exit /b 1
+cl /Fe:bin\folder-test.exe tests\folder_test.cpp /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib dwmapi.lib advapi32.lib shell32.lib || exit /b 1
 
 rem The trace and the app's own temp files are in the real %TEMP%, not the compiler's.
 endlocal & set "FAILED=0" & set "ARGS=%*"

@@ -4448,6 +4448,7 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
             // can take 100 ms for a closing UWP window, and the click must not wait for it.
             if (!CardOf(h))
             {
+                Trace(L"  gone unseen, no card yet: made after the switch", h);
                 m_lateCards.push_back(h);
                 continue;
             }
