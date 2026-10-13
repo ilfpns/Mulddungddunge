@@ -23,6 +23,7 @@ namespace
     constexpr UINT ID_TEST_GROUP = 31;        // this window's card held over the target: a folder
     constexpr UINT ID_TEST_MOVE = 32;         // this window's card dropped on the target: moved by hand
     constexpr UINT ID_TEST_OPEN = 33;         // this window's card clicked (from its folder's card if in one)
+    constexpr UINT ID_TEST_HIDE_OPEN = 34;    // this stage window hidden and the target's card clicked at once
     // Where "크기 맞추기" puts a window: the visible frame of the Orca window as it was on 2026-09-30,
     // in screen pixels (left, top, right, bottom). Fixed on purpose.
     constexpr RECT kFitFrame = { 252, 52, 2228, 1377 };
@@ -5723,8 +5724,15 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             FolderCommand(LOWORD(wp), FolderOf(reinterpret_cast<HWND>(lp)));   // lParam: one of its windows
         else if (LOWORD(wp) == ID_TEST_MARK)
             m_testMark = reinterpret_cast<HWND>(lp);
-        else if (LOWORD(wp) == ID_TEST_OPEN && !m_busy && !m_dragging)
+        else if ((LOWORD(wp) == ID_TEST_OPEN || LOWORD(wp) == ID_TEST_HIDE_OPEN) && !m_busy && !m_dragging)
         {
+            // 34: lParam (a stage window) hidden, and the marked card opened, in this one go: the
+            // switch finds it gone before the notice of that is read (as a closing UWP frame does).
+            if (LOWORD(wp) == ID_TEST_HIDE_OPEN)
+            {
+                ShowWindow(reinterpret_cast<HWND>(lp), SW_HIDE);
+                lp = reinterpret_cast<LPARAM>(m_testMark);
+            }
             auto card = CardOf(reinterpret_cast<HWND>(lp));
             if (auto at = std::find(m_visible.begin(), m_visible.end(), card); card && at != m_visible.end())
                 SwitchTo(static_cast<size_t>(at - m_visible.begin()));

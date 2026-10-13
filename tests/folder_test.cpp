@@ -12,6 +12,8 @@
 //     --tray   only: a window hiding itself on X (as KakaoTalk signed in) keeps its card and comes back
 //     --uwp    only: switch start times with Calculator (UWP) leaving, and closing as a switch begins
 //              (opens Calculator and closes it again)
+//     --late   only: a stage window gone unannounced as a switch starts gets its card after the switch
+//     (all skipped while the PC is locked)
 #include <windows.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -354,10 +356,14 @@ static void UwpCase()
         long long t = TraceSize();
         if (closing)
         {
-            // Hidden, and the switch asked for at once: a sent message is handled before the queued
-            // notice of the hiding, so the switch finds it gone unseen (with no card yet).
+            // A closing UWP app: its inner window's hiding is announced, its frame (the stage window)
+            // just goes, unannounced. The switch is asked for the moment the frame is gone.
             PostMessageW(calc, WM_CLOSE, 0, 0);
-            WaitFor([&] { return !IsWindowVisible(calc); }, 3000);
+            WaitFor([&] {
+                DWORD cloaked = 0;
+                DwmGetWindowAttribute(calc, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+                return !IsWindow(calc) || !IsWindowVisible(calc) || IsIconic(calc) || cloaked;
+            }, 3000);
         }
         Command(ID_TEST_OPEN, m);
         bool up = WaitFor([&] { return IsWindowVisible(m) && !IsIconic(m); }, 3000);
@@ -366,9 +372,9 @@ static void UwpCase()
         char name[96];
         sprintf_s(name, closing ? "switch as Calculator closes: start %.1f ms (< 170)" : "Calculator leaving the stage: start %.1f ms (< 170)", took);
         Expect(name, up && took >= 0 && took < 170.0);
-        if (closing)
-            Expect("  (it was the gone-unseen path, card made after the switch)",
-                TraceSince(t).find(L"made after the switch") != std::wstring::npos);
+        if (closing)                                // which way it went depends on Calculator (see --late)
+            printf("  [INFO] closing frame %s\n", TraceSince(t).find(L"made after the switch") != std::wstring::npos
+                ? "went unannounced: its card made after the switch" : "was announced before the switch");
         Sleep(1000);
         if (!closing)
         {
@@ -383,11 +389,66 @@ static void UwpCase()
     Sleep(500);
 }
 
+// A stage window with no card yet that goes unannounced just as a switch starts (as a closing UWP
+// frame does): the switch must not wait to make its card (a UWP icon could take 100 ms); the card is
+// made once the switch is done. Test hook 34 hides it and starts the switch in one go, before the
+// notice of the hiding is read, so this happens every time.
+static void GoneUnseenCase()
+{
+    puts("stage window gone unannounced as a switch starts");
+    constexpr UINT ID_TEST_MARK = 30, ID_TEST_HIDE_OPEN = 34;
+    HWND card = MakeWindow(L"late test card", RGB(90, 170, 170));
+    WaitFor([&] { return IsIconic(card); }, 3000);
+    Sleep(1500);
+    HWND w = MakeWindow(L"late test stage", RGB(170, 90, 170), false);
+    GiveBack(w);                                    // focused: on stage, and it never had a card
+    bool onStage = WaitFor([&] { return GetForegroundWindow() == w; }, 3000);
+    Sleep(2000);
+    Expect("setup: a new window on stage", onStage);
+    long long t = TraceSize();
+    Command(ID_TEST_MARK, card);
+    Command(ID_TEST_HIDE_OPEN, w);
+    bool up = WaitFor([&] { return IsWindowVisible(card) && !IsIconic(card); }, 3000);
+    TraceHas(t, L"switch end", 2000);
+    Sleep(1000);
+    auto s = TraceSince(t);
+    double took = -1;
+    if (auto at = s.find(L"switch start took "); at != std::wstring::npos)
+        took = _wtof(s.c_str() + at + 18);
+    char name[96];
+    sprintf_s(name, "the switch started at once: %.1f ms (< 170)", took);
+    Expect(name, up && took >= 0 && took < 170.0);
+    Expect("found gone unannounced: its card made after the switch", s.find(L"made after the switch") != std::wstring::npos);
+    // Its card is there afterwards: hidden as to the tray, it comes back from it.
+    Command(ID_TEST_OPEN, w);
+    Expect("that card brings it back", WaitFor([&] { return IsWindowVisible(w) && !IsIconic(w); }, 3000));
+    Sleep(800);
+    PostMessageW(w, kDestroy, 0, 0);
+    PostMessageW(card, kDestroy, 0, 0);
+    Sleep(500);
+}
+
+// Locked (the lock screen in front) nothing can take the focus: the cases that need it can't run.
+static bool Locked()
+{
+    HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!input)
+        return true;
+    wchar_t name[64]{};
+    GetUserObjectInformationW(input, UOI_NAME, name, sizeof(name), nullptr);
+    CloseDesktop(input);
+    if (_wcsicmp(name, L"Default") != 0)
+        return true;
+    wchar_t title[64]{};
+    GetWindowTextW(GetForegroundWindow(), title, ARRAYSIZE(title));
+    return wcscmp(title, L"Windows 기본 잠금 화면") == 0 || wcscmp(title, L"Windows Default Lock Screen") == 0;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::wstring shots;
-    bool force = false, tray = false, uwp = false;
+    bool force = false, tray = false, uwp = false, late = false;
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"--shots") == 0 && i + 1 < argc)
@@ -395,12 +456,18 @@ int wmain(int argc, wchar_t** argv)
         force |= wcscmp(argv[i], L"--force") == 0;
         tray |= wcscmp(argv[i], L"--tray") == 0;
         uwp |= wcscmp(argv[i], L"--uwp") == 0;
+        late |= wcscmp(argv[i], L"--late") == 0;
     }
     // It sends keys, takes the focus and restarts the app: not while someone is using the PC.
     LASTINPUTINFO last{ sizeof(last) };
     if (!force && GetLastInputInfo(&last) && GetTickCount() - last.dwTime < 60000)
     {
         puts("[SKIP] the PC is in use (input within the last minute); --force runs it anyway");
+        return 0;
+    }
+    if (Locked())
+    {
+        puts("[SKIP] the PC is locked: nothing can take the focus");
         return 0;
     }
     if (!Sidebar() || TraceSize() < 0)
@@ -410,12 +477,14 @@ int wmain(int argc, wchar_t** argv)
     }
     std::wstring app = AppPath();
     HWND user = GetForegroundWindow();
-    if (tray || uwp)
+    if (tray || uwp || late)
     {
         if (tray)
             TrayCase();
         if (uwp)
             UwpCase();
+        if (late)
+            GoneUnseenCase();
         GiveBack(user);
         printf("\n%d checks, %d failed\n", g_run, g_failed);
         return g_failed ? 1 : 0;
