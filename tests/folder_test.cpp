@@ -14,6 +14,8 @@
 //              (opens Calculator and closes it again)
 //     --late   only: a stage window gone unannounced as a switch starts gets its card after the switch
 //     --dock   only: a switch to a maximized window tucks the sidebar once (no slide back out)
+//     --onecard  only: an app whose windows share one card (as KakaoTalk) shows the one used last
+//              (restarts stage-manager twice: with the test listed in OneCardApps, then without)
 //     (all skipped while the PC is locked)
 #include <windows.h>
 #include <dwmapi.h>
@@ -429,6 +431,83 @@ static void GoneUnseenCase()
     Sleep(500);
 }
 
+// Restarts stage-manager (it reads some settings only at start) and waits until it answers again.
+static bool RestartApp(std::wstring const& app)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(Sidebar(), &pid);
+    HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    PostMessageW(Sidebar(), WM_COMMAND, 1, 0);      // ID_EXIT
+    bool exited = proc && WaitForSingleObject(proc, 8000) == WAIT_OBJECT_0;
+    if (proc)
+        CloseHandle(proc);
+    STARTUPINFOW si{ sizeof(si) };
+    PROCESS_INFORMATION pi{};
+    if (!exited || !CreateProcessW(app.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+        return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    WaitFor([] { return Sidebar() != nullptr; }, 5000);
+    Sleep(6000);                                    // set up: cards made, photographed
+    return Sidebar() != nullptr;
+}
+
+// KakaoTalk's windows (its friend list, each chat room) go under one card: the one used last stands for
+// them all. Tried on this program's own windows, listed as such an app (OneCardApps) for the test.
+static void OneCardCase(std::wstring const& app)
+{
+    puts("one card for all of an app's windows (as KakaoTalk's)");
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    bool had = false;
+    auto saved = ReadStrings(L"OneCardApps", &had);
+    WriteStrings(L"OneCardApps", { self }, true);
+    if (!RestartApp(app))
+    {
+        Expect("stage-manager restarted", false);
+        WriteStrings(L"OneCardApps", saved, had);
+        return;
+    }
+    auto cardCount = [](std::wstring const& layout) {
+        auto at = layout.rfind(L"(of ");
+        return at == std::wstring::npos ? -1 : _wtoi(layout.c_str() + at + 4);
+    };
+    auto shownOf = [](std::wstring const& layout) {
+        size_t n = 0;
+        for (size_t at = 0; (at = layout.find(L"onecard test", at)) != std::wstring::npos; ++at)
+            ++n;
+        return n;
+    };
+    long long t = TraceSize();
+    int before = cardCount(LastLayout(t > 200000 ? t - 200000 : 0));
+    HWND w[3] = { MakeWindow(L"onecard test A", RGB(200, 80, 80)), MakeWindow(L"onecard test B", RGB(80, 200, 80)),
+                  MakeWindow(L"onecard test C", RGB(80, 80, 200)) };
+    bool carded = WaitFor([&] { return cardCount(LastLayout(t)) >= before + 3; }, 6000);
+    Sleep(800);
+    auto layout = LastLayout(t);
+    Expect("three windows: three cards, one shown", carded && shownOf(layout) == 1, Narrow(layout));
+    for (int i : { 1, 2 })                          // B, then C, used (on stage, then put away)
+    {
+        GiveBack(w[i]);
+        WaitFor([&] { return GetForegroundWindow() == w[i]; }, 3000);
+        Sleep(1500);
+        long long u = TraceSize();
+        ShowWindow(w[i], SW_MINIMIZE);
+        WaitFor([&] { return IsIconic(w[i]); }, 3000);
+        Sleep(1200);
+        auto l = LastLayout(u);
+        std::wstring want = std::wstring(L"onecard test ") + (i == 1 ? L"B" : L"C");
+        char name[80];
+        sprintf_s(name, "used last, %s is the one card", i == 1 ? "B" : "C");
+        Expect(name, shownOf(l) == 1 && l.find(want) != std::wstring::npos, Narrow(l));
+    }
+    for (HWND h : w)
+        PostMessageW(h, kDestroy, 0, 0);
+    Sleep(500);
+    WriteStrings(L"OneCardApps", saved, had);
+    Expect("stage-manager restarted with the setting put back", RestartApp(app));
+}
+
 // A switch to a maximized window tucks the sidebar away once, whatever the pointer rests on: it used to
 // slide back out and in again (the pointer anywhere on the still full-screen view counted as at the edge).
 static void DockCase()
@@ -489,7 +568,7 @@ int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::wstring shots;
-    bool force = false, tray = false, uwp = false, late = false, dock = false;
+    bool force = false, tray = false, uwp = false, late = false, dock = false, onecard = false;
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"--shots") == 0 && i + 1 < argc)
@@ -499,6 +578,7 @@ int wmain(int argc, wchar_t** argv)
         uwp |= wcscmp(argv[i], L"--uwp") == 0;
         late |= wcscmp(argv[i], L"--late") == 0;
         dock |= wcscmp(argv[i], L"--dock") == 0;
+        onecard |= wcscmp(argv[i], L"--onecard") == 0;
     }
     // It sends keys, takes the focus and restarts the app: not while someone is using the PC.
     LASTINPUTINFO last{ sizeof(last) };
@@ -519,7 +599,7 @@ int wmain(int argc, wchar_t** argv)
     }
     std::wstring app = AppPath();
     HWND user = GetForegroundWindow();
-    if (tray || uwp || late || dock)
+    if (tray || uwp || late || dock || onecard)
     {
         if (tray)
             TrayCase();
@@ -529,6 +609,8 @@ int wmain(int argc, wchar_t** argv)
             GoneUnseenCase();
         if (dock)
             DockCase();
+        if (onecard)
+            OneCardCase(app);
         GiveBack(user);
         printf("\n%d checks, %d failed\n", g_run, g_failed);
         return g_failed ? 1 : 0;

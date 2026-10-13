@@ -30,6 +30,20 @@ namespace
     constexpr UINT ID_MOVE = 20;              // 20..28: send to desktop 1..9
     constexpr size_t kMaxMoveTargets = 9;
 
+    // An app whose windows all go under one card (see Relayout). KakaoTalk: its chat rooms are windows
+    // of their own, and a card for each crowded the sidebar. More can be listed in the registry
+    // (HKCU\Software\StageManager, OneCardApps: executable paths; read at start, used by the tests).
+    std::vector<std::wstring> g_oneCardApps;
+
+    bool OneCardApp(std::wstring const& app)
+    {
+        constexpr wchar_t kKakao[] = L"\\KakaoTalk.exe";
+        size_t n = ARRAYSIZE(kKakao) - 1;
+        if (app.size() >= n && _wcsicmp(app.c_str() + app.size() - n, kKakao) == 0)
+            return true;
+        return std::any_of(g_oneCardApps.begin(), g_oneCardApps.end(), [&](auto& a) { return wt::SameApp(a, app); });
+    }
+
     // "<name>로 보내기" / "<name>으로 보내기": 으로 after a final consonant other than ㄹ (and after the
     // digits read that way: 3 삼, 6 육, 0 영).
     std::wstring SendLabel(std::wstring const& name)
@@ -598,6 +612,7 @@ void Stage::LoadLayout()
         m_savedFolders.push_back(std::move(s));
     }
     m_savedOrder = ReadStrings(L"Order");
+    g_oneCardApps = ReadStrings(L"OneCardApps");
 }
 
 void Stage::SaveLayout() const
@@ -2903,8 +2918,29 @@ void Stage::Relayout(bool animate)
         f->shown = false;
     std::vector<CardFolder*> placed;
     size_t slots = 0;
+    // Apps whose windows share one card (KakaoTalk: its friend list and every chat room): the one used
+    // last (put away last) stands for them all; the others stay out of the sidebar, keeping their
+    // pictures, and take its place when it goes on stage.
+    std::vector<std::shared_ptr<Card>> standIns;
     for (auto& c : m_cards)
     {
+        if (!OneCardApp(c->app) || c->pinned || !Here(*c) || FolderOf(c->hwnd))
+            continue;
+        auto same = std::find_if(standIns.begin(), standIns.end(), [&](auto& s) { return wt::SameApp(s->app, c->app); });
+        if (same == standIns.end())
+            standIns.push_back(c);
+        else if (c->cardedAt > (*same)->cardedAt)
+            *same = c;
+    }
+    for (auto& c : m_cards)
+    {
+        if (OneCardApp(c->app) && !c->pinned && Here(*c) && !FolderOf(c->hwnd) &&
+            std::find(standIns.begin(), standIns.end(), c) == standIns.end())
+        {
+            if (c->side.holder)
+                c->side.holder.IsVisible(false);
+            continue;
+        }
         // A pinned card keeps its place, but its window on stage takes it out of the sidebar like any
         // other; it comes back to that place when the window leaves.
         if (c->pinned && OnStage(c->hwnd))
