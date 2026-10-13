@@ -178,6 +178,29 @@ namespace wt
         return r;
     }
 
+    bool Restore(HWND hwnd)
+    {
+        if (!IsIconic(hwnd))
+            return false;                           // already back: a restore would undo a maximize
+        if (PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0))
+            return true;
+        RestoreDirectly(hwnd);                      // refused (full queue; UIPI lets this one through)
+        return false;
+    }
+
+    bool RestoreIgnored(HWND hwnd)
+    {
+        // A hung app has the command queued: a second restore would only undo it once it wakes up.
+        return IsWindow(hwnd) && IsIconic(hwnd) && !IsHungAppWindow(hwnd);
+    }
+
+    void RestoreDirectly(HWND hwnd)
+    {
+        WINDOWPLACEMENT wp{ sizeof(wp) };
+        bool maximized = GetWindowPlacement(hwnd, &wp) && (wp.flags & WPF_RESTORETOMAXIMIZED);
+        ShowWindowAsync(hwnd, maximized ? SW_SHOWMAXIMIZED : SW_RESTORE);
+    }
+
     static bool IsDialog(HWND hwnd)
     {
         wchar_t cls[16]{};

@@ -19,6 +19,16 @@ namespace wt
     std::vector<HWND> EnumManageable(HMONITOR monitor, bool otherDesktops = false);   // top of z-order first
     RECT FrameRect(HWND hwnd);                              // visible frame, without invisible resize borders
     RECT RestoreRect(HWND hwnd, bool* maximized = nullptr); // window rect a minimized window comes back to
+    // Brings a minimized window back as it was minimized (maximized, snapped, normal) with one restore
+    // only, the taskbar's: a second one would land on a window the first already brought back, and
+    // Windows takes that as "restore down". Does nothing to a window not minimized. Returns whether
+    // the command went to the app, which should then be checked after kRestoreAnswerMs (RestoreIgnored).
+    bool Restore(HWND hwnd);
+    constexpr UINT kRestoreAnswerMs = 150;
+    bool RestoreIgnored(HWND hwnd);                         // still minimized, though not hung: restore it directly
+    // Restores without asking the app. SW_SHOWMAXIMIZED for a window minimized from maximized: unlike
+    // SW_RESTORE it is harmless should the app's own restore still be on its way.
+    void RestoreDirectly(HWND hwnd);
     std::wstring ProcessPath(HWND hwnd);                    // full path of the window's executable
     // Which app a window belongs to: its executable, or for a browser web app (YouTube or GitHub
     // installed from Chrome/Edge) "executable#web app id", so it is not mistaken for the browser,

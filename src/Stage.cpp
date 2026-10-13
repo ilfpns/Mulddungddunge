@@ -85,7 +85,6 @@ namespace
     constexpr UINT_PTR kTimerReconcile = 24;  // after window changes we have no direct event for (Reconcile)
     constexpr UINT kReconcileMs = 30;         // lets a burst of events (a desktop switch) settle into one check
     constexpr UINT_PTR kTimerRestoreCheck = 25;   // a window sent the restore command: did it come back?
-    constexpr UINT kRestoreCheckMs = 150;
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -4563,33 +4562,17 @@ void Stage::BringBack(HWND hwnd)
 {
     if (!IsWindowVisible(hwnd))
         ShowWindowAsync(hwnd, SW_SHOW);
-    if (IsIconic(hwnd))
+    if (wt::Restore(hwnd) && g_stage)
     {
-        // One restore only, the taskbar's. A second one lands on a window the first already brought
-        // back maximized (or snapped), and Windows takes it as "restore down": it came back smaller.
-        if (!PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0))
-            RestoreDirectly(hwnd);                  // not ours to message (an elevated window)
-        else if (g_stage)
-        {
-            // An app that ignores the command is restored directly, once it has had time to answer.
-            auto& checks = g_stage->m_restoreChecks;
-            if (std::find(checks.begin(), checks.end(), hwnd) == checks.end())
-                checks.push_back(hwnd);
-            SetTimer(g_stage->m_sidebar, kTimerRestoreCheck, kRestoreCheckMs, nullptr);
-        }
+        // An app that ignores the command is restored directly, once it has had time to answer.
+        auto& checks = g_stage->m_restoreChecks;
+        if (std::find(checks.begin(), checks.end(), hwnd) == checks.end())
+            checks.push_back(hwnd);
+        SetTimer(g_stage->m_sidebar, kTimerRestoreCheck, wt::kRestoreAnswerMs, nullptr);
     }
     // An unowned dialog blocking it was put away with it (see Minimize); owned ones follow by themselves.
     if (HWND dialog = wt::ModalDialog(hwnd); dialog && IsIconic(dialog))
         ShowWindowAsync(dialog, SW_RESTORE);
-}
-
-// Restores a minimized window to the state it was minimized from. SW_SHOWMAXIMIZED for one that was
-// maximized: unlike SW_RESTORE it is harmless should a restore already be on its way.
-void Stage::RestoreDirectly(HWND hwnd)
-{
-    WINDOWPLACEMENT wp{ sizeof(wp) };
-    bool maximized = GetWindowPlacement(hwnd, &wp) && (wp.flags & WPF_RESTORETOMAXIMIZED);
-    ShowWindowAsync(hwnd, maximized ? SW_SHOWMAXIMIZED : SW_RESTORE);
 }
 
 // Minimizes a window leaving the stage, together with an unowned dialog blocking it, which would
@@ -5194,12 +5177,10 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             for (HWND h : m_restoreChecks)
             {
-                // Still minimized: the app ignored the restore command. A hung one has it queued, and
-                // a second restore would only undo the first once it wakes up.
-                if (IsWindow(h) && IsIconic(h) && !IsHungAppWindow(h))
+                if (wt::RestoreIgnored(h))
                 {
                     Trace(L"restore command ignored: restoring directly", h);
-                    RestoreDirectly(h);
+                    wt::RestoreDirectly(h);
                 }
             }
             m_restoreChecks.clear();

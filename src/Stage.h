@@ -257,7 +257,6 @@ private:
     Pose TargetPose(Card const& c) const;
     static void ForceForeground(HWND hwnd);
     static void BringBack(HWND hwnd);
-    static void RestoreDirectly(HWND hwnd);
     static void Minimize(HWND hwnd);
     void OnHidden(HWND hwnd);
     void GrowView();                                // whole monitor, for a transition

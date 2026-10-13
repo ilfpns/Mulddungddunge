@@ -13,6 +13,7 @@
   - `Snapshot.*`: D3D/D2D 장치, 창 캡처, 아이콘, 대체 카드
   - `WindowTracker.*`: 관리 대상 창 판별, 앱 식별, 창 위치
   - `Audio.*`: 앱별 소리 재생·음소거 감지 / `VirtualDesktop.*`: 가상 데스크톱
+- `tests/`: 시험 프로그램 (`restore_test.cpp`: 카드에서 다시 띄운 창의 크기·최대화·스냅 유지)
 - `res/`: 아이콘, 버전 정보, 매니페스트
 - `packaging/`: 설치·제거·패키지 스크립트 / `tools/`: 빌드 도구 설치
 - `docs/`: 기록과 점검표만 두고 앱 코드를 넣지 않는다.
@@ -67,6 +68,7 @@
 - `build.bat` → `bin\stage-manager.exe` (x64 Release, `/O2 /MT`)
 - 실행 중 덮어쓰기: 실행 중인 프로세스를 종료 → 파일 잠금이 풀릴 때까지 기다린 뒤 복사 → 다시 실행
 - 패키지: `powershell -ExecutionPolicy Bypass -File packaging\package.ps1` → `dist\`
+- 시험: `tests\run-tests.bat` (앱을 끄고 실행, 시험 창이 잠깐 뜸) / `--snap` Win+Left 스냅 포함 / `--e2e` 실행 중인 앱으로 Alt+1 왕복만 (키 입력을 보내고 무대 창을 잠시 카드로 보냄)
 - 진단: 빈 파일 `%TEMP%\stage-manager.trace`를 만들고 시작하면 이벤트와 반응 시간(`took N ms`)이 기록된다.
 - 시험 훅: 창 클래스 `StageManagerSidebar`에 `WM_COMMAND` 6(설정), 7(앱 종료, lParam=hwnd), 8(크기 맞추기 후 열기, lParam=hwnd)
 
