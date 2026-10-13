@@ -13,7 +13,7 @@
   - `Snapshot.*`: D3D/D2D 장치, 창 캡처, 아이콘, 대체 카드
   - `WindowTracker.*`: 관리 대상 창 판별, 앱 식별, 창 위치
   - `Audio.*`: 앱별 소리 재생·음소거 감지 / `VirtualDesktop.*`: 가상 데스크톱
-- `tests/`: 시험 프로그램 (`restore_test.cpp`: 카드에서 다시 띄운 창의 크기·최대화·스냅 유지 / `capture_memory_test.cpp`: 창 사진을 반복해 찍어도 GPU 메모리가 늘지 않음)
+- `tests/`: 시험 프로그램 (`restore_test.cpp`: 카드에서 다시 띄운 창의 크기·최대화·스냅 유지 / `capture_memory_test.cpp`: 창 사진을 반복해 찍어도 GPU 메모리가 늘지 않음 / `folder_test.cpp`: 실행 중인 앱으로 폴더 묶기·이름·Alt 번호·모두 열기·알림 표시·재시작 후 폴더와 순서 유지)
 - `res/`: 아이콘, 버전 정보, 매니페스트
 - `packaging/`: 설치·제거·패키지 스크립트 / `tools/`: 빌드 도구 설치
 - `docs/`: 기록과 점검표만 두고 앱 코드를 넣지 않는다.
@@ -69,9 +69,10 @@
 - `build.bat` → `bin\stage-manager.exe` (x64 Release, `/O2 /MT`)
 - 실행 중 덮어쓰기: 실행 중인 프로세스를 종료 → 파일 잠금이 풀릴 때까지 기다린 뒤 복사 → 다시 실행
 - 패키지: `powershell -ExecutionPolicy Bypass -File packaging\package.ps1` → `dist\`
-- 시험: `tests\run-tests.bat` (앱을 끄고 실행, 시험 창이 잠깐 뜸) / `--snap` Win+Left 스냅 포함 / `--e2e` 실행 중인 앱으로 Alt+1 왕복만 (키 입력을 보내고 무대 창을 잠시 카드로 보냄)
+- 시험: `tests\run-tests.bat` (앱을 끄고 실행, 시험 창이 잠깐 뜸) / `--snap` Win+Left 스냅 포함 / `--e2e` 실행 중인 앱으로 Alt+1 왕복만 (키 입력을 보내고 무대 창을 잠시 카드로 보냄) / `--folders [--shots <폴더>]` 실행 중인 앱(trace 켠 상태)으로 폴더 시험만 (앱을 한 번 재시작, 저장된 폴더·순서는 원래대로 돌려놓음)
+- 사용자가 컴퓨터를 쓰는 중에는 키 입력을 보내는 시험(`--snap`, `--e2e`, `--folders`)을 돌리지 않는다: 사용자의 Alt+숫자와 섞여 결과가 틀리고 작업을 방해한다. 시험 프로그램이 최근 1분 안에 입력이 있었으면 스스로 건너뛴다(`[SKIP]`, `--force`로 강제). 다른 데스크톱·숨은 데스크톱에서는 키 입력과 화면 합성이 동작하지 않아 대신할 수 없다
 - 진단: 빈 파일 `%TEMP%\stage-manager.trace`를 만들고 시작하면 이벤트와 반응 시간(`took N ms`)이 기록된다.
-- 시험 훅: 창 클래스 `StageManagerSidebar`에 `WM_COMMAND` 6(설정), 7(앱 종료, lParam=hwnd), 8(크기 맞추기 후 열기, lParam=hwnd)
+- 시험 훅: 창 클래스 `StageManagerSidebar`에 `WM_COMMAND` 6(설정), 7(앱 종료, lParam=hwnd), 8(크기 맞추기 후 열기, lParam=hwnd), 9·10·11(그 창이 든 폴더: 풀기·이름 바꾸기·모두 열기, lParam=hwnd), 30(대상 카드 표시), 31(lParam 창의 카드를 대상 위에 들고 있기 = 폴더로 묶기), 32(lParam 창의 카드를 대상에 놓기 = 순서 옮기기)
 
 ## 확인 절차 (작업을 끝냈다고 말하기 전에)
 1. 빌드 오류·경고가 없고, `%TEMP%\stage-manager.log`에 새 오류가 없다.

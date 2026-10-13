@@ -60,6 +60,8 @@ private:
     // part of making a card.
     winrt::com_ptr<IWICFormatConverter> CachedIcon(HWND hwnd);
     std::vector<std::pair<std::wstring, winrt::com_ptr<IWICFormatConverter>>> m_icons;
+    std::pair<HWND, winrt::com_ptr<IWICFormatConverter>> m_frameIcon{};    // a UWP window's, just asked for
+    ULONGLONG m_frameIconAt = 0;
     std::vector<std::pair<std::wstring, uint32_t>> m_logoColors;
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_device{ nullptr };
     wuc::CompositionGraphicsDevice m_graphics{ nullptr };

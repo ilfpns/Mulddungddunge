@@ -16,6 +16,8 @@ struct CardVis
     wuc::SpriteVisual glass{ nullptr };     // blurred backdrop under a glass stand-in; follows the sprite
     wuc::SpriteVisual sound{ nullptr };     // speaker: its app is playing sound
     wuc::ContainerVisual grid{ nullptr };   // a folder card: its windows' pictures, 2 x 2
+    wuc::SpriteVisual label{ nullptr };     // a folder card: its name, across the bottom edge
+    mutable float2 labelSize{};
     // Where the holder was last sent (set or animated to). Reading Offset back gives the last value
     // set, not where an animation took it, so a card that had slid would jump back and slide again.
     mutable float2 at{ -1e9f, -1e9f };
@@ -76,6 +78,8 @@ struct CardFolder
     std::vector<HWND> members;      // in the order its grid shows them, at most kFolderMax
     std::shared_ptr<Card> card;     // what the sidebar shows for it
     bool shown = false;             // has a slot in the current layout
+    std::wstring name;              // given with 이름 바꾸기 (empty: none shown)
+    int saved = 0;                  // the saved folder it is (Stage::m_savedFolders), 0: not saved yet
 };
 
 // Where a card sits: center in target coords, uniform scale, Y rotation.
@@ -181,6 +185,12 @@ private:
     // "크기 맞추기": the window takes one saved place and size (its visible frame lands there, whatever
     // invisible borders the app has).
     void FitToSaved(HWND hwnd);
+    void PlaceFrame(HWND hwnd, RECT const& frame);  // visible frame there, minimized or not
+    // 모두 열기: the folder's windows on stage together, splitting the screen (2: halves, 3: a half and
+    // two quarters, 4: quarters). The first flies out of the folder's card like a switch.
+    void OpenWholeFolder(std::shared_ptr<CardFolder> f);
+    void FolderCommand(UINT command, std::shared_ptr<CardFolder> f);
+    HWND m_testMark{};                              // WM_COMMAND test hooks: the card a grouping goes to
     void FitAndOpen(HWND hwnd);                     // then brings it on stage
     // Virtual desktops: the sidebar only shows windows of the desktop being looked at.
     GUID DesktopOf(HWND hwnd) const;                // asks Explorer (a cross-process call)
@@ -389,7 +399,7 @@ private:
     void InsertReturning(std::shared_ptr<Card> card);   // a card back from the stage: where it belongs
     bool CanGroup(Card const& dragged, Card const& target) const;
     bool Group(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target);
-    void LeaveFolder(HWND hwnd);
+    void LeaveFolder(HWND hwnd, bool byUser = true);   // byUser false: its window closed
     void Dissolve(std::shared_ptr<CardFolder> f);
     void PruneFolders();
     void OpenFolder(std::shared_ptr<CardFolder> f, bool byKey);
@@ -398,6 +408,41 @@ private:
     std::shared_ptr<Card> MakeFolderCard();
     wuc::CompositionDrawingSurface FolderBackground(Card const& c);
     void FillFolderGrid(CardVis const& v, Card& folderCard);
+    void SetFolderLabel(CardVis const& v, Card const& folderCard);  // its name tag, drawn again
+    float2 LabelOffset(Card const& c, Pose const& p, float2 size) const;
+    // 이름 바꾸기: a text box over the folder's card. Enter or clicking elsewhere keeps the name, Esc
+    // leaves it as it was.
+    void BeginRename(std::shared_ptr<CardFolder> f);
+    void EndRename(bool keep);
+    static LRESULT CALLBACK RenameProc(HWND, UINT, WPARAM, LPARAM);
+    // Folders and the order cards were moved into by hand, kept across restarts. Windows are new after
+    // a restart, so both are kept by app: a saved folder forms again once windows of two of its apps
+    // are in the sidebar (also ones opened later), and fills up as more of them come. Only what the
+    // user does changes them: a folder that came apart because its windows closed stays saved.
+    struct SavedFolder
+    {
+        int id = 0;
+        std::wstring name;
+        GUID desktop{};
+        std::vector<std::wstring> apps;             // its windows' apps, in its order
+        // Of those, the ones a window was put in for this run (not saved). Only the others are filled
+        // from windows that come: one whose window closed is not refilled by another of that app.
+        std::vector<std::wstring> filled;
+    };
+    std::vector<SavedFolder> m_savedFolders;
+    int m_savedIds = 0;
+    std::vector<std::wstring> m_savedOrder;         // apps of the cards, top first, as last arranged by hand
+    void LoadLayout();
+    void SaveLayout() const;
+    void RememberFolder(CardFolder& f);             // the user made or changed it
+    void ForgetFolder(CardFolder& f);               // the user took it apart
+    void RestoreFolders();                          // saved folders whose apps' windows are here
+    void ApplySavedOrder();                         // at start: the cards found take the saved order
+    void SaveOrder();                               // a card was moved by hand
+    HWND m_renameEdit{};
+    WNDPROC m_renameEditProc{};
+    HFONT m_renameFont{};
+    std::weak_ptr<CardFolder> m_renameFolder;
     void RefreshFolderBadges(CardFolder& f);
     // A folder's windows in the sidebar (not the one on stage), in its order: its grid, its numbers.
     std::vector<std::shared_ptr<Card>> InSidebar(CardFolder const& f) const;
@@ -405,6 +450,15 @@ private:
     int HotkeyCount() const;                        // how many Alt+number keys that needs (at least the card count)
     size_t HotkeyOrderOf(Card const& folderCard) const;
     void RegisterHotkeys();
+    // Holding the hotkey modifier (Alt) for a moment shows each card's number on it. Keys come as raw
+    // input (no hook in the way of other apps' typing); only the modifiers are looked at.
+    void OnRawKey(USHORT vk, bool down);
+    bool HotkeyModifiersHeld() const;               // exactly the modifiers of the Alt+number keys
+    void ShowNumbers(bool show);
+    bool m_numbersShown = false;
+    bool m_numbersPending = false;                  // kTimerNumbers armed
+    bool m_otherKey = false;                        // another key was pressed with the modifiers down
+    std::vector<std::pair<wuc::ContainerVisual, wuc::SpriteVisual>> m_numberBadges;   // holder, number
     void SwitchToCard(std::shared_ptr<Card> next, Pose from);
     // Clicking the empty desktop (like macOS): every stage window flies into its card.
     bool DesktopClicked(HWND foreground);
@@ -421,6 +475,7 @@ private:
     GUID DesktopMovedTo(HWND foreground);
     bool UserSwitchedMidTransition(HWND hwnd) const;
     std::vector<HWND> m_leaving;                    // windows put away by the current/last transition
+    std::vector<HWND> m_lateCards;                  // stage windows gone unseen: their new cards, once it ends
     // Windows we asked to minimize (ShowWindowAsync: it lands later), and when. A minimize that lands
     // after the window was picked again is ours and stale, not the user's.
     std::vector<std::pair<HWND, ULONGLONG>> m_selfMinimized;

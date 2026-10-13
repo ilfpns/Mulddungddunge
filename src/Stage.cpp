@@ -16,6 +16,12 @@ namespace
     constexpr UINT ID_QUIT = 7;
     constexpr UINT ID_FIT = 8;                // the card's window takes the saved place and size
     constexpr UINT ID_UNFOLD = 9;             // a folder's windows go back to cards of their own
+    constexpr UINT ID_RENAME = 10;            // a folder gets a name, shown on its card
+    constexpr UINT ID_OPEN_ALL = 11;          // a folder's windows on stage together, side by side
+    // Test hooks (WM_COMMAND to the StageManagerSidebar window, lParam = a window):
+    constexpr UINT ID_TEST_MARK = 30;         // remember this window's card as the target
+    constexpr UINT ID_TEST_GROUP = 31;        // this window's card held over the target: a folder
+    constexpr UINT ID_TEST_MOVE = 32;         // this window's card dropped on the target: moved by hand
     // Where "크기 맞추기" puts a window: the visible frame of the Orca window as it was on 2026-09-30,
     // in screen pixels (left, top, right, bottom). Fixed on purpose.
     constexpr RECT kFitFrame = { 252, 52, 2228, 1377 };
@@ -85,6 +91,10 @@ namespace
     constexpr UINT_PTR kTimerReconcile = 24;  // after window changes we have no direct event for (Reconcile)
     constexpr UINT kReconcileMs = 30;         // lets a burst of events (a desktop switch) settle into one check
     constexpr UINT_PTR kTimerRestoreCheck = 25;   // a window sent the restore command: did it come back?
+    constexpr UINT_PTR kTimerRenameEnd = 26;  // the folder name box lost the focus: keep what was typed
+    constexpr UINT_PTR kTimerNumbers = 27;    // the hotkey modifier held this long: cards show their numbers
+    constexpr UINT kNumbersDelayMs = 450;     // a quick Alt+Tab or Alt+number shows nothing
+    constexpr USHORT kNoKey = 0xFF;           // a virtual key no app uses (see ShowNumbers)
     constexpr ULONGLONG kQueuedMaxAge = 1200; // ...unless it is this old by then (the user moved on)
     constexpr UINT_PTR kTimerSweep = 11;      // after a window left the taskbar: was it closed or only hidden?    // a transition still running after this long is forced to end
     constexpr UINT kWatchdogMs = 3000;         // re-evaluate the dock once a closing/minimizing window is gone
@@ -377,6 +387,7 @@ bool Stage::Init(HINSTANCE inst)
     m_snap.Init(m_compositor);
     m_snap.SetQuality(m_cfg.quality);
     LoadPins();
+    LoadLayout();
     m_desktops = winrt::try_create_instance<IVirtualDesktopManager>(CLSID_VirtualDesktopManager);
 
     Dock();
@@ -528,6 +539,210 @@ void Stage::SavePins() const
         static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
 }
 
+namespace
+{
+    std::vector<std::wstring> ReadStrings(wchar_t const* name)
+    {
+        std::vector<std::wstring> out;
+        DWORD size = 0;
+        if (RegGetValueW(HKEY_CURRENT_USER, kStateKey, name, RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || !size)
+            return out;
+        std::wstring buffer(size / sizeof(wchar_t), L'\0');
+        if (RegGetValueW(HKEY_CURRENT_USER, kStateKey, name, RRF_RT_REG_MULTI_SZ, nullptr, buffer.data(), &size) != ERROR_SUCCESS)
+            return out;
+        for (wchar_t const* p = buffer.c_str(); *p; p += wcslen(p) + 1)
+            out.emplace_back(p);
+        return out;
+    }
+
+    void WriteStrings(wchar_t const* name, std::vector<std::wstring> const& strings)
+    {
+        std::wstring buffer;
+        for (auto& s : strings)
+            buffer.append(s).push_back(L'\0');
+        buffer.push_back(L'\0');
+        RegSetKeyValueW(HKEY_CURRENT_USER, kStateKey, name, REG_MULTI_SZ, buffer.data(),
+            static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
+    }
+
+    std::vector<std::wstring> SplitTabs(std::wstring const& s)
+    {
+        std::vector<std::wstring> parts;
+        size_t start = 0;
+        for (size_t tab; (tab = s.find(L'\t', start)) != std::wstring::npos; start = tab + 1)
+            parts.push_back(s.substr(start, tab - start));
+        parts.push_back(s.substr(start));
+        return parts;
+    }
+}
+
+// "Folders": one entry per folder, "id \t desktop \t name \t app \t app...". "Order": apps, top first.
+void Stage::LoadLayout()
+{
+    for (auto& entry : ReadStrings(L"Folders"))
+    {
+        auto parts = SplitTabs(entry);
+        if (parts.size() < 5)
+            continue;
+        SavedFolder s;
+        s.id = _wtoi(parts[0].c_str());
+        if (s.id <= 0 || FAILED(CLSIDFromString(parts[1].c_str(), &s.desktop)))
+            s.desktop = GUID_NULL;
+        if (s.id <= 0)
+            continue;
+        s.name = parts[2];
+        s.apps.assign(parts.begin() + 3, parts.end());
+        m_savedIds = std::max(m_savedIds, s.id);
+        m_savedFolders.push_back(std::move(s));
+    }
+    m_savedOrder = ReadStrings(L"Order");
+}
+
+void Stage::SaveLayout() const
+{
+    std::vector<std::wstring> folders;
+    for (auto& s : m_savedFolders)
+    {
+        wchar_t desktop[64]{};
+        StringFromGUID2(s.desktop, desktop, ARRAYSIZE(desktop));
+        std::wstring entry = std::to_wstring(s.id) + L'\t' + desktop + L'\t' + s.name;
+        for (auto& app : s.apps)
+            entry += L'\t' + app;
+        folders.push_back(entry);
+    }
+    WriteStrings(L"Folders", folders);
+    WriteStrings(L"Order", m_savedOrder);
+}
+
+void Stage::RememberFolder(CardFolder& f)
+{
+    if (!f.saved)
+    {
+        f.saved = ++m_savedIds;
+        m_savedFolders.push_back({ f.saved });
+    }
+    auto s = std::find_if(m_savedFolders.begin(), m_savedFolders.end(), [&](auto& x) { return x.id == f.saved; });
+    if (s == m_savedFolders.end())
+        return;
+    s->name = f.name;
+    s->apps.clear();
+    s->desktop = f.card ? f.card->desktop : m_desktopId;
+    for (HWND h : f.members)
+        if (auto c = CardOf(h); c && !c->app.empty())
+            s->apps.push_back(c->app);
+    s->filled = s->apps;                            // as the user made it: nothing to fill
+    SaveLayout();
+}
+
+void Stage::ForgetFolder(CardFolder& f)
+{
+    if (!f.saved)
+        return;
+    std::erase_if(m_savedFolders, [&](auto& x) { return x.id == f.saved; });
+    f.saved = 0;
+    SaveLayout();
+}
+
+void Stage::RestoreFolders()
+{
+    for (auto& s : m_savedFolders)
+    {
+        auto live = std::find_if(m_folders.begin(), m_folders.end(), [&](auto& f) { return f->saved == s.id; });
+        std::shared_ptr<CardFolder> f = live != m_folders.end() ? *live : nullptr;
+        size_t wanted = std::min(s.apps.size(), kFolderMax);
+        if ((f && f->members.size() >= wanted) || s.filled.size() >= wanted)
+            continue;
+        // Its apps no window was put in for yet this run, then a free sidebar card for each.
+        std::vector<std::wstring> missing(s.apps.begin(), s.apps.begin() + wanted);
+        for (auto& done : s.filled)
+            if (auto it = std::find_if(missing.begin(), missing.end(), [&](auto& a) { return wt::SameApp(a, done); }); it != missing.end())
+                missing.erase(it);
+        std::vector<std::shared_ptr<Card>> found;
+        for (auto& app : missing)
+            for (auto& c : m_cards)
+                if (!c->isFolder && !c->pinned && !FolderOf(c->hwnd) && IsWindow(c->hwnd) &&
+                    (s.desktop == GUID_NULL || c->desktop == s.desktop) && wt::SameApp(c->app, app) &&
+                    std::find(found.begin(), found.end(), c) == found.end())
+                {
+                    found.push_back(c);
+                    break;
+                }
+        if (found.empty() || (!f && found.size() < 2))
+            continue;
+        for (auto& c : found)
+            s.filled.push_back(c->app);
+        for (auto& c : found)
+            if (c->side.holder)
+            {
+                m_sideContent.Children().Remove(c->side.holder);
+                c->side = {};
+            }
+        if (!f)
+        {
+            // Formed where its first window's card is, its windows next to each other there.
+            f = std::make_shared<CardFolder>();
+            f->id = ++m_folderIds;
+            f->saved = s.id;
+            f->name = s.name;
+            f->card = MakeFolderCard();
+            f->card->desktop = found.front()->desktop;
+            f->card->folderOf = f;
+            m_folders.push_back(f);
+            size_t at = std::find(m_cards.begin(), m_cards.end(), found.front()) - m_cards.begin();
+            std::erase_if(m_cards, [&](auto& c) { return std::find(found.begin(), found.end(), c) != found.end(); });
+            for (auto& c : found)
+                f->members.push_back(c->hwnd);
+            m_cards.insert(m_cards.begin() + std::min(at, m_cards.size()), found.begin(), found.end());
+            Trace((L"saved folder formed again: " + s.name).c_str());
+        }
+        else
+        {
+            for (auto& c : found)
+            {
+                f->members.push_back(c->hwnd);
+                m_cards.erase(std::find(m_cards.begin(), m_cards.end(), c));
+                InsertReturning(c);                 // next to the folder's other windows
+            }
+            Trace((L"saved folder filled up: " + s.name).c_str());
+        }
+    }
+}
+
+void Stage::ApplySavedOrder()
+{
+    if (m_savedOrder.empty())
+        return;
+    std::vector<bool> used(m_savedOrder.size());
+    std::vector<std::pair<size_t, std::shared_ptr<Card>>> ranked;
+    for (auto& c : m_cards)
+    {
+        size_t rank = SIZE_MAX;                     // not in the saved order: after those that are
+        for (size_t i = 0; i < m_savedOrder.size(); ++i)
+            if (!used[i] && wt::SameApp(m_savedOrder[i], c->app))
+            {
+                used[i] = true;
+                rank = i;
+                break;
+            }
+        ranked.push_back({ rank, c });
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    m_cards.clear();
+    for (auto& [rank, c] : ranked)
+        m_cards.push_back(c);
+    m_manualOrder = true;
+    Trace(L"saved card order applied");
+}
+
+void Stage::SaveOrder()
+{
+    m_savedOrder.clear();
+    for (auto& c : m_cards)
+        if (!c->isFolder && !c->app.empty())
+            m_savedOrder.push_back(c->app);
+    SaveLayout();
+}
+
 bool Stage::StartsWithWindows()
 {
     return RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
@@ -578,6 +793,8 @@ void Stage::OpenCardMenu(int index, int anchorY)
     {
         m_menu.items = {
             card->pinned ? MenuItem{ ID_UNPIN, L"\xE77A", L"고정 해제" } : MenuItem{ ID_PIN, L"\xE718", L"폴더 고정" },
+            MenuItem{ ID_OPEN_ALL, L"\xF0E2", L"모두 열기" },
+            MenuItem{ ID_RENAME, L"\xE8AC", L"이름 바꾸기" },
             MenuItem{ ID_UNFOLD, L"\xE8B7", L"폴더 풀기" },
             MenuItem{ 0, nullptr, nullptr },
         };
@@ -898,6 +1115,31 @@ void Stage::SetMenuHover(int item)
     }
 }
 
+// 모두 열기, 이름 바꾸기, 폴더 풀기: from the folder's menu, or WM_COMMAND with one of its windows.
+void Stage::FolderCommand(UINT command, std::shared_ptr<CardFolder> f)
+{
+    if (!f)
+        return;
+    if (command == ID_OPEN_ALL)
+        OpenWholeFolder(f);
+    else if (command == ID_RENAME)
+        BeginRename(f);
+    else if (command == ID_UNFOLD)
+    {
+        Trace(L"folder unfolded");
+        float2 center{};
+        bool from = f->card && f->card->side.holder;
+        if (from)
+            center = f->card->side.at;
+        auto cards = InSidebar(*f);
+        ForgetFolder(*f);
+        Dissolve(f);
+        Relayout(true);
+        if (from)
+            SpreadFrom(center, cards);              // its windows come out of where it was
+    }
+}
+
 void Stage::RunMenuItem(int item)
 {
     UINT command = m_menu.items[item].command;
@@ -908,21 +1150,9 @@ void Stage::RunMenuItem(int item)
         SetPinned(*card, command == ID_PIN);
         return;
     }
-    if (command == ID_UNFOLD)
+    if (command == ID_OPEN_ALL || command == ID_RENAME || command == ID_UNFOLD)
     {
-        if (auto f = card ? card->folderOf.lock() : nullptr)
-        {
-            Trace(L"folder unfolded");
-            float2 center{};
-            bool from = f->card && f->card->side.holder;
-            if (from)
-                center = f->card->side.at;
-            auto cards = InSidebar(*f);
-            Dissolve(f);
-            Relayout(true);
-            if (from)
-                SpreadFrom(center, cards);          // its windows come out of where it was
-        }
+        FolderCommand(command, card ? card->folderOf.lock() : nullptr);
         return;
     }
     if (command != ID_SETTINGS && (!card || !IsWindow(card->hwnd)))
@@ -1315,6 +1545,66 @@ void Stage::RestoreTouchpadGesture()
     Trace(L"touchpad: three-finger swipe setting restored");
 }
 
+void Stage::OpenWholeFolder(std::shared_ptr<CardFolder> f)
+{
+    if (!f || m_busy || m_dragging)
+        return;
+    std::vector<std::shared_ptr<Card>> cards;      // its windows in the sidebar, in its order
+    for (HWND h : f->members)
+        if (auto c = CardOf(h); c && IsWindow(h) && !wt::IsCloaked(h) && std::find(m_cards.begin(), m_cards.end(), c) != m_cards.end())
+            cards.push_back(c);
+    if (cards.empty())
+        return;
+    Trace(L"folder opened whole");
+    if (cards.size() > 1)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(m_mon, &mi);
+        RECT w = mi.rcWork;
+        LONG x = (w.left + w.right) / 2, y = (w.top + w.bottom) / 2;
+        std::vector<RECT> tiles;
+        if (cards.size() == 2)
+            tiles = { { w.left, w.top, x, w.bottom }, { x, w.top, w.right, w.bottom } };
+        else if (cards.size() == 3)
+            tiles = { { w.left, w.top, x, w.bottom }, { x, w.top, w.right, y }, { x, y, w.right, w.bottom } };
+        else
+            tiles = { { w.left, w.top, x, y }, { x, w.top, w.right, y }, { w.left, y, x, w.bottom }, { x, y, w.right, w.bottom } };
+        for (size_t i = 0; i < cards.size() && i < tiles.size(); ++i)
+            PlaceFrame(cards[i]->hwnd, tiles[i]);   // while minimized: they come up there
+    }
+    CloseFolder();
+    // The first flies out of the folder's card (as Alt+number does), the others come up beside it.
+    auto first = cards.front();
+    int slot = SlotOf(*first);
+    Pose from = SlotPose(*first, static_cast<size_t>(std::max(slot, 0)));
+    from.center = SideToAnim(from.center);
+    from.scale *= 0.45f;
+    Prefetch();
+    SwitchToCard(first, from);
+    if (!m_busy)
+        return;
+    for (size_t i = 1; i < cards.size(); ++i)
+    {
+        auto& c = cards[i];
+        if (!c->pinned)
+        {
+            if (auto it = std::find(m_cards.begin(), m_cards.end(), c); it != m_cards.end())
+            {
+                c->homeIndex = static_cast<int>(it - m_cards.begin());
+                m_cards.erase(it);
+            }
+            Park(c);
+        }
+        // Without taking the focus from the first: its placement was just set (not maximized), so
+        // this one restore lands where it should.
+        if (!IsWindowVisible(c->hwnd))
+            ShowWindowAsync(c->hwnd, SW_SHOW);
+        ShowWindowAsync(c->hwnd, SW_SHOWNOACTIVATE);
+        m_stage.insert(m_stage.begin(), c->hwnd);
+    }
+    Relayout(true);
+}
+
 // "크기 맞추기": the window takes the saved place and size, then comes up on stage there, as if its
 // card had been clicked (already on stage: only the size changes).
 void Stage::FitAndOpen(HWND hwnd)
@@ -1353,6 +1643,12 @@ RECT Stage::FitFrame()
 
 void Stage::FitToSaved(HWND hwnd)
 {
+    PlaceFrame(hwnd, FitFrame());
+}
+
+// Puts the window's visible frame at `frame` (screen px), whatever invisible borders it has.
+void Stage::PlaceFrame(HWND hwnd, RECT const& frame)
+{
     if (!IsWindow(hwnd))
         return;
     // This window's own invisible borders (measured now if it is on screen, otherwise as its card
@@ -1380,7 +1676,6 @@ void Stage::FitToSaved(HWND hwnd)
         int bottom = std::max(0, GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + padded - 1);
         border = { side, 0, side, bottom };
     }
-    RECT frame = FitFrame();
     RECT target{ frame.left - border.left, frame.top - border.top, frame.right + border.right, frame.bottom + border.bottom };
 
     // Placement is in workspace coordinates of the monitor the rectangle is on. The window keeps its
@@ -1403,7 +1698,7 @@ void Stage::FitToSaved(HWND hwnd)
     if (g_trace)
     {
         wchar_t what[96];
-        swprintf_s(what, L"fit to the saved size (border %ld %ld %ld %ld)", border.left, border.top, border.right, border.bottom);
+        swprintf_s(what, L"placed (border %ld %ld %ld %ld)", border.left, border.top, border.right, border.bottom);
         Trace(what, hwnd);
     }
     // The card flies from/to the new place from now on.
@@ -1700,7 +1995,8 @@ void Stage::Populate()
             Adopt(h);
     }
     AdoptPinnedElsewhere();
-    Relayout(false);
+    ApplySavedOrder();
+    Relayout(false);                                // forms the saved folders whose windows are here
 }
 
 // ---- outside changes -------------------------------------------------------
@@ -2212,7 +2508,7 @@ void Stage::RemoveCard(HWND hwnd, bool evenIfPinned)
     {
         std::erase_if(m_offstage, [&](auto& c) { return c->hwnd == hwnd; });
         folderChanged = FolderOf(hwnd) != nullptr;
-        LeaveFolder(hwnd);
+        LeaveFolder(hwnd, false);
     }
     auto it = std::find_if(m_cards.begin(), m_cards.end(), [&](auto& c) { return c->hwnd == hwnd; });
     if (it == m_cards.end() || ((*it)->pinned && !evenIfPinned))
@@ -2427,6 +2723,12 @@ CardVis Stage::MakeVis(Card const& c, bool withBadge)
         v.grid = m_compositor.CreateContainerVisual();
         v.sprite.Children().InsertAtTop(v.grid);
         FillFolderGrid(v, const_cast<Card&>(c));  // a new grid: drawn, not yet remembered
+        if (withBadge)
+        {
+            v.label = m_compositor.CreateSpriteVisual();
+            v.holder.Children().InsertAtTop(v.label);
+            SetFolderLabel(v, c);
+        }
     }
 
     if (withBadge)
@@ -2489,6 +2791,11 @@ void Stage::ApplyPose(CardVis const& v, Card const& c, Pose const& p)
         float2 a = AlertOffset(c, p), o = SoundOffset(c, p);
         v.alert.Offset({ a.x, a.y, 0.f });
         v.sound.Offset({ o.x, o.y, 0.f });
+    }
+    if (v.label)
+    {
+        float2 l = LabelOffset(c, p, v.labelSize);
+        v.label.Offset({ l.x, l.y, 0.f });
     }
 }
 
@@ -2555,11 +2862,21 @@ void Stage::AnimatePose(CardVis const& v, Card const& c, Pose const& from, Pose 
             visual.StartAnimation(L"Offset", move);
         }
     }
+    if (v.label)
+    {
+        float2 l = LabelOffset(c, to, v.labelSize);
+        auto move = m_compositor.CreateVector3KeyFrameAnimation();
+        move.InsertKeyFrame(1.f, { l.x, l.y, 0.f }, m_ease);
+        move.Duration(dur);
+        v.label.StartAnimation(L"Offset", move);
+    }
 }
 
 void Stage::Relayout(bool animate)
 {
     PruneFolders();
+    if (!m_savedFolders.empty() && !m_busy && !m_dragging && !m_openFolder)
+        RestoreFolders();
     // A pinned folder's windows sit with the pinned cards, in the folder's pin place.
     auto pinKeyOf = [&](Card const& c) -> std::wstring const* {
         if (c.pinned)
@@ -2967,6 +3284,7 @@ bool Stage::Group(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target)
     f->members.push_back(dragged->hwnd);
     m_cards.erase(std::find(m_cards.begin(), m_cards.end(), dragged));
     InsertReturning(dragged);                       // next to the folder's other windows
+    RememberFolder(*f);
     if (dragged->side.holder)
     {
         m_sideContent.Children().Remove(dragged->side.holder);
@@ -2978,12 +3296,19 @@ bool Stage::Group(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target)
     return true;
 }
 
-void Stage::LeaveFolder(HWND hwnd)
+void Stage::LeaveFolder(HWND hwnd, bool byUser)
 {
     auto f = FolderOf(hwnd);
     if (!f)
         return;
     std::erase(f->members, hwnd);
+    if (byUser)
+    {
+        if (f->members.size() <= 1)
+            ForgetFolder(*f);
+        else
+            RememberFolder(*f);
+    }
     if (f->members.size() <= 1)
         Dissolve(f);                                // a folder of one is just that card
 }
@@ -3076,6 +3401,7 @@ void Stage::MoveCard(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target
             m.erase(a);
             b = std::find(m.begin(), m.end(), target->hwnd);
             m.insert(down ? b + 1 : b, h);
+            RememberFolder(*from);
         }
         Relayout(true);
         return;
@@ -3105,6 +3431,7 @@ void Stage::MoveCard(std::shared_ptr<Card> dragged, std::shared_ptr<Card> target
                 at = it + 1;
     m_cards.insert(at, block.begin(), block.end());
     m_manualOrder = true;
+    SaveOrder();
     Trace(L"card moved", dragged->hwnd);
     m_hover = -1;
     Relayout(true);
@@ -3194,6 +3521,137 @@ void Stage::FillFolderGrid(CardVis const& v, Card& folderCard)
         v.grid.Children().InsertAtTop(cell);
         ++i;
     }
+}
+
+// A folder's name on a dark pill across the bottom edge of its card; a long one ends in an ellipsis.
+void Stage::SetFolderLabel(CardVis const& v, Card const& folderCard)
+{
+    if (!v.label)
+        return;
+    auto f = folderCard.folderOf.lock();
+    if (!f || f->name.empty())
+    {
+        v.label.IsVisible(false);
+        v.labelSize = {};
+        return;
+    }
+    auto dwrite = m_snap.Text();
+    winrt::com_ptr<IDWriteTextFormat> format;
+    winrt::com_ptr<IDWriteTextLayout> layout;
+    winrt::com_ptr<IDWriteInlineObject> ellipsis;
+    if (FAILED(dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, S(12.f), L"ko-kr", format.put())))
+        return;
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    DWRITE_TRIMMING trim{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+    if (SUCCEEDED(dwrite->CreateEllipsisTrimmingSign(format.get(), ellipsis.put())))
+        format->SetTrimming(&trim, ellipsis.get());
+    float padX = S(9.f), h = S(21.f), maxText = ThumbW() * 0.85f - 2.f * padX;
+    if (FAILED(dwrite->CreateTextLayout(f->name.c_str(), static_cast<UINT32>(f->name.size()), format.get(), maxText, h, layout.put())))
+        return;
+    DWRITE_TEXT_METRICS tm{};
+    layout->GetMetrics(&tm);
+    float textW = std::min(maxText, std::ceil(tm.widthIncludingTrailingWhitespace));
+    layout->SetMaxWidth(textW);
+    float w = textW + 2.f * padX;
+    auto surface = m_snap.Paint(w, h, [&](ID2D1DeviceContext* dc) {
+        winrt::com_ptr<ID2D1SolidColorBrush> fill, ink;
+        dc->CreateSolidColorBrush(D2D1::ColorF(0.11f, 0.11f, 0.12f, 0.9f), fill.put());
+        dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 1.f), ink.put());
+        dc->FillRoundedRectangle({ { 0.f, 0.f, w, h }, h / 2.f, h / 2.f }, fill.get());
+        dc->DrawTextLayout({ padX, 0.f }, layout.get(), ink.get());
+    });
+    v.label.Brush(m_compositor.CreateSurfaceBrush(surface));
+    v.label.Size({ w, h });
+    v.labelSize = { w, h };
+    v.label.IsVisible(true);
+}
+
+// Centered on the card's bottom edge as the camera shows it (the middle of the card does not tilt).
+float2 Stage::LabelOffset(Card const& c, Pose const& p, float2 size) const
+{
+    Crop k = CropFor(c, p.thumb);
+    return Project(p, { 0.f, k.size.y * p.scale / 2.f }, 0.f) - size / 2.f;
+}
+
+void Stage::BeginRename(std::shared_ptr<CardFolder> f)
+{
+    EndRename(true);
+    if (!f || !f->card || !f->card->side.holder)
+        return;
+    m_renameFolder = f;
+    int w = static_cast<int>(S(190.f)), h = static_cast<int>(S(30.f));
+    float2 at = f->card->side.at;                   // the card's center, sidebar coordinates
+    int x = m_bar.left + static_cast<int>(at.x) - w / 2, y = m_bar.top + static_cast<int>(at.y) - h / 2;
+    x = std::clamp(x, static_cast<int>(m_monitor.left), static_cast<int>(m_monitor.right) - w);
+    if (!m_renameFont)
+        m_renameFont = CreateFontW(-static_cast<int>(S(15.f)), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    m_renameEdit = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"EDIT", f->name.c_str(),
+        WS_POPUP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL, x, y, w, h, m_view, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!m_renameEdit)
+        return;
+    SendMessageW(m_renameEdit, WM_SETFONT, reinterpret_cast<WPARAM>(m_renameFont), FALSE);
+    SendMessageW(m_renameEdit, EM_LIMITTEXT, 30, 0);
+    m_renameEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(m_renameEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(RenameProc)));
+    ShowWindow(m_renameEdit, SW_SHOW);
+    ForceForeground(m_renameEdit);
+    SetFocus(m_renameEdit);
+    SendMessageW(m_renameEdit, EM_SETSEL, 0, -1);
+    Trace(L"folder rename started");
+}
+
+void Stage::EndRename(bool keep)
+{
+    if (!m_renameEdit)
+        return;
+    HWND edit = m_renameEdit;
+    m_renameEdit = nullptr;                         // the focus loss DestroyWindow causes ends nothing more
+    wchar_t text[64]{};
+    GetWindowTextW(edit, text, ARRAYSIZE(text));
+    bool hadFocus = GetForegroundWindow() == edit;
+    DestroyWindow(edit);
+    auto f = m_renameFolder.lock();
+    m_renameFolder.reset();
+    if (keep && f)
+    {
+        std::wstring name = text;
+        auto first = name.find_first_not_of(L" \t"), last = name.find_last_not_of(L" \t");
+        name = first == std::wstring::npos ? L"" : name.substr(first, last - first + 1);
+        if (name != f->name)
+        {
+            f->name = name;
+            RememberFolder(*f);
+            Trace((L"folder renamed: " + name).c_str());
+            if (f->card && f->card->side.holder)
+            {
+                SetFolderLabel(f->card->side, *f->card);
+                Relayout(false);
+            }
+        }
+    }
+    // Typing took the focus from the stage window: it gets it back (not if the user went elsewhere).
+    if (hadFocus && m_active && IsWindow(m_active))
+        ForceForeground(m_active);
+}
+
+LRESULT CALLBACK Stage::RenameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (!g_stage)
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    WNDPROC base = g_stage->m_renameEditProc;
+    if (msg == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE))
+    {
+        g_stage->EndRename(wp == VK_RETURN);
+        return 0;
+    }
+    if (msg == WM_CHAR && (wp == L'\r' || wp == 27))
+        return 0;                                   // no beep
+    if (msg == WM_KILLFOCUS && hwnd == g_stage->m_renameEdit)
+        SetTimer(g_stage->m_sidebar, kTimerRenameEnd, 1, nullptr);    // clicked elsewhere: keep it
+    return CallWindowProcW(base, hwnd, msg, wp, lp);
 }
 
 void Stage::RefreshFolderBadges(CardFolder& f)
@@ -3844,8 +4302,8 @@ GUID Stage::DesktopMovedTo(HWND foreground)
 // minimized) or is the incoming window itself.
 bool Stage::UserSwitchedMidTransition(HWND hwnd) const
 {
-    if (!hwnd || hwnd == m_active || (m_inCard && hwnd == m_inCard->hwnd))
-        return false;
+    if (!hwnd || hwnd == m_active || (m_inCard && hwnd == m_inCard->hwnd) || OnStage(hwnd))
+        return false;                               // (on stage: e.g. a window of a folder opened whole)
     ULONGLONG now = GetTickCount64();
     bool settled = m_inCard ? (m_shownAt && now - m_shownAt >= 30) : now - m_begunAt >= 30;
     return settled && wt::IsManageable(hwnd, m_mon) && IsWindowVisible(hwnd) && !IsIconic(hwnd);
@@ -3984,7 +4442,14 @@ void Stage::BeginTransition(HWND next, std::shared_ptr<Card> nextCard, Pose cons
             leaving.push_back(h);
         else
         {
-            // Minimized or hidden without us noticing in time: no flight, but it keeps its card.
+            // Minimized or hidden without us noticing in time: no flight, but it keeps its card. One
+            // that has none yet gets it once the switch is done: making a card (its icon, a stand-in)
+            // can take 100 ms for a closing UWP window, and the click must not wait for it.
+            if (!CardOf(h))
+            {
+                m_lateCards.push_back(h);
+                continue;
+            }
             auto card = TakeCard(h);
             if (!card->pinned)
                 InsertReturning(card);
@@ -4305,6 +4770,124 @@ void Stage::SetHotkeys(bool on)
     RegisterHotkeys();
 }
 
+bool Stage::HotkeyModifiersHeld() const
+{
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    UINT mods = m_cfg.HotkeyModifiers();
+    return down(VK_MENU) && down(VK_CONTROL) == ((mods & MOD_CONTROL) != 0) && down(VK_SHIFT) == ((mods & MOD_SHIFT) != 0) &&
+           !down(VK_LWIN) && !down(VK_RWIN);
+}
+
+void Stage::OnRawKey(USHORT vk, bool down)
+{
+    if (vk == kNoKey)
+        return;                                     // ours, see ShowNumbers
+    bool modifier = vk == VK_MENU || vk == VK_CONTROL || vk == VK_SHIFT || vk == VK_LWIN || vk == VK_RWIN;
+    if (!modifier)
+    {
+        // Alt+Tab, Alt+F4, Alt+number...: not a look at the numbers (they go once a number is used).
+        if (down)
+        {
+            m_otherKey = true;
+            m_numbersPending = false;
+            KillTimer(m_sidebar, kTimerNumbers);
+            if (m_numbersShown)
+                ShowNumbers(false);
+        }
+        return;
+    }
+    if (!down)
+    {
+        m_numbersPending = false;
+        KillTimer(m_sidebar, kTimerNumbers);
+        if (m_numbersShown && m_revealed && !m_tracking)
+            SetTimer(m_sidebar, kTimerTuck, 350, nullptr);  // brought out for them: back behind the window
+        ShowNumbers(false);
+        auto held = [](int k) { return (GetAsyncKeyState(k) & 0x8000) != 0; };
+        if (!held(VK_MENU) && !held(VK_CONTROL) && !held(VK_SHIFT) && !held(VK_LWIN) && !held(VK_RWIN))
+            m_otherKey = false;                     // all released: the next press starts over
+        return;
+    }
+    // Key repeat sends the press again and again: the wait starts once.
+    if (!m_numbersShown && !m_numbersPending && !m_otherKey && m_hotkeysOn && HotkeyModifiersHeld())
+    {
+        m_numbersPending = true;
+        SetTimer(m_sidebar, kTimerNumbers, kNumbersDelayMs, nullptr);
+    }
+}
+
+// The Alt+number of each card in its middle; a folder shows the numbers of its windows ("3-4").
+void Stage::ShowNumbers(bool show)
+{
+    for (auto& [holder, badge] : m_numberBadges)
+        holder.Children().Remove(badge);
+    m_numberBadges.clear();
+    m_numbersShown = false;
+    if (!show || !m_hotkeysOn || m_dock != DockState::Shown || m_busy || m_dragging || m_menu.open || m_settings.open || m_renameEdit)
+        return;
+    auto order = HotkeyOrder();
+    size_t keys = std::min<size_t>(order.size(), kMaxHotkeys);
+    auto dwrite = m_snap.Text();
+    winrt::com_ptr<IDWriteTextFormat> format;
+    if (FAILED(dwrite->CreateTextFormat(L"Segoe UI Variable Display", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, S(19.f), L"", format.put())))
+        return;
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    for (auto& card : m_visible)
+    {
+        if (!card->side.holder)
+            continue;
+        // Its numbers: its own, or its folder's windows'.
+        size_t first = SIZE_MAX, last = 0;
+        for (size_t i = 0; i < keys; ++i)
+        {
+            bool mine = card->isFolder ? FolderOf(order[i]->hwnd) == card->folderOf.lock() : order[i] == card;
+            if (mine)
+            {
+                first = std::min(first, i);
+                last = std::max(last, i);
+            }
+        }
+        if (first == SIZE_MAX)
+            continue;
+        std::wstring text = std::to_wstring(first + 1);
+        if (last > first)
+            text += L"\x2013" + std::to_wstring(last + 1);
+        float h = S(34.f), w = std::max(h, S(13.f) * text.size() + S(16.f));
+        auto surface = m_snap.Paint(w, h, [&](ID2D1DeviceContext* dc) {
+            winrt::com_ptr<ID2D1SolidColorBrush> fill, ink;
+            dc->CreateSolidColorBrush(D2D1::ColorF(0.08f, 0.08f, 0.09f, 0.88f), fill.put());
+            dc->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 1.f), ink.put());
+            dc->FillRoundedRectangle({ { 0.f, 0.f, w, h }, h / 2.f, h / 2.f }, fill.get());
+            dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format.get(), { 0.f, 0.f, w, h }, ink.get());
+        });
+        auto badge = m_compositor.CreateSpriteVisual();
+        badge.Size({ w, h });
+        badge.Offset({ -w / 2.f, -h / 2.f, 0.f });  // the holder sits at the card's visual center
+        badge.Brush(m_compositor.CreateSurfaceBrush(surface));
+        auto fade = m_compositor.CreateScalarKeyFrameAnimation();
+        fade.InsertKeyFrame(0.f, 0.f);
+        fade.InsertKeyFrame(1.f, 1.f);
+        fade.Duration(std::chrono::milliseconds(std::max(1, m_cfg.Ms(120))));
+        card->side.holder.Children().InsertAtTop(badge);
+        badge.StartAnimation(L"Opacity", fade);
+        m_numberBadges.push_back({ card->side.holder, badge });
+    }
+    m_numbersShown = !m_numberBadges.empty();
+    if (m_numbersShown)
+    {
+        Trace(L"card numbers shown");
+        // Alt pressed and released alone opens the menu bar of the app in front. With a key that does
+        // nothing in between, letting go of Alt after looking at the numbers is not that.
+        INPUT none[2]{};
+        none[0].type = none[1].type = INPUT_KEYBOARD;
+        none[0].ki.wVk = none[1].ki.wVk = kNoKey;
+        none[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, none, sizeof(INPUT));
+    }
+}
+
 // Alt+1.. for every card, a folder's windows each counting (1 2 [3 4] 5: Alt+4 is the folder's second
 // window). Only as many as there are, so other apps keep the rest of the Alt+number keys.
 void Stage::RegisterHotkeys()
@@ -4470,6 +5053,18 @@ void Stage::FinishTransition()
     std::erase_if(m_stage, [](HWND h) { return !IsWindow(h); });
     if (m_active && !IsWindow(m_active))
         m_active = m_stage.empty() ? nullptr : m_stage.back();
+    if (!m_lateCards.empty())
+    {
+        for (HWND h : m_lateCards)
+            if (IsWindow(h) && !OnStage(h) && !CardOf(h))
+            {
+                auto card = TakeCard(h);
+                if (!card->pinned)
+                    InsertReturning(card);
+            }
+        m_lateCards.clear();
+        Relayout(true);
+    }
     StageChanged();                                 // after m_busy is cleared, or the dock won't update
     // Focus changes that arrived while animating were ignored; catch up once things have settled.
     SetTimer(m_sidebar, kTimerRecheck, static_cast<UINT>(kQuietMs / 2) + 30, nullptr);
@@ -5048,11 +5643,23 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             m_newWindow = reinterpret_cast<HWND>(lp);
             m_rechecks = kMaxRechecks;
             SetTimer(m_sidebar, kTimerNewWindow, kRecheckMs, nullptr);
+            // One that opens minimized takes no focus and sends no minimize event: without this its
+            // card waited for some later event (22 s in a test).
+            ReconcileSoon();
         }
         return 0;
     }
     switch (msg)
     {
+    case WM_INPUT:
+    {
+        RAWINPUT in{};
+        UINT size = sizeof(in);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &in, &size, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+            in.header.dwType == RIM_TYPEKEYBOARD)
+            OnRawKey(in.data.keyboard.VKey, !(in.data.keyboard.Flags & RI_KEY_BREAK));
+        return DefWindowProcW(m_sidebar, msg, wp, lp);
+    }
     case WM_AUDIO:
         OnAudioChanged();
         return 0;
@@ -5110,6 +5717,19 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             if (IsWindow(reinterpret_cast<HWND>(lp)) && !m_busy && !m_dragging)
                 FitAndOpen(reinterpret_cast<HWND>(lp));
         }
+        else if ((LOWORD(wp) == ID_OPEN_ALL || LOWORD(wp) == ID_RENAME || LOWORD(wp) == ID_UNFOLD) && !m_busy && !m_dragging)
+            FolderCommand(LOWORD(wp), FolderOf(reinterpret_cast<HWND>(lp)));   // lParam: one of its windows
+        else if (LOWORD(wp) == ID_TEST_MARK)
+            m_testMark = reinterpret_cast<HWND>(lp);
+        else if ((LOWORD(wp) == ID_TEST_GROUP || LOWORD(wp) == ID_TEST_MOVE) && !m_busy && !m_dragging)
+        {
+            // As holding the card of lParam over the marked one (grouping), or dropping it there (moving).
+            auto dragged = CardOf(reinterpret_cast<HWND>(lp)), target = CardOf(m_testMark);
+            if (auto f = FolderOf(m_testMark); f && LOWORD(wp) == ID_TEST_MOVE)
+                target = f->card;
+            if (dragged && target)
+                LOWORD(wp) == ID_TEST_GROUP ? (void)Group(dragged, target) : MoveCard(dragged, target);
+        }
         return 0;
     case WM_TIMER:
         KillTimer(m_sidebar, wp);
@@ -5133,6 +5753,9 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             m_shellMsg = RegisterWindowMessageW(L"SHELLHOOK");
             RegisterShellHookWindow(m_sidebar);
             SetHotkeys(m_dock != DockState::Hidden);
+            RAWINPUTDEVICE keyboard{ 0x01, 0x06, RIDEV_INPUTSINK, m_sidebar };     // generic desktop, keyboard
+            if (!RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)))
+                LogError(WM_INPUT, HRESULT_FROM_WIN32(GetLastError()), L"raw keyboard input not available: no card numbers on Alt");
         }
         else if (wp == kTimerActiveSnap)
         {
@@ -5184,6 +5807,23 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
             m_restoreChecks.clear();
+        }
+        else if (wp == kTimerRenameEnd)
+            EndRename(true);
+        else if (wp == kTimerNumbers)
+        {
+            m_numbersPending = false;
+            if (HotkeyModifiersHeld() && !m_otherKey)
+            {
+                // Tucked behind a maximized window, where Alt+number is used most: it comes out to
+                // show them, and goes back once Alt is let go.
+                if (m_dock == DockState::Tucked && !m_busy)
+                {
+                    m_revealed = true;
+                    SetDock(DockState::Shown);
+                }
+                ShowNumbers(true);
+            }
         }
         else if (wp == kTimerFade)
             FadeOutFlyIn();

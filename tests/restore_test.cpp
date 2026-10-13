@@ -6,8 +6,9 @@
 //   (default)  test windows of our own, each on its own thread so restores reach them as asynchronously
 //              as another app's window. They show up on screen for a moment.
 //   --snap     also snaps a test window with Win+Left (sends keys; the window has focus meanwhile).
-//   --e2e      also swaps two test windows through the running stage-manager with Alt+1 (sends keys;
-//              whatever is on stage goes to its card and is brought back at the end).
+//   --e2e      only this: swaps two test windows through the running stage-manager with Alt+1 (sends
+//              keys; whatever is on stage goes to its card and is brought back at the end).
+//   --force    --snap/--e2e even if the PC was used within the last minute (otherwise skipped).
 #include "../src/WindowTracker.h"
 #include <sddl.h>
 #include <cstdio>
@@ -463,10 +464,18 @@ static void EndToEnd()
 
 // ---- main ---------------------------------------------------------------------
 
+// Someone typed or moved the mouse within the last minute: the cases that send keys and take the focus
+// would get in their way (and their Alt+number would mix with ours). Skipped unless --force.
+static bool SomeoneAtThePc()
+{
+    LASTINPUTINFO last{ sizeof(last) };
+    return GetLastInputInfo(&last) && GetTickCount() - last.dwTime < 60000;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    bool snap = false, e2e = false;
+    bool snap = false, e2e = false, force = false;
     for (int i = 1; i < argc; ++i)
     {
         std::wstring a = argv[i];
@@ -480,6 +489,14 @@ int wmain(int argc, wchar_t** argv)
         }
         snap |= a == L"--snap";
         e2e |= a == L"--e2e";
+        force |= a == L"--force";
+    }
+    if ((snap || e2e) && !force && SomeoneAtThePc())
+    {
+        puts("[SKIP] the PC is in use (input within the last minute): --snap/--e2e left out (--force runs them anyway)\n");
+        snap = false;
+        if (e2e)
+            return 0;
     }
     if (e2e)
     {

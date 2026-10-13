@@ -321,7 +321,17 @@ winrt::com_ptr<IWICFormatConverter> Snapshot::CachedIcon(HWND hwnd)
     // A UWP frame's icon comes from the window and may not be set yet right after it opens: asked
     // again each time rather than caching a generic one.
     if (path.empty() || IsFrameHost(wt::ProcessPath(hwnd)))
-        return IconSource(m_wic.get(), hwnd, 128);
+    {
+        // A card asks twice in a row (its icon, its stand-in), and each ask may wait 50 ms on a
+        // closing window: the answer is kept for a moment.
+        ULONGLONG now = GetTickCount64();
+        if (m_frameIcon.first == hwnd && now - m_frameIconAt < 2000)
+            return m_frameIcon.second;
+        auto source = IconSource(m_wic.get(), hwnd, 128);
+        m_frameIcon = { hwnd, source };
+        m_frameIconAt = now;
+        return source;
+    }
     // Cached by the file the icon comes from: a terminal's windows differ by the shell they show.
     if (path.find(L'#') == std::wstring::npos)
         path = wt::IconFile(hwnd);
