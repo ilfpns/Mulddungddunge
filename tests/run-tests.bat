@@ -1,7 +1,7 @@
 @echo off
 setlocal
 rem Builds and runs the tests. Arguments go to restore-test (--snap, --e2e: see restore_test.cpp);
-rem capture-memory-test runs too, except with --e2e (which only swaps windows through the running app).
+rem capture-memory-test runs too, except with --e2e or --kakao (which only use the running app).
 rem --folders runs only folder-test against the running app (see folder_test.cpp; further arguments go to it).
 
 set VSDIR=
@@ -42,7 +42,7 @@ bin\folder-test.exe %ARGS:--folders=%
 exit /b %errorlevel%
 
 :others
-echo %ARGS% | find "--e2e" >nul
+echo %ARGS% | findstr /c:"--e2e" /c:"--kakao" >nul
 if errorlevel 1 (
   echo == capture memory
   bin\capture-memory-test.exe || set FAILED=1

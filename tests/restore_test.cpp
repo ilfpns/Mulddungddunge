@@ -8,7 +8,9 @@
 //   --snap     also snaps a test window with Win+Left (sends keys; the window has focus meanwhile).
 //   --e2e      only this: swaps two test windows through the running stage-manager with Alt+1 (sends
 //              keys; whatever is on stage goes to its card and is brought back at the end).
-//   --force    --snap/--e2e even if the PC was used within the last minute (otherwise skipped).
+//   --kakao    only this: KakaoTalk's card through the running stage-manager (started and ended again
+//              if it was not running).
+//   --force    --snap/--e2e/--kakao even if the PC was used within the last minute (otherwise skipped).
 #include "../src/WindowTracker.h"
 #include <sddl.h>
 #include <cstdio>
@@ -416,6 +418,118 @@ static void Snapped()
     }
 }
 
+// KakaoTalk minimizes its own way and closes to the tray; its card must still bring it back.
+// Clicks its card through the running stage-manager (WM_COMMAND 33). Started if it isn't running, and
+// then ended again afterwards.
+static void KakaoTalk()
+{
+    puts("KakaoTalk card (minimizes its own way, closes to the tray)");
+    HWND sidebar = FindWindowW(L"StageManagerSidebar", nullptr);
+    if (!sidebar)
+    {
+        Expect("stage-manager is running", false, nullptr);
+        return;
+    }
+    auto findKakao = [] {
+        struct Ctx { HWND found; } ctx{ nullptr };
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            wchar_t title[32]{};
+            GetWindowTextW(h, title, ARRAYSIZE(title));
+            if (wcscmp(title, L"카카오톡") != 0 || GetWindow(h, GW_OWNER))
+                return TRUE;
+            auto path = wt::ProcessPath(h);
+            if (path.size() < 13 || _wcsicmp(path.c_str() + path.size() - 13, L"KakaoTalk.exe") != 0)
+                return TRUE;
+            reinterpret_cast<Ctx*>(lp)->found = h;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.found;
+    };
+    auto waitFor = [](auto done, DWORD ms) {
+        for (DWORD t = GetTickCount(); GetTickCount() - t < ms; Sleep(50))
+            if (done())
+                return true;
+        return static_cast<bool>(done());
+    };
+    auto open = [&](HWND h) {
+        SendMessageTimeoutW(sidebar, WM_COMMAND, 33, reinterpret_cast<LPARAM>(h), SMTO_ABORTIFHUNG, 2000, nullptr);
+        return waitFor([&] { return IsWindowVisible(h) && !IsIconic(h); }, 3000);
+    };
+    // KakaoTalk processes (its launcher starts the real one: ending what we started means all of them).
+    auto kakaoPids = [] {
+        std::vector<DWORD> pids;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pe{ sizeof(pe) };
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+            if (_wcsicmp(pe.szExeFile, L"KakaoTalk.exe") == 0)
+                pids.push_back(pe.th32ProcessID);
+        CloseHandle(snap);
+        return pids;
+    };
+    HWND user = GetForegroundWindow();
+    HWND k = findKakao();
+    bool wasRunning = !kakaoPids().empty();
+    if (!k)
+    {
+        wchar_t exe[MAX_PATH];
+        ExpandEnvironmentStringsW(L"%ProgramFiles%\\Kakao\\KakaoTalk\\KakaoTalk.exe", exe, MAX_PATH);
+        ShellExecuteW(nullptr, L"open", exe, nullptr, nullptr, SW_SHOWNORMAL);
+        waitFor([&] { return (k = findKakao()) != nullptr && IsWindowVisible(k); }, 20000);
+        // Its first "카카오톡" window is a splash that goes in a moment: the one that stays is the one.
+        Sleep(5000);
+        k = findKakao();
+        if (k && !IsWindowVisible(k))
+            k = nullptr;
+    }
+    if (!k)
+    {
+        Expect("KakaoTalk window found (installed and started)", false, nullptr);
+        return;
+    }
+    Sleep(2500);                                    // settled: on stage, photographed
+
+    ShowWindow(k, SW_MINIMIZE);                     // as its minimize button
+    bool minimized = waitFor([&] { return IsIconic(k) || !IsWindowVisible(k); }, 3000);
+    Sleep(1500);
+    Expect("minimized: into its card", minimized, k);
+    Expect("its card brings it back", open(k), k);
+    Sleep(1500);
+
+    PostMessageW(k, WM_CLOSE, 0, 0);                // X: signed in, KakaoTalk hides to the tray
+    waitFor([&] { return !IsWindow(k) || !IsWindowVisible(k) || IsIconic(k); }, 3000);
+    Sleep(1500);
+    if (!IsWindow(k))
+    {
+        // Its sign-in window closes for good on X (nothing in the tray to come back from).
+        printf("  [SKIP] %-62s\n", "closed with X: this window was destroyed (signed out?), no tray case");
+    }
+    else
+    {
+        Expect("closed with X: hidden to the tray, still a window", !IsWindowVisible(k) || IsIconic(k), k);
+        Expect("its card shows it again", open(k), k);
+        Sleep(1000);
+    }
+
+    if (!wasRunning)
+    {
+        for (DWORD pid : kakaoPids())               // it was not running before the test
+            if (HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, pid))
+            {
+                TerminateProcess(p, 0);
+                CloseHandle(p);
+            }
+    }
+    else if (IsWindow(k))
+        ShowWindow(k, SW_MINIMIZE);                 // back to a card, as it was
+    Sleep(800);
+    if (user && IsWindow(user))
+    {
+        Activate(user);
+        if (IsIconic(user))
+            ShowWindow(user, SW_RESTORE);
+    }
+}
+
 static void EndToEnd()
 {
     puts("end to end: swapped through the running stage-manager (Alt+1)");
@@ -475,7 +589,7 @@ static bool SomeoneAtThePc()
 int wmain(int argc, wchar_t** argv)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    bool snap = false, e2e = false, force = false;
+    bool snap = false, e2e = false, kakao = false, force = false;
     for (int i = 1; i < argc; ++i)
     {
         std::wstring a = argv[i];
@@ -489,18 +603,22 @@ int wmain(int argc, wchar_t** argv)
         }
         snap |= a == L"--snap";
         e2e |= a == L"--e2e";
+        kakao |= a == L"--kakao";
         force |= a == L"--force";
     }
-    if ((snap || e2e) && !force && SomeoneAtThePc())
+    if ((snap || e2e || kakao) && !force && SomeoneAtThePc())
     {
-        puts("[SKIP] the PC is in use (input within the last minute): --snap/--e2e left out (--force runs them anyway)\n");
+        puts("[SKIP] the PC is in use (input within the last minute): --snap/--e2e/--kakao left out (--force runs them anyway)\n");
         snap = false;
-        if (e2e)
+        if (e2e || kakao)
             return 0;
     }
-    if (e2e)
+    if (e2e || kakao)
     {
-        EndToEnd();
+        if (e2e)
+            EndToEnd();
+        if (kakao)
+            KakaoTalk();
         printf("\n%d checks, %d failed\n", g_run, g_failed);
         return g_failed ? 1 : 0;
     }

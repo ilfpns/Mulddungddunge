@@ -22,6 +22,7 @@ namespace
     constexpr UINT ID_TEST_MARK = 30;         // remember this window's card as the target
     constexpr UINT ID_TEST_GROUP = 31;        // this window's card held over the target: a folder
     constexpr UINT ID_TEST_MOVE = 32;         // this window's card dropped on the target: moved by hand
+    constexpr UINT ID_TEST_OPEN = 33;         // this window's card clicked (from its folder's card if in one)
     // Where "크기 맞추기" puts a window: the visible frame of the Orca window as it was on 2026-09-30,
     // in screen pixels (left, top, right, bottom). Fixed on purpose.
     constexpr RECT kFitFrame = { 252, 52, 2228, 1377 };
@@ -5721,6 +5722,21 @@ LRESULT Stage::OnSidebarMessage(UINT msg, WPARAM wp, LPARAM lp)
             FolderCommand(LOWORD(wp), FolderOf(reinterpret_cast<HWND>(lp)));   // lParam: one of its windows
         else if (LOWORD(wp) == ID_TEST_MARK)
             m_testMark = reinterpret_cast<HWND>(lp);
+        else if (LOWORD(wp) == ID_TEST_OPEN && !m_busy && !m_dragging)
+        {
+            auto card = CardOf(reinterpret_cast<HWND>(lp));
+            if (auto at = std::find(m_visible.begin(), m_visible.end(), card); card && at != m_visible.end())
+                SwitchTo(static_cast<size_t>(at - m_visible.begin()));
+            else if (int slot = card ? SlotOf(*card) : -1; slot >= 0)
+            {
+                Pose from = SlotPose(*card, static_cast<size_t>(slot));     // out of its folder's card
+                from.center = SideToAnim(from.center);
+                from.scale *= 0.45f;
+                SwitchToCard(card, from);
+            }
+            else
+                Trace(L"test open: no card in view", reinterpret_cast<HWND>(lp));
+        }
         else if ((LOWORD(wp) == ID_TEST_GROUP || LOWORD(wp) == ID_TEST_MOVE) && !m_busy && !m_dragging)
         {
             // As holding the card of lParam over the marked one (grouping), or dropping it there (moving).
