@@ -1,6 +1,7 @@
 @echo off
 setlocal
-rem Builds and runs the tests. Arguments go to the test program (--snap, --e2e: see restore_test.cpp).
+rem Builds and runs the tests. Arguments go to restore-test (--snap, --e2e: see restore_test.cpp);
+rem capture-memory-test runs too, except with --e2e (which only swaps windows through the running app).
 
 set VSDIR=
 "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -prerelease -products * ^
@@ -19,11 +20,23 @@ if not exist obj\tests mkdir obj\tests
 if not exist obj\tmp mkdir obj\tmp
 set TMP=%~dp0..\obj\tmp
 set TEMP=%~dp0..\obj\tmp
+set CL=/nologo /std:c++20 /EHsc /O2 /MT /W3 /utf-8 /permissive- /DUNICODE /D_UNICODE /Fo:obj\tests\
 
-cl /nologo /std:c++20 /EHsc /O2 /MT /W3 /utf-8 /permissive- /DUNICODE /D_UNICODE ^
-   /Fo:obj\tests\ /Fe:bin\restore-test.exe tests\restore_test.cpp src\WindowTracker.cpp ^
+cl /Fe:bin\restore-test.exe tests\restore_test.cpp src\WindowTracker.cpp ^
    /link /SUBSYSTEM:CONSOLE ^
    user32.lib shell32.lib ole32.lib dwmapi.lib shcore.lib advapi32.lib version.lib windowsapp.lib || exit /b 1
+cl /Fe:bin\capture-memory-test.exe tests\capture_memory_test.cpp src\Snapshot.cpp src\WindowTracker.cpp ^
+   /link /SUBSYSTEM:CONSOLE ^
+   user32.lib gdi32.lib shell32.lib ole32.lib dwmapi.lib shcore.lib d3d11.lib dxgi.lib d2d1.lib dwrite.lib ^
+   windowscodecs.lib windowsapp.lib CoreMessaging.lib advapi32.lib version.lib || exit /b 1
 
-bin\restore-test.exe %*
-exit /b %errorlevel%
+set FAILED=0
+echo %* | find "--e2e" >nul
+if errorlevel 1 (
+  echo == capture memory
+  bin\capture-memory-test.exe || set FAILED=1
+  echo.
+  echo == restore
+)
+bin\restore-test.exe %* || set FAILED=1
+exit /b %FAILED%
