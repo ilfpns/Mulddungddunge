@@ -53,10 +53,11 @@ namespace wt
             return false;
         LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
         // Always-on-top windows (desktop pets, PiP players, overlays) stay where they are. Not an app's
-        // ordinary window the user made stay on top (Spotify's option): it has a full frame (title bar,
-        // system menu, resizable border), which pets and overlays don't.
+        // ordinary window the user made stay on top (Spotify's option): it has a title bar and a resizable
+        // border, which pets and overlays don't. No system menu needed: Electron apps with their own title
+        // bar (Claude, Orca) drop WS_SYSMENU.
         LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-        bool framed = (style & WS_CAPTION) == WS_CAPTION && (style & WS_SYSMENU) && (style & WS_THICKFRAME);
+        bool framed = (style & WS_CAPTION) == WS_CAPTION && (style & WS_THICKFRAME);
         if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || ((ex & WS_EX_TOPMOST) && !framed))
             return false;
         DWORD pid = 0;
