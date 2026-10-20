@@ -52,13 +52,7 @@ namespace wt
         if (GetWindow(hwnd, GW_OWNER) || ModalOwner(hwnd))
             return false;
         LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        // Always-on-top windows (desktop pets, PiP players, overlays) stay where they are. Not an app's
-        // ordinary window the user made stay on top (Spotify's option): it has a title bar and a resizable
-        // border, which pets and overlays don't. No system menu needed: Electron apps with their own title
-        // bar (Claude, Orca) drop WS_SYSMENU.
-        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-        bool framed = (style & WS_CAPTION) == WS_CAPTION && (style & WS_THICKFRAME);
-        if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || ((ex & WS_EX_TOPMOST) && !framed))
+        if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || IsOverlay(hwnd))
             return false;
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
@@ -69,6 +63,20 @@ namespace wt
         if (monitor && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != monitor)
             return false;
         return !IsFullscreen(hwnd);
+    }
+
+    bool IsOverlay(HWND hwnd)
+    {
+        // Always-on-top windows (desktop pets, PiP players, overlays) stay where they are. Not an app's
+        // ordinary window made to stay on top (by the user, the app or another tool: Spotify, Claude,
+        // Orca, Chrome): it can be resized, and has a title bar or a minimize button, which pets and
+        // overlays don't. Only these two: Electron apps drawing their own title bar drop WS_SYSMENU
+        // (Claude, Orca), frameless ones WS_CAPTION too.
+        if (!(GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST))
+            return false;
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        bool framed = (style & WS_THICKFRAME) && ((style & WS_CAPTION) == WS_CAPTION || (style & WS_MINIMIZEBOX));
+        return !framed;
     }
 
     bool IsFullscreen(HWND hwnd)

@@ -287,6 +287,49 @@ static void Destroyed()
     Expect("Restore and RestoreIgnored are false", !IsWindow(h) && !wt::Restore(h) && !wt::RestoreIgnored(h), nullptr);
 }
 
+// Which always-on-top windows get a card (wt::IsAppWindow): app windows made to stay on top do, with
+// whatever frame their app draws (Claude and Orca once lost their cards here: no WS_SYSMENU); pets
+// and overlays don't. Shown without activation for a moment. Judged by a copy of this program
+// (--app-window), since IsAppWindow passes over the windows of its own process.
+static void AlwaysOnTop()
+{
+    puts("always-on-top windows");
+    struct Case { char const* name; DWORD style; bool card; };
+    Case cases[] = {
+        { "full frame (Spotify) gets a card",                         WS_OVERLAPPEDWINDOW, true },
+        { "own title bar, no system menu (Claude, Orca) gets a card", 0x00C70000, true },
+        { "frameless, resizable, minimizable (Electron) gets a card", WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX, true },
+        { "borderless popup (desktop pet) gets none",                 WS_POPUP, false },
+        { "resizable popup, no title or minimize (overlay) gets none", WS_POPUP | WS_THICKFRAME, false },
+    };
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    for (auto& c : cases)
+    {
+        HWND h = CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"restore test: always on top", c.style,
+            kNormal.left, kNormal.top, 400, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        ShowWindow(h, SW_SHOWNOACTIVATE);
+        wchar_t cmd[MAX_PATH + 64];
+        swprintf_s(cmd, L"\"%s\" --app-window %llx", exe, static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(h)));
+        STARTUPINFOW si{ sizeof(si) };
+        PROCESS_INFORMATION pi{};
+        DWORD code = 2;
+        if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+        {
+            // The copy asks our window for its title: answer while waiting.
+            ULONGLONG until = GetTickCount64() + 10000;
+            while (MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, 100, QS_ALLINPUT) != WAIT_OBJECT_0 && GetTickCount64() < until)
+                for (MSG m; PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE);)
+                    DispatchMessageW(&m);
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        Expect(c.name, code == (c.card ? 1u : 0u), nullptr);
+        DestroyWindow(h);
+    }
+}
+
 // A window of a higher integrity level (UIPI): a low integrity copy of this program restores ours, as
 // we would an elevated app's window. UIPI blocks most posted messages there (WM_APP: access denied),
 // but lets the restore command through, so it is normally Restore's first path that does it.
@@ -602,6 +645,8 @@ int wmain(int argc, wchar_t** argv)
     for (int i = 1; i < argc; ++i)
     {
         std::wstring a = argv[i];
+        if (a == L"--app-window" && i + 1 < argc)        // exit code 1: gets a card
+            return wt::IsAppWindow(reinterpret_cast<HWND>(static_cast<UINT_PTR>(wcstoull(argv[i + 1], nullptr, 16))), nullptr) ? 1 : 0;
         if (a == L"--restore-child" && i + 1 < argc)
         {
             // Exit code: 0 the command was blocked (restored directly), 1 it went to the app, 2 not minimized.
@@ -645,6 +690,7 @@ int wmain(int argc, wchar_t** argv)
     Destroyed();
     CannotMessage();
     OldCodeFails();
+    AlwaysOnTop();
     if (snap)
         Snapped();
 

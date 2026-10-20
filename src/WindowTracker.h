@@ -11,6 +11,8 @@ namespace wt
     // A readable name for an app id: the executable's description ("KakaoTalk"), or for a browser web
     // app the title of `sample`, one of its windows (may be null).
     std::wstring AppLabel(std::wstring const& app, HWND sample);
+    // Always on top without an app window's frame (a desktop pet, a PiP player): left alone.
+    bool IsOverlay(HWND hwnd);
     bool IsFullscreen(HWND hwnd);
     bool IsCloaked(HWND hwnd);                              // hidden by DWM, e.g. on another virtual desktop
     // The top-most ordinary window on the monitor: skips always-on-top windows (pets, PiP players),

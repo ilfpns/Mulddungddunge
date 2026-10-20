@@ -2173,6 +2173,13 @@ void Stage::OnForeground(HWND hwnd)
     if (!wt::IsManageable(hwnd, m_mon))
     {
         UpdateDock();                               // e.g. a fullscreen game came to the front
+        // An app window passed over for being always on top gets no card; says why, so a pet rule
+        // catching an ordinary app (Claude and Orca once) shows in the trace right away.
+        DWORD owner = 0;
+        GetWindowThreadProcessId(hwnd, &owner);
+        if (wt::IsOverlay(hwnd) && IsWindowVisible(hwnd) && !GetWindow(hwnd, GW_OWNER) && GetWindowTextLengthW(hwnd) &&
+            owner != GetCurrentProcessId() && !(GetWindowLongW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)))
+            Trace(L"not managed: always on top, no frame (pet/overlay)", hwnd);
         // An app window still being set up (not shown or untitled yet) becomes manageable in a moment;
         // look again soon instead of waiting for the next focus change. Not the taskbar, the desktop,
         // tool windows or our own.

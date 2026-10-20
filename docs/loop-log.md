@@ -552,3 +552,12 @@
 - 수정(`WindowTracker.cpp` `IsAppWindow`): 항상 위 창은 제목 표시줄과 크기 조절 테두리만 있으면 일반 앱 창으로 관리. 펫(clawd 등)·PiP·오버레이는 둘 다 없어 계속 제외
 - 비슷한 경우: 같은 시스템 메뉴 조건을 쓰는 곳은 이 한 곳뿐
 - 확인: 재시작 직후 trace `layout: Claude | Orca  (of 2)`, 두 창 모두 카드로 내려감
+
+### 재발 방지 (같은 날)
+- 왜 갑자기: 제외 규칙(2026-10-01)은 그대로였고, 오늘 두 창이 "항상 위"가 되면서 걸림. trace 기준 Claude는 16:47~16:55, Orca는 17:09~17:10 사이에 바뀜(그 전까지 카드로 정상 표시). 같은 때 Chrome 창 하나도 항상 위가 됨(예전 Spotify도 같은 경우). 우리 앱에는 다른 앱 창을 항상 위로 만드는 코드가 없고, 두 앱 설정 파일에도 항상 위 항목이 없음 → 누가 바꿨는지는 확인하지 못함. 앱·사용자·다른 도구 어느 쪽이 바꿔도 카드가 빠지지 않게 하는 쪽으로 대응
+- 규칙을 `wt::IsOverlay` 한 곳으로 모음: 항상 위라도 크기 조절 테두리가 있고 제목 표시줄 또는 최소화 버튼이 있으면 앱 창. 제목 표시줄까지 없는 Electron 창(frameless)도 포함. 테두리 없는 펫, 제목·최소화 없는 오버레이는 계속 제외
+- trace: 항상 위 규칙 때문에 카드에서 빠진 앱 창이 앞으로 오면 `not managed: always on top, no frame (pet/overlay)` 기록 → 다음에 같은 일이 생기면 trace에서 바로 원인이 보임
+- 회귀 시험(`restore_test` "always-on-top windows" 5개): Spotify형·Claude/Orca형·frameless Electron형은 카드, 펫·오버레이는 제외. `IsAppWindow`는 자기 프로세스 창을 거르므로 시험 프로그램 사본(`--app-window`)이 판정
+- 결과: `run-tests.bat` 23/23(앱 끈 상태), `--e2e` 8/8, 재시작 후 `layout: Orca | Claude`
+- 측정: 전환 시작 최대 20.8ms, 최소화 반응 최대 0.8ms, 60초 대기 CPU 0.00%·GPU 0.00%·메모리 5.9MB, `stage-manager.log` 오류 없음
+- 참고: 앱을 켠 채 기본 시험을 돌리면 "elevated app" 항목이 실패할 수 있음(시험 창을 앱도 관리). 앱을 끄면 통과
